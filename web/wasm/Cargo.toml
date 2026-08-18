@@ -64,7 +64,7 @@ web-sys = { version = "0.3", features = [
 critical-section = { version = "1", features = ["std"] }
 # Select getrandom's JS backend (both major versions are pulled via ratzilla).
 # Pairs with the getrandom_backend cfg in .cargo/config.toml, next to this file.
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 getrandom_v04 = { package = "getrandom", version = "0.4", features = [
   "wasm_js",
 ] }
