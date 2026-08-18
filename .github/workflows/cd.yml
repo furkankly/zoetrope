@@ -96,7 +96,7 @@ jobs:
 
       - name: Import the GPG key
         if: runner.os != 'Windows'
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.GPG_RELEASE_KEY }}
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
