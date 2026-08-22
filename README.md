@@ -36,11 +36,24 @@ Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkank
 
 ## Installation
 
+**Homebrew** — macOS and Linux:
+
+```bash
+brew install furkankly/tap/zoetrope
+```
+
+**Cargo** — needs a Rust toolchain:
+
 ```bash
 cargo install zoetrope
 ```
 
-The binary is `zoe`. Or build from source:
+**Prebuilt binaries** — no toolchain needed. Every
+[release](https://github.com/furkankly/zoetrope/releases) carries archives for
+macOS (Apple Silicon and Intel), Linux (`musl`, arm64 and x86_64) and Windows
+(x86_64). Unpack one and put `zoe` on your `PATH`.
+
+Whichever route you take, the command is `zoe`. Or build from source:
 
 ```bash
 git clone https://github.com/furkankly/zoetrope

@@ -1,6 +1,6 @@
 ---
 title: Install
-description: Install the zoetrope terminal app with cargo (or build it from source), or skip the install and run it in your browser.
+description: Install the zoetrope terminal app with Homebrew, cargo or a prebuilt binary (or build it from source), or skip the install and run it in your browser.
 ---
 
 zoetrope runs two ways: a terminal app you install, or the same portable core
@@ -19,13 +19,47 @@ which are identical to the native app.
 
 ## Install the terminal app
 
-crates.io gets one crate, `zoetrope`, and it installs one command, `zoe`:
+However you install it, the project is named `zoetrope` and the command it gives
+you is `zoe`.
+
+### Homebrew
+
+On macOS and Linux:
+
+```sh
+brew install furkankly/tap/zoetrope
+```
+
+The formula pours a prebuilt binary for Apple Silicon, Intel macOS, and arm64 or
+x86_64 Linux — no Rust toolchain involved. `brew upgrade zoetrope` tracks new
+releases.
+
+### Cargo
+
+If you already have a Rust toolchain, crates.io publishes one crate:
 
 ```sh
 cargo install zoetrope
 ```
 
-Or build from source:
+### A prebuilt binary
+
+Every [release](https://github.com/furkankly/zoetrope/releases) carries archives
+built from exactly the commit that was tagged:
+
+| Platform | Archive |
+| --- | --- |
+| macOS, Apple Silicon | `zoetrope-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `zoetrope-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux, arm64 (`musl`) | `zoetrope-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| Linux, x86_64 (`musl`) | `zoetrope-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Windows, x86_64 | `zoetrope-<version>-x86_64-pc-windows-msvc.zip` |
+
+Unpack one and put `zoe` somewhere on your `PATH`. The Linux builds are static
+(`musl`), so they don't care which distro they land on. Windows is binary-only —
+it isn't in the Homebrew tap.
+
+### From source
 
 ```sh
 git clone https://github.com/furkankly/zoetrope zoetrope
@@ -34,20 +68,11 @@ cargo build --release
 # binary at ./target/release/zoe
 ```
 
-:::note
-A source build also needs **`rataflow`**: the repo depends on it as a path
-dependency (a sibling checkout). Clone it alongside this repo until it's published:
-
-```sh
-git clone https://github.com/furkankly/rataflow rataflow
-```
-
-Your layout should be `…/zoetrope` and `…/rataflow` side by side.
-:::
-
 ### Requirements
 
-- A recent stable Rust toolchain (`rustup` recommended).
+- The Homebrew and prebuilt routes need no toolchain at all.
+- Building (`cargo install` or from source) needs a recent stable Rust toolchain
+  (`rustup` recommended).
 - A terminal that supports truecolor and mouse events (most modern terminals do).
 
 ## Build the browser app yourself
