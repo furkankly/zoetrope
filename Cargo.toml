@@ -13,7 +13,7 @@ exclude = ["web/wasm"]
 
 [package]
 name = "zoetrope"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Inherited from ratatui 0.30, which is the floor: nothing in this crate's own
 # source needs anything newer. Verified by the `msrv` job in CI.
