@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Sparkline, SparklineBar};
 
+use crate::i18n::{Locale, fill};
 use crate::state::session::LogKind;
 use crate::state::{App, Camera, Mode, Transport};
 
@@ -93,7 +94,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     render_status_bar(frame, status_area, app);
 
     if app.show_help {
-        render_help(frame, area, &app.flow.theme.palette());
+        render_help(frame, area, &app.flow.theme.palette(), app.locale);
     }
     if app.show_info {
         render_info(frame, area, app);
@@ -123,11 +124,12 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
     let txt = bg.fg(palette.text);
     let dim = bg.fg(palette.subtle);
     let info = &app.session_info;
+    let strs = app.locale.strs();
 
     let value_w = (w as usize).saturating_sub(12);
     let row = |label: &'static str, value: String, style: Style| {
         Line::from(vec![
-            Span::styled(format!(" {label:<8} "), key),
+            Span::styled(format!(" {} ", pad_width(label, 8)), key),
             Span::styled(truncate(&value, value_w), style),
         ])
     };
@@ -136,27 +138,33 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(""),
         row(
-            "title",
+            strs.info_title,
             info.title.clone().unwrap_or_else(|| dash.clone()),
             txt,
         ),
         row(
-            "perms",
+            strs.info_perms,
             info.permission_mode.clone().unwrap_or_else(|| dash.clone()),
             txt,
         ),
         row(
-            "mode",
+            strs.info_mode,
             info.mode.clone().unwrap_or_else(|| dash.clone()),
             txt,
         ),
         row(
-            "queued",
-            format!("{} · {} file edits", info.queued_ops, info.file_snapshots),
+            strs.info_queued,
+            fill(
+                strs.info_queued_edits,
+                &[
+                    ("q", &info.queued_ops.to_string()),
+                    ("f", &info.file_snapshots.to_string()),
+                ],
+            ),
             dim,
         ),
         row(
-            "last",
+            strs.info_last,
             info.last_prompt
                 .as_deref()
                 .map(|p| format!("\"{p}\""))
@@ -170,11 +178,11 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(bg.fg(palette.accent))
         .style(bg)
         .title_top(
-            Line::from(" session ")
+            Line::from(strs.info_heading)
                 .centered()
                 .style(bg.fg(palette.text).add_modifier(Modifier::BOLD)),
         )
-        .title_bottom(Line::from(" i / esc to close ").centered().style(dim));
+        .title_bottom(Line::from(strs.info_close).centered().style(dim));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -415,17 +423,20 @@ fn render_scrubber(frame: &mut Frame, area: Rect, app: &mut App) {
             .to_string(),
         None => "—".to_string(),
     };
+    let s = app.locale.strs();
     let (tag, tag_style) = match transport {
         Transport::Live => (
-            "● LIVE",
+            s.transport_live,
             bg.fg(palette.success).add_modifier(Modifier::BOLD),
         ),
-        Transport::Playing => ("▶ play", bg.fg(palette.accent)),
-        Transport::Paused => ("⏸ paused", bg.fg(palette.accent)),
-        Transport::History => ("⏮ history", bg.fg(palette.subtle)),
-        Transport::Idle => ("■ end", bg.fg(palette.subtle)),
+        Transport::Playing => (s.transport_play, bg.fg(palette.accent)),
+        Transport::Paused => (s.transport_pause, bg.fg(palette.accent)),
+        Transport::History => (s.transport_history, bg.fg(palette.subtle)),
+        Transport::Idle => (s.transport_end, bg.fg(palette.subtle)),
     };
-    let tag_cols = tag.chars().count() as u16;
+    // Display columns, not chars: a CJK tag is 2 cols per char and would
+    // under-reserve the right-aligned area.
+    let tag_cols = unicode_width::UnicodeWidthStr::width(tag) as u16;
     let [clock_area, tag_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(tag_cols + 1)]).areas(info_row);
     frame.render_widget(
@@ -543,7 +554,7 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
 }
 
 /// Centered help overlay: full key reference + status-glyph legend.
-fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
+fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette, locale: Locale) {
     let w = area.width.min(60);
     let h = area.height.min(18);
     if w < 24 || h < 9 {
@@ -561,75 +572,74 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
     let key = bg.fg(palette.accent).add_modifier(Modifier::BOLD);
     let txt = bg.fg(palette.text);
     let dim = bg.fg(palette.subtle);
+    let s = locale.strs();
 
-    // The keymap is identical on native and web except quit: a browser tab can't
-    // reliably close itself, so there `q`/`ctrl-c` don't apply.
+    // The keymap is identical on native and web except quit: a browser tab
+    // can't reliably close itself, so there `q`/`ctrl-c` don't apply.
     let quit_hint = if cfg!(target_arch = "wasm32") {
-        "close the browser tab"
+        s.help_quit_web
     } else {
         "q · ctrl-c"
     };
 
+    // Section-label column, padded to one common display width so the
+    // descriptions align (pad_width: CJK labels are 2 cols per char).
+    const LABEL_COLS: usize = 10;
+    let section = |name: &str| Span::styled(pad_width(name, LABEL_COLS), key);
+    let legend_spacer = Span::styled(" ".repeat(LABEL_COLS), key);
+
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" camera    ", key),
-            Span::styled("o overview · f follow · pan/zoom = manual", txt),
+            section(s.sec_camera),
+            Span::styled(s.help_camera, txt),
         ]),
         Line::from(vec![
-            Span::styled(" layout    ", key),
-            Span::styled("r rearrange the graph", txt),
+            section(s.sec_layout),
+            Span::styled(s.help_layout, txt),
         ]),
         Line::from(vec![
-            Span::styled(" navigate  ", key),
-            Span::styled("tab / shift-tab cycle · ↑↓←→ · click select", txt),
+            section(s.sec_navigate),
+            Span::styled(s.help_navigate, txt),
         ]),
         Line::from(vec![
-            Span::styled(" viewport  ", key),
-            Span::styled("h j k l pan · + - zoom · 0 reset · c center", txt),
+            section(s.sec_viewport),
+            Span::styled(s.help_viewport, txt),
         ]),
+        Line::from(vec![section(s.sec_panel), Span::styled(s.help_panel, txt)]),
         Line::from(vec![
-            Span::styled(" panel     ", key),
-            Span::styled("j/k · pgup/pgdn scroll · esc close", txt),
-        ]),
-        Line::from(vec![
-            Span::styled(" timeline  ", key),
-            Span::styled("[ ] step prompts ", txt),
+            section(s.sec_timeline),
+            Span::styled(s.help_timeline_a, txt),
             Span::styled("◆", bg.fg(palette.accent)),
-            Span::styled(" · End/g live · drag to seek", txt),
+            Span::styled(s.help_timeline_b, txt),
         ]),
         Line::from(vec![
-            Span::styled(" pacing    ", key),
-            Span::styled("s skip idle gaps (on = »; off = real-time)", txt),
+            section(s.sec_pacing),
+            Span::styled(s.help_pacing, txt),
+        ]),
+        Line::from(vec![section(s.sec_info), Span::styled(s.help_info, txt)]),
+        Line::from(vec![
+            section(s.sec_replay),
+            Span::styled(s.help_replay, txt),
         ]),
         Line::from(vec![
-            Span::styled(" info      ", key),
-            Span::styled("i session details (mode, prompts, …)", txt),
+            section(s.sec_language),
+            Span::styled(s.help_language, txt),
         ]),
         Line::from(vec![
-            Span::styled(" replay    ", key),
-            Span::styled("space pause/resume", txt),
-        ]),
-        Line::from(vec![
-            Span::styled(" quit      ", key),
-            Span::styled(quit_hint, txt),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" status    ", key),
+            section(s.sec_status),
             Span::styled("● ", bg.fg(palette.success)),
-            Span::styled("active/running  ", txt),
+            Span::styled(format!("{}  ", s.legend_active_running), txt),
             Span::styled("◌ ", dim),
-            Span::styled("idle  ", txt),
+            Span::styled(format!("{}  ", s.legend_idle), txt),
             Span::styled("✓ ", bg.fg(palette.accent)),
-            Span::styled("done  ", txt),
+            Span::styled(format!("{}  ", s.legend_done), txt),
             Span::styled("✗ ", bg.fg(palette.error)),
-            Span::styled("failed", txt),
+            Span::styled(s.legend_failed, txt),
         ]),
-        Line::from(vec![
-            Span::styled("           ", key),
-            Span::styled("green edges = agent running", dim),
-        ]),
+        Line::from(vec![legend_spacer, Span::styled(s.legend_edges, dim)]),
+        Line::from(""),
+        Line::from(vec![section(s.sec_quit), Span::styled(quit_hint, txt)]),
     ];
 
     let block = Block::default()
@@ -637,11 +647,11 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
         .border_style(bg.fg(palette.accent))
         .style(bg)
         .title_top(
-            Line::from(" zoetrope — keys ")
+            Line::from(s.help_title)
                 .centered()
                 .style(bg.fg(palette.text).add_modifier(Modifier::BOLD)),
         )
-        .title_bottom(Line::from(" ? or esc to close ").centered().style(dim));
+        .title_bottom(Line::from(s.help_close).centered().style(dim));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -683,17 +693,22 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     let palette = app.flow.theme.palette();
     let bg = Style::default().bg(palette.surface);
+    let s = app.locale.strs();
 
-    let title = app.session_info.title.as_deref().unwrap_or("session");
+    let title = app
+        .session_info
+        .title
+        .as_deref()
+        .unwrap_or(s.statusbar_untitled);
 
     // Emergent transport badge — "LIVE" is following + fresh appends, never a
     // hardcoded mode.
     let (badge, badge_color) = match app.transport() {
-        Transport::Live => (" ● LIVE ", palette.success),
-        Transport::Playing => (" ▶ PLAY ", palette.accent),
-        Transport::Paused => (" ⏸ PAUSE ", palette.accent),
-        Transport::History => (" ⏮ PAST ", palette.subtle),
-        Transport::Idle => (" ■ IDLE ", palette.subtle),
+        Transport::Live => (s.badge_live, palette.success),
+        Transport::Playing => (s.badge_play, palette.accent),
+        Transport::Paused => (s.badge_pause, palette.accent),
+        Transport::History => (s.badge_past, palette.subtle),
+        Transport::Idle => (s.badge_idle, palette.subtle),
     };
 
     let mut left: Vec<Span> = vec![
@@ -720,17 +735,19 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     ];
 
     left.push(Span::styled(
-        format!(
-            "  {} agents · {} tools",
-            app.session.agent_count(),
-            app.session.tool_count()
+        fill(
+            s.statusbar_counts,
+            &[
+                ("a", &app.session.agent_count().to_string()),
+                ("t", &app.session.tool_count().to_string()),
+            ],
         ),
         bg.fg(palette.subtle),
     ));
 
     match app.camera {
-        Camera::Overview => left.push(Span::styled("  ⌖ overview", bg.fg(palette.subtle))),
-        Camera::Follow => left.push(Span::styled("  ⌖ follow", bg.fg(palette.subtle))),
+        Camera::Overview => left.push(Span::styled(s.statusbar_overview, bg.fg(palette.subtle))),
+        Camera::Follow => left.push(Span::styled(s.statusbar_follow, bg.fg(palette.subtle))),
         Camera::Manual => {}
     }
 
@@ -746,19 +763,21 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let quit = if cfg!(target_arch = "wasm32") {
         ""
     } else {
-        "q quit · "
+        s.statusbar_quit
     };
-    let hints = if app.mode == Mode::Replay {
-        format!("{quit}? help · space pause")
+    let pause = if app.mode == Mode::Replay {
+        format!(" · space {}", s.statusbar_pause)
     } else {
-        format!("{quit}? help")
+        String::new()
     };
+    let hints = format!("{}{}{}", quit, s.statusbar_help, pause);
 
     // Reserve the hint area in terminal CELLS, not bytes: the hints contain
-    // multibyte glyphs (`·` is 2 bytes, the arrows 3 each), so `str::len()`
-    // would over-reserve and squeeze the left status. The hint chars are all
-    // single-width BMP, so char count equals display columns here.
-    let hints_cols = hints.chars().count() as u16;
+    // multibyte glyphs (`·`, the arrows, and every CJK char in a translated
+    // hint), so `str::len()` would over-reserve and squeeze the left status —
+    // and char count would UNDER-reserve CJK (2 columns per char), so measure
+    // display columns.
+    let hints_cols = unicode_width::UnicodeWidthStr::width(hints.as_str()) as u16;
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(hints_cols + 1)]).areas(area);
 
@@ -786,6 +805,18 @@ pub(crate) fn status_color(
         AgentStatus::Failed => palette.error,
         // Stopped: terminal but not success/failure — a neutral, muted mark.
         AgentStatus::Stopped => palette.muted,
+    }
+}
+
+/// Right-pad to exactly `cols` display columns (unicode-width, so CJK labels
+/// pad correctly — `format!("{:<w$}")` counts chars and under-pads wide ones).
+pub(crate) fn pad_width(s: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let w = s.width();
+    if w >= cols {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(cols - w))
     }
 }
 

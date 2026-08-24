@@ -13,6 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget};
 
+use crate::i18n::Locale;
 use crate::state::session::AgentStatus;
 
 /// Fixed card dimensions for main / workflow nodes (world units).
@@ -46,6 +47,11 @@ pub struct AgentNode {
     /// Interactive agents (main, forks) word `Running` as "active": we know
     /// there are recent entries, not that a task is executing.
     pub interactive: bool,
+    /// UI language for the card's own words (status, tools, token unit). The
+    /// render context carries no App reference, so the locale is stamped onto
+    /// the content at graph sync — and refreshed in place by
+    /// [`App::set_locale`](crate::state::App::set_locale).
+    pub locale: Locale,
 }
 
 use crate::ui::truncate;
@@ -74,7 +80,7 @@ impl NodeContent for AgentNode {
         // Single-source vocabulary + presence colors (cards/panel/inspect
         // share them; only the pulse override below is card-specific).
         let glyph_color = crate::ui::status_color(self.status, &palette);
-        let status_text = crate::state::session::status_word(self.status, self.interactive);
+        let status_text = self.locale.status_word(self.status, self.interactive);
 
         // Cell level (semantic zoom): too small for any text — a bordered card
         // carries no information here, so paint a solid status-colored block.
@@ -152,7 +158,11 @@ impl NodeContent for AgentNode {
                 inner_w.saturating_sub(unicode_width::UnicodeWidthStr::width(prefix.as_str()));
             format!("{prefix}{}", truncate(last, budget))
         } else {
-            format!("⚒ {} tools", self.tool_count)
+            format!(
+                "⚒ {} {}",
+                self.tool_count,
+                self.locale.strs().card_tools_word
+            )
         };
         lines.push(Line::from(Span::styled(
             tools_text,
@@ -161,10 +171,11 @@ impl NodeContent for AgentNode {
 
         // Footer row: status word + token count, separated to the edges.
         let tokens = fmt_tokens(self.output_tokens);
+        let tok_unit = self.locale.strs().card_tok_unit;
         let footer = if self.output_tokens > 0 {
             Line::from(vec![
                 Span::styled(status_text, bg_style.fg(glyph_color)),
-                Span::styled(format!("  {tokens} tok"), bg_style.fg(palette.muted)),
+                Span::styled(format!("  {tokens} {tok_unit}"), bg_style.fg(palette.muted)),
             ])
         } else {
             Line::from(Span::styled(status_text, bg_style.fg(glyph_color)))
@@ -244,6 +255,7 @@ mod tests {
             last_tool: Some("Bash".into()),
             output_tokens: 1200,
             interactive: false,
+            locale: Locale::En,
         };
         let ctx = NodeRenderContext {
             id: "main",

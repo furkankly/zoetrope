@@ -24,6 +24,8 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
+<p align="center">English · <a href="README.zh-CN.md">简体中文</a></p>
+
 Claude Code writes a JSONL transcript for every session under `~/.claude/projects/`.
 zoetrope reads it and draws the session as a graph in your terminal: the main agent, the subagents and
 workflows it spawns, and the tools each one runs, updating live as it goes. Point it

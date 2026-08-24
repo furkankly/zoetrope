@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
+use zoetrope::i18n::{Locale, fill};
 use zoetrope::state::session::{AgentKind, SessionModel, ToolState};
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{Source, TailRequest, UiEvent, Update};
@@ -39,44 +40,69 @@ pub enum Cli {
         target: Option<PathBuf>,
         follow: bool,
         speed: f64,
+        locale: Locale,
     },
     /// Headless: parse and print the session tree + info; no TUI.
-    Inspect { file: PathBuf },
+    Inspect { file: PathBuf, locale: Locale },
 }
 
 /// Default replay speed multiplier.
 const DEFAULT_REPLAY_SPEED: f64 = 8.0;
 
-const USAGE: &str = "\
-zoetrope — visualize Claude Code agent sessions as a flow graph
+/// The usage text for a locale (the string table carries one per language).
+fn usage(locale: Locale) -> &'static str {
+    locale.strs().cli_usage
+}
 
-USAGE:
-    zoe                     follow the current project's live session
-    zoe <file.jsonl>        replay a recording, played from the start
-    zoe <dir>               follow another project's live session
-    zoe <file> --follow     follow a file's live edge instead of replaying
-    zoe <file> --speed N    playback speed (default 8.0)
-    zoe inspect <file>      headless: print the session tree + info
-    zoe --version           print the version and exit
-
-Once open, scrub/follow/pause/go-live are available no matter how you launched.";
+/// Resolve the launch locale: `--lang` > `ZOETROPE_LANG` > the system
+/// environment (`LC_ALL`/`LC_MESSAGES`/`LANG`) > English.
+fn detect_locale() -> Locale {
+    std::env::var("ZOETROPE_LANG")
+        .ok()
+        .as_deref()
+        .and_then(Locale::from_tag)
+        .or_else(Locale::detect_env)
+        .unwrap_or_default()
+}
 
 /// Parse `std::env::args` into a [`Cli`]. Returns a usage error on bad input.
-fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
+/// `locale` is the fallback (from [`detect_locale`]); `--lang` overrides it.
+fn parse_cli(args: impl Iterator<Item = String>, locale: Locale) -> Result<Cli> {
     // Skip argv[0].
     let mut args = args.skip(1).peekable();
+    let mut locale = locale;
 
     // `inspect <file>` is the one distinct (headless) subcommand.
     if args.peek().map(String::as_str) == Some("inspect") {
         args.next();
-        let file = args
-            .next()
-            .ok_or_else(|| anyhow!("inspect requires a <file.jsonl>\n\n{USAGE}"))?;
-        if args.next().is_some() {
-            bail!("inspect takes a single file argument\n\n{USAGE}");
+        let file = args.next().ok_or_else(|| {
+            anyhow!(
+                "{}\n\n{}",
+                locale.strs().err_inspect_requires,
+                usage(locale)
+            )
+        })?;
+        let mut extra = args.next();
+        // `inspect <file> --lang zh` is accepted alongside the bare form.
+        while let Some(arg) = extra {
+            match arg.as_str() {
+                "--lang" => {
+                    let v = args.next().ok_or_else(|| {
+                        anyhow!("{}\n\n{}", locale.strs().err_lang_requires, usage(locale))
+                    })?;
+                    locale = parse_lang(&v, locale)?;
+                    extra = args.next();
+                }
+                other => bail!(
+                    "{}: {other:?}\n\n{}",
+                    locale.strs().err_single_path,
+                    usage(locale)
+                ),
+            }
         }
         return Ok(Cli::Inspect {
             file: PathBuf::from(file),
+            locale,
         });
     }
 
@@ -87,7 +113,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{}", usage(locale));
                 std::process::exit(0);
             }
             // Packaging depends on this: the Homebrew formula's `test do`
@@ -97,23 +123,33 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                 std::process::exit(0);
             }
             "--follow" => follow = true,
+            "--lang" => {
+                let v = args.next().ok_or_else(|| {
+                    anyhow!("{}\n\n{}", locale.strs().err_lang_requires, usage(locale))
+                })?;
+                locale = parse_lang(&v, locale)?;
+            }
             "--speed" => {
-                let v = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--speed requires a number\n\n{USAGE}"))?;
+                let v = args.next().ok_or_else(|| {
+                    anyhow!("{}\n\n{}", locale.strs().err_speed_requires, usage(locale))
+                })?;
                 speed = v
                     .parse::<f64>()
-                    .with_context(|| format!("invalid --speed value: {v:?}"))?;
+                    .with_context(|| fill(locale.strs().err_speed_invalid, &[("v", &v)]))?;
                 if !(speed.is_finite() && speed > 0.0) {
-                    bail!("--speed must be a positive number, got {v:?}");
+                    bail!("{}", fill(locale.strs().err_speed_positive, &[("v", &v)]));
                 }
             }
             other if other.starts_with('-') => {
-                bail!("unknown flag {other:?}\n\n{USAGE}");
+                bail!(
+                    "{}\n\n{}",
+                    fill(locale.strs().err_unknown_flag, &[("v", other)]),
+                    usage(locale)
+                );
             }
             _ => {
                 if target.is_some() {
-                    bail!("expected a single path argument\n\n{USAGE}");
+                    bail!("{}\n\n{}", locale.strs().err_single_path, usage(locale));
                 }
                 target = Some(PathBuf::from(arg));
             }
@@ -124,15 +160,26 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         target,
         follow,
         speed,
+        locale,
     })
+}
+
+/// Parse a `--lang` value into a [`Locale`], or fail with the localized error.
+fn parse_lang(v: &str, current: Locale) -> Result<Locale> {
+    Locale::from_tag(v)
+        .ok_or_else(|| anyhow!("{}", fill(current.strs().err_unknown_lang, &[("v", v)])))
 }
 
 /// Read a transcript file fully and fold its lines into `model` under `source`.
 ///
 /// Defensive: unreadable lines are skipped; only the file-open error propagates.
-fn fold_file(model: &mut SessionModel, path: &Path, source: Source) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading transcript {}", path.display()))?;
+fn fold_file(model: &mut SessionModel, path: &Path, source: Source, locale: Locale) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        fill(
+            locale.strs().err_reading,
+            &[("p", &path.display().to_string())],
+        )
+    })?;
     for line in text.lines() {
         if let Some(entry) = transcript::parse_line(line) {
             model.apply_update(&Update::Entry {
@@ -159,7 +206,7 @@ fn fold_meta(model: &mut SessionModel, path: &Path, agent_id: &str, workflow: Op
 /// journals) into a [`SessionModel`], reading every sidecar discovered next to
 /// the main transcript. Shared by `inspect`; the live/replay path uses the
 /// tailer instead.
-fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
+fn parse_session_fully(main_file: &Path, locale: Locale) -> Result<SessionModel> {
     let session_id = main_file
         .file_stem()
         .and_then(|s| s.to_str())
@@ -175,23 +222,23 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
     // tree well-formed.
     if let Some(subs) = transcript::subagents_dir(main_file) {
         // Direct subagents: agent-<id>.jsonl + agent-<id>.meta.json
-        collect_subagents(&mut model, &subs, None);
+        collect_subagents(&mut model, &subs, None, locale);
 
         // Workflow subagents: workflows/<wf-id>/agent-*.jsonl + journal.jsonl
         for wf_id in transcript::scan_workflow_ids(&subs) {
             let wf_path = transcript::workflow_dir(&subs, &wf_id);
-            collect_subagents(&mut model, &wf_path, Some(&wf_id));
+            collect_subagents(&mut model, &wf_path, Some(&wf_id), locale);
 
             // Journal ledger marks workflow-subagent completion.
             let journal = transcript::workflow_journal(&subs, &wf_id);
             if journal.is_file() {
-                let _ = fold_file(&mut model, &journal, Source::Journal(wf_id.clone()));
+                let _ = fold_file(&mut model, &journal, Source::Journal(wf_id.clone()), locale);
             }
         }
     }
 
     // Finally the main transcript — its tool_results resolve subagent statuses.
-    fold_file(&mut model, main_file, Source::Main)?;
+    fold_file(&mut model, main_file, Source::Main, locale)?;
 
     // Workflow group nodes have no direct completion signal — roll them up from
     // their children once everything is folded.
@@ -207,48 +254,74 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
 
 /// Discover and fold every `agent-<id>.jsonl` (+ `.meta.json`) in `dir`. Used
 /// for both direct subagents (`workflow == None`) and workflow subagents.
-fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str>) {
+fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str>, locale: Locale) {
     for file in transcript::scan_subagent_files(dir, workflow) {
         // Fold the meta sidecar first so the node exists with type/desc.
         if file.meta.is_file() {
             fold_meta(model, &file.meta, &file.agent_id, workflow);
         }
-        let _ = fold_file(model, &file.transcript, Source::Sub(file.agent_id));
+        let _ = fold_file(model, &file.transcript, Source::Sub(file.agent_id), locale);
     }
 }
 
 /// Run the `inspect` subcommand: fully parse the session and print a tree to
 /// stdout. Returns an error (non-zero exit) on an unreadable file. This is the
 /// headless smoke test — no TTY required.
-async fn run_inspect(file: PathBuf) -> Result<()> {
+async fn run_inspect(file: PathBuf, locale: Locale) -> Result<()> {
     if !file.is_file() {
-        bail!("not a readable file: {}", file.display());
+        bail!(
+            "{}",
+            fill(
+                locale.strs().err_not_readable,
+                &[("p", &file.display().to_string())]
+            )
+        );
     }
-    let model = parse_session_fully(&file)?;
+    let model = parse_session_fully(&file, locale)?;
     let info = read_session_info(&file);
+    let s = locale.strs();
 
-    let title = info.title.as_deref().unwrap_or("(untitled)");
-    println!("session {} — {title}", model.session_id);
+    let title = info.title.as_deref().unwrap_or(s.inspect_untitled);
+    println!(
+        "{}",
+        fill(
+            s.inspect_session,
+            &[("id", &model.session_id), ("title", title)]
+        )
+    );
     // Session-level metadata (the `i` overlay's content, headless).
     println!(
-        "  mode: {} · permission: {}",
-        info.mode.as_deref().unwrap_or("—"),
-        info.permission_mode.as_deref().unwrap_or("—"),
+        "{}",
+        fill(
+            s.inspect_mode_perm,
+            &[
+                ("m", info.mode.as_deref().unwrap_or("—")),
+                ("p", info.permission_mode.as_deref().unwrap_or("—")),
+            ],
+        )
     );
     println!(
-        "  {} agent(s), {} tool call(s) · {} queued · {} file edit(s)",
-        model.agent_count(),
-        model.tool_count(),
-        info.queued_ops,
-        info.file_snapshots,
+        "{}",
+        fill(
+            s.inspect_summary,
+            &[
+                ("a", &model.agent_count().to_string()),
+                ("t", &model.tool_count().to_string()),
+                ("q", &info.queued_ops.to_string()),
+                ("f", &info.file_snapshots.to_string()),
+            ],
+        )
     );
     if let Some(p) = &info.last_prompt {
-        println!("  last prompt: {p:?}");
+        println!(
+            "{}",
+            fill(s.inspect_last_prompt, &[("p", &format!("{p:?}"))])
+        );
     }
     println!();
 
     // Print roots first, then children indented underneath, in spawn order.
-    print_agent_tree(&model, None, 0);
+    print_agent_tree(&model, None, 0, locale);
 
     Ok(())
 }
@@ -269,7 +342,7 @@ fn read_session_info(main_path: &Path) -> zoetrope::state::SessionInfo {
 }
 
 /// Recursively print agents whose `parent` equals `parent`, in spawn order.
-fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
+fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize, locale: Locale) {
     for id in &model.spawn_order {
         let Some(agent) = model.agent(id) else {
             continue;
@@ -279,13 +352,14 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
         }
 
         let indent = "  ".repeat(depth + 1);
+        let s = locale.strs();
         let kind = match agent.kind {
-            AgentKind::Main => "main",
-            AgentKind::Subagent => "subagent",
-            AgentKind::WorkflowGroup => "workflow",
+            AgentKind::Main => s.kind_main,
+            AgentKind::Subagent => s.kind_subagent,
+            AgentKind::WorkflowGroup => s.kind_workflow,
         };
         // Single source: same wording + glyph the cards/panel use.
-        let status = agent.status_word();
+        let status = agent.status_word(locale);
         let glyph = agent.status.glyph();
 
         let label = agent
@@ -313,27 +387,35 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
             println!("{indent}    {desc}");
         }
         if let Some(model_name) = &agent.model {
-            println!("{indent}    model: {model_name}");
+            println!("{}", fill(s.inspect_model, &[("m", model_name)]));
         }
         println!(
-            "{indent}    tools: {} ({ok}✓ {err}✗ {pending}⏳)   tokens: {}",
-            agent.tool_calls.len(),
-            agent.output_tokens
+            "{indent}{}",
+            fill(
+                s.inspect_tools,
+                &[
+                    ("n", &agent.tool_calls.len().to_string()),
+                    ("ok", &ok.to_string()),
+                    ("err", &err.to_string()),
+                    ("pend", &pending.to_string()),
+                    ("k", &agent.output_tokens.to_string()),
+                ],
+            )
         );
 
         // Provenance: what triggered this agent (the panel's `↳ prompt`/`↳ thought`).
         if let Some(ctx) = model.provenance(agent) {
             if let Some(prompt) = model.provenance_prompt(ctx) {
-                println!("{indent}    ↳ prompt: {prompt}");
+                println!("{}", fill(s.inspect_prompt, &[("p", prompt)]));
             }
             if let Some(reasoning) = &ctx.reasoning {
-                println!("{indent}    ↳ thought: {reasoning}");
+                println!("{}", fill(s.inspect_thought, &[("p", reasoning)]));
             }
         }
 
         // Recurse into this agent's children (workflow groups have subagent
         // children, main has direct subagents + workflow groups).
-        print_agent_tree(model, Some(id), depth + 1);
+        print_agent_tree(model, Some(id), depth + 1, locale);
     }
 }
 
@@ -348,6 +430,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         target,
         follow,
         speed,
+        locale,
     } = cli
     else {
         unreachable!("inspect handled in main");
@@ -408,7 +491,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     });
 
-    let app = App::new(session_id, mode);
+    let mut app = App::new(session_id, mode);
+    app.set_locale(locale);
     tui::run(app, tail_tx, ui_rx).await
 }
 
@@ -423,9 +507,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cli = parse_cli(std::env::args())?;
+    let cli = parse_cli(std::env::args(), detect_locale())?;
     match cli {
-        Cli::Inspect { file } => run_inspect(file).await,
+        Cli::Inspect { file, locale } => run_inspect(file, locale).await,
         other => run_tui(other).await,
     }
 }
@@ -439,7 +523,7 @@ mod tests {
         // parse_cli skips argv[0], so prepend a fake program name.
         let mut v = vec!["zoe".to_string()];
         v.extend(args.iter().map(|s| s.to_string()));
-        parse_cli(v.into_iter())
+        parse_cli(v.into_iter(), Locale::En)
     }
 
     #[test]
@@ -489,6 +573,7 @@ mod tests {
                 target: Some(p),
                 follow,
                 speed,
+                ..
             } => {
                 assert_eq!(p, PathBuf::from("s.jsonl"));
                 assert_eq!(speed, 4.0);
@@ -527,7 +612,7 @@ mod tests {
     #[test]
     fn inspect_takes_one_file() {
         match cli(&["inspect", "s.jsonl"]).unwrap() {
-            Cli::Inspect { file } => assert_eq!(file, PathBuf::from("s.jsonl")),
+            Cli::Inspect { file, .. } => assert_eq!(file, PathBuf::from("s.jsonl")),
             other => panic!("got {other:?}"),
         }
         assert!(cli(&["inspect"]).is_err());
@@ -553,7 +638,7 @@ mod tests {
         )
         .unwrap();
 
-        let model = parse_session_fully(&tmp).expect("parses");
+        let model = parse_session_fully(&tmp, Locale::En).expect("parses");
         assert_eq!(
             model
                 .agent(zoetrope::state::session::MAIN_ID)

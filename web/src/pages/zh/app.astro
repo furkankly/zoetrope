@@ -1,0 +1,20 @@
+---
+// Starlight prefixes sidebar links with the current locale, so the Chinese
+// sidebar's "open the browser app" entry lands on /zh/app. The app itself is
+// one standalone page that localizes in-canvas (via navigator.language and the
+// toolbar toggle), so this route just bounces to it — with an instant
+// meta-refresh rather than `Astro.redirect`, whose static-mode fallback waits
+// two seconds.
+---
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="refresh" content="0;url=/app" />
+    <link rel="canonical" href="/app" />
+    <title>zoetrope — 浏览器版</title>
+  </head>
+  <body>
+    <a href="/app">正在前往 zoetrope 浏览器版…</a>
+  </body>
+</html>

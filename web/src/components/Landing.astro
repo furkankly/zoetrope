@@ -1,0 +1,462 @@
+---
+// The zoetrope front page — a bespoke, standalone "living terminal" landing
+// (NOT the Starlight splash; the docs at /guides/* keep their Starlight chrome).
+// It reads like a zoetrope session: a dotted-grid canvas, a terminal window with
+// an animated ASCII flow-graph, and the least copy that still sells the feeling —
+// because the whole app is one click away at /app.
+//
+// Rendered once per language (`/` for en, `/zh/` for zh) from the copy tables
+// in `src/i18n/landing.ts`; the two page files are one-liners.
+import { Font } from 'astro:assets';
+import Analytics from './Analytics.astro';
+import Seo from './Seo.astro';
+import Schema from './Schema.astro';
+import { REPO_URL } from '../consts.ts';
+import ZoetropeSvg from '../assets/zoetrope.svg';
+import { LANDING } from '../i18n/landing.ts';
+
+interface Props {
+  lang: 'en' | 'zh';
+}
+
+const { lang } = Astro.props;
+const t = LANDING[lang];
+// The docs live under Starlight locales: `/guides/…` (root) vs `/zh/guides/…`.
+const DOCS_URL = lang === 'zh' ? '/zh/guides/install/' : '/guides/install/';
+const KEYS_URL = lang === 'zh' ? '/zh/guides/usage/' : '/guides/usage/';
+---
+
+<!doctype html>
+<html lang={t.htmlLang}>
+  <head>
+    <meta charset="UTF-8" />
+    <Analytics />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{t.title}</title>
+    <meta name="description" content={t.description} />
+    <Schema />
+    <Seo title={t.title} description={t.description} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <Font cssVariable="--font-mono" preload />
+    <Font cssVariable="--font-display" preload />
+  </head>
+
+  <body>
+    <!-- ── Top bar ─────────────────────────────────────────────────────────── -->
+    <header class="bar">
+      {/* The mark, inlined and recomposed for 18px: the ring, the elapsed arc
+          and the playhead survive, the three-node session inside them does not
+          — at this size it is three grey pixels. The live agent stays as the
+          dot in the middle and keeps the pulse the bare `●` used to carry, so
+          the header still says "something is running" as well as "zoetrope".
+          Colours come from the page tokens, not the file, so it follows the
+          theme; the ink card the favicon carries is dropped because the bar
+          already supplies the ground. */}
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 32 32" width="18" height="18" aria-hidden="true">
+          <g fill="none" stroke-width="3.5" stroke-dasharray="5.8 2.84">
+            <path d="M16 5 A 11 11 0 1 1 16 27 A 11 11 0 1 1 16 5" stroke="var(--dim)"></path>
+            <path d="M16 5 A 11 11 0 0 1 25.5 21.5" stroke="var(--gold)" opacity="0.55"></path>
+          </g>
+          <line
+            x1="16"
+            y1="2.5"
+            x2="16"
+            y2="7"
+            stroke="var(--gold)"
+            stroke-width="2.6"
+            stroke-linecap="round"
+            transform="rotate(120 16 16)"></line>
+          <circle class="pulse-dot" cx="16" cy="16" r="2.6" fill="var(--green)"></circle>
+        </svg>
+        zoetrope
+      </a>
+      <span class="spacer"></span>
+      <a class="lnk" href={KEYS_URL}>{t.nav.keys}</a>
+      <a class="lnk" href={DOCS_URL}>{t.nav.docs}</a>
+      <a class="lnk" href={t.nav.langSwitchHref}>{t.nav.langSwitch}</a>
+      <a class="lnk" href={REPO_URL} target="_blank" rel="noopener">{t.nav.github}</a>
+      <a class="cta" href="/app">{t.nav.openApp}</a>
+    </header>
+
+    <main>
+      <!-- ── Hero ──────────────────────────────────────────────────────────── -->
+      <section class="hero">
+        <div class="art">
+          <ZoetropeSvg aria-label={t.hero.artLabel} />
+        </div>
+
+        <div class="pitch">
+          <h1><Fragment set:html={t.hero.h1Top} /><em>{t.hero.h1Em}</em></h1>
+          <p class="sub">{t.hero.sub}</p>
+          <div class="actions">
+            <a class="btn primary" href="/app">{t.hero.tryBrowser}</a>
+            <a class="btn ghost" href={DOCS_URL}>{t.hero.installTui}</a>
+          </div>
+          <p class="fineprint">{t.hero.fineprint}</p>
+        </div>
+      </section>
+
+      <!-- ── What you get ──────────────────────────────────────────────────── -->
+      <section class="tiles">
+        {t.tiles.map((tile) => (
+          <article class="tile">
+            <span class={`g ${tile.cls}`}>{tile.glyph}</span>
+            <h3>{tile.h}</h3>
+            <p>{tile.p}</p>
+          </article>
+        ))}
+      </section>
+
+      <!-- ── See it ────────────────────────────────────────────────────────── -->
+      <section class="shots">
+        <!-- Animated: served from public/ rather than imported. Astro's image
+             pipeline (sharp) flattens animation to a single frame, so these
+             bypass it entirely and are written by hand at their natural size.
+
+             VIDEO HERE, GIF IN THE README. The two destinations disagree:
+             GitHub strips <video> from markdown, so the repo has to keep GIFs,
+             but a page has no such limit — and these three were 5.5 MB of GIF
+             on one landing page against 1.7 MB as H.264. Both files come out of
+             assets/to-mp4.sh under the same basename.
+
+             autoplay/muted/loop/playsinline are all load-bearing: mobile Safari
+             refuses to autoplay anything unmuted, and without playsinline it
+             takes the video fullscreen instead of playing it in place. A video
+             has no alt, so the accessible name is given with aria-label. The
+             <img> inside is reached only where <video> is unsupported. -->
+        {[
+          { video: '/zoetrope-demo.mp4', gif: '/zoetrope-demo.gif', copy: t.shots[0] },
+          { video: '/zoetrope-follow.mp4', gif: '/zoetrope-follow.gif', copy: t.shots[1] },
+          { video: '/zoetrope-tour.mp4', gif: '/zoetrope-tour.gif', copy: t.shots[2] },
+        ].map(({ video, gif, copy }) => (
+          <Fragment>
+            <div class="shot">
+              <div class="shot-head"><span class="dots"><i></i><i></i><i></i></span><span>{copy.head}</span></div>
+              <video src={video} aria-label={copy.videoLabel} width="1728" height="944"
+                     autoplay muted loop playsinline preload="metadata">
+                <img src={gif} alt={copy.videoLabel} width="1728" height="944" loading="lazy" decoding="async" />
+              </video>
+            </div>
+            <p class="shotcap"><Fragment set:html={copy.cap} /></p>
+          </Fragment>
+        ))}
+
+        <p class="shotnote">
+          {t.shotnotePre}
+          <a href="/app">{t.shotnoteLink}</a>{t.shotnotePost}
+        </p>
+      </section>
+
+      <!-- ── Closing CTA ───────────────────────────────────────────────────── -->
+      <section class="close">
+        <p class="prompt"><span class="mut">~/code/my-app $</span> zoe<span class="cursor">█</span></p>
+        <h2>{t.close.h2}</h2>
+        <div class="actions">
+          <a class="btn primary" href="/app">{t.close.openApp}</a>
+          <a class="btn ghost" href={DOCS_URL}>{t.close.install}</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span><span class="pulse-dot">●</span> zoetrope</span>
+      <span class="mut">{t.foot.tagline}</span>
+      <span class="mut">{t.foot.built} <a href="https://ratatui.rs" target="_blank" rel="noopener">ratatui</a> + <a href="https://github.com/ratatui/ratzilla" target="_blank" rel="noopener">ratzilla</a> · MIT</span>
+    </footer>
+
+    <style is:global>
+      :root {
+        --gold: #d7af00;
+        --gold-bright: #f0d56a;
+        --green: #87d787;
+        --ink: #0d0d0d;
+        --ink-2: #121212;
+        --panel: #1a1a1a;
+        --line: #2a2a2a;
+        --dim: #6a6a6a;
+        --bright: #e8e8e8;
+        --err: #e07a7a;
+        --mono: var(--font-mono), ui-monospace, "SF Mono", Menlo, monospace;
+        --display: var(--font-display), var(--font-mono), ui-monospace, monospace;
+      }
+
+      * { box-sizing: border-box; }
+
+      html { scroll-behavior: smooth; }
+
+      body {
+        margin: 0;
+        background: var(--ink);
+        color: var(--bright);
+        font-family: var(--mono);
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        /* Dotted-grid canvas, like the TUI + logo background. */
+        background-image: radial-gradient(rgba(120, 120, 120, 0.10) 1px, transparent 1px);
+        background-size: 24px 24px;
+        background-position: center top;
+      }
+
+      a { color: inherit; text-decoration: none; }
+      .mut { color: var(--dim); }
+      .ok { color: var(--green); }
+      .err { color: var(--err); }
+
+      /* ── Top bar ─────────────────────────────────────────────────────────── */
+      .bar {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        display: flex;
+        align-items: center;
+        gap: 1.1rem;
+        padding: 0.7rem 1.15rem;
+        background: rgba(13, 13, 13, 0.82);
+        backdrop-filter: blur(8px);
+        border-bottom: 1px solid var(--line);
+        font-size: 0.82rem;
+      }
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-family: var(--display);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--bright);
+      }
+      /* The brand's live dot is now the mark's centre circle, which takes a
+         `fill`; the footer keeps the text `●` and colours it via `.foot`. */
+      .brand-mark { flex: none; overflow: visible; }
+      .spacer { flex: 1; }
+      .lnk { color: var(--dim); transition: color 0.15s; }
+      .lnk:hover { color: var(--bright); }
+      .cta {
+        color: #170f00;
+        background: var(--gold);
+        padding: 0.34rem 0.85rem;
+        border-radius: 6px;
+        font-weight: 700;
+        transition: background 0.15s, transform 0.15s;
+      }
+      .cta:hover { background: var(--gold-bright); transform: translateY(-1px); }
+
+      main { max-width: 1080px; margin: 0 auto; padding: 0 1.15rem; }
+
+      /* ── Hero ────────────────────────────────────────────────────────────── */
+      .hero {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 2.4rem;
+        align-items: center;
+        padding: clamp(2.5rem, 7vw, 5.5rem) 0 clamp(2rem, 5vw, 4rem);
+      }
+
+      /* Hero visual: the animated brand SVG — a real zoetrope flow graph, its
+         status dots pulsing via the SVG's own SMIL animation. Crisp at any size. */
+      .art {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        background: #121212;
+        box-shadow:
+          0 30px 80px -30px rgba(0, 0, 0, 0.9),
+          0 0 60px -20px rgba(215, 175, 0, 0.12);
+      }
+      .art svg { display: block; width: 100%; height: auto; }
+
+      /* Terminal-dot cluster (shared by the screenshot title bars). */
+      .dots { display: inline-flex; gap: 0.4rem; }
+      .dots i {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: var(--line); display: inline-block;
+      }
+      .dots i:nth-child(1) { background: #4a3d1a; }
+      .cursor {
+        color: var(--gold);
+        animation: blink 1.05s steps(1) infinite;
+      }
+
+      /* Pitch column. */
+      .pitch h1 {
+        font-family: var(--display);
+        font-weight: 700;
+        font-size: clamp(2.3rem, 5.4vw, 3.7rem);
+        line-height: 1.02;
+        letter-spacing: -0.03em;
+        margin: 0 0 1.1rem;
+        color: var(--bright);
+      }
+      .pitch h1 em {
+        font-style: normal;
+        color: var(--gold);
+        position: relative;
+      }
+      .pitch .sub {
+        color: #b6b6b6;
+        font-size: clamp(0.9rem, 1.4vw, 1.02rem);
+        max-width: 34ch;
+        margin: 0 0 1.6rem;
+      }
+      .actions { display: flex; flex-wrap: wrap; gap: 0.7rem; }
+      .btn {
+        font-family: var(--mono);
+        font-size: 0.86rem;
+        font-weight: 500;
+        padding: 0.6rem 1.05rem;
+        border-radius: 7px;
+        border: 1px solid transparent;
+        transition: transform 0.15s, background 0.15s, border-color 0.15s, color 0.15s;
+        white-space: nowrap;
+      }
+      .btn.primary {
+        background: var(--gold);
+        color: #170f00;
+        font-weight: 700;
+        box-shadow: 0 0 0 rgba(215, 175, 0, 0.5);
+      }
+      .btn.primary:hover {
+        background: var(--gold-bright);
+        transform: translateY(-2px);
+        box-shadow: 0 10px 30px -10px rgba(215, 175, 0, 0.5);
+      }
+      .btn.ghost { border-color: var(--line); color: var(--bright); }
+      .btn.ghost:hover { border-color: var(--gold); color: var(--gold-bright); transform: translateY(-2px); }
+      .fineprint { font-size: 0.78rem; color: var(--dim); margin: 1.3rem 0 0; }
+
+      /* ── Tiles ───────────────────────────────────────────────────────────── */
+      .tiles {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.9rem;
+        padding: 1rem 0 clamp(2.5rem, 6vw, 4.5rem);
+      }
+      .tile {
+        border: 1px solid var(--line);
+        border-left: 2px solid var(--gold);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--ink) 55%, var(--panel));
+        padding: 1.05rem 1.1rem 1.15rem;
+        transition: transform 0.18s, border-color 0.18s, background 0.18s;
+      }
+      .tile:hover {
+        transform: translateY(-3px);
+        background: color-mix(in srgb, var(--ink) 35%, var(--panel));
+        border-top-color: var(--gold);
+      }
+      .tile .g { font-size: 1.1rem; font-variant-emoji: text; }
+      .tile .g.run { color: var(--green); }
+      .tile .g.gold { color: var(--gold); }
+      .tile h3 {
+        font-family: var(--display);
+        font-size: 0.98rem;
+        margin: 0.5rem 0 0.35rem;
+        letter-spacing: -0.01em;
+        color: var(--bright);
+      }
+      .tile p { margin: 0; font-size: 0.8rem; color: #a2a2a2; line-height: 1.5; }
+
+      /* ── Screenshots ─────────────────────────────────────────────────────── */
+      /* One full-width panel: the demo GIF is the centrepiece, so it gets the
+         whole column rather than sharing it with a still. */
+      .shots {
+        padding-bottom: clamp(2.5rem, 6vw, 4.5rem);
+      }
+      .shot + .shotcap {
+        margin: 0.75rem 0 2.2rem;
+        font-size: 0.84rem;
+        line-height: 1.55;
+        color: var(--dim);
+        text-align: center;
+        max-width: 62ch;
+        margin-inline: auto;
+      }
+      .shotcap kbd {
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--bright);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0 0.3rem;
+      }
+      .shotnote {
+        margin: 0.9rem 0 0;
+        text-align: center;
+        font-size: 0.82rem;
+        color: var(--dim);
+      }
+      .shotnote a { color: var(--gold); text-decoration: none; }
+      .shotnote a:hover { color: var(--gold-bright); text-decoration: underline; }
+      .shot {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        background: var(--ink-2);
+        box-shadow: 0 20px 60px -30px rgba(0, 0, 0, 0.9);
+      }
+      .shot-head {
+        display: flex; align-items: center; gap: 0.6rem;
+        padding: 0.5rem 0.8rem;
+        border-bottom: 1px solid var(--line);
+        font-size: 0.72rem; color: var(--dim);
+      }
+      /* video and img both: the <img> is the fallback inside each <video>. */
+      .shot video, .shot img { display: block; width: 100%; height: auto; }
+
+      /* ── Closing CTA ─────────────────────────────────────────────────────── */
+      .close {
+        text-align: center;
+        padding: clamp(3rem, 8vw, 6rem) 1rem clamp(3.5rem, 9vw, 7rem);
+        border-top: 1px solid var(--line);
+      }
+      .close .prompt { font-size: 0.86rem; color: var(--dim); margin: 0 0 1.4rem; }
+      .close h2 {
+        font-family: var(--display);
+        font-weight: 700;
+        font-size: clamp(1.7rem, 4.2vw, 2.7rem);
+        letter-spacing: -0.02em;
+        margin: 0 0 1.8rem;
+        color: var(--bright);
+      }
+      .close .actions { justify-content: center; }
+
+      /* ── Footer ──────────────────────────────────────────────────────────── */
+      .foot {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 0.6rem 1.5rem;
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 1.4rem 1.15rem 2.4rem;
+        border-top: 1px solid var(--line);
+        font-size: 0.76rem;
+        color: var(--dim);
+      }
+      .foot .pulse-dot { color: var(--green); }
+      .foot a { color: var(--dim); text-decoration: underline; text-underline-offset: 2px; }
+      .foot a:hover { color: var(--gold); }
+
+      /* ── Motion ──────────────────────────────────────────────────────────── */
+      .pulse-dot { animation: pulse 2s ease-in-out infinite; }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+      @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+
+      /* ── Responsive ──────────────────────────────────────────────────────── */
+      @media (max-width: 860px) {
+        .hero { grid-template-columns: 1fr; gap: 1.8rem; }
+        /* Lead with the animated graph on mobile, then the pitch below it. */
+        .tiles { grid-template-columns: 1fr 1fr; }
+      }
+      @media (max-width: 520px) {
+        .bar .lnk { display: none; }
+        .tiles { grid-template-columns: 1fr; }
+      }
+
+      /* Animations run for everyone, on purpose. The motion here (blinking
+         cursor, pulsing dots, the SVG's live session) is the whole point of the
+         page, so it is intentionally NOT gated behind prefers-reduced-motion. */
+    </style>
+  </body>
+</html>

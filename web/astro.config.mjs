@@ -54,26 +54,60 @@ export default defineConfig({
       social: [{ icon: 'github', label: 'GitHub', href: REPO_URL }],
       // The brand is a dark terminal; default to dark and keep a tidy light mode.
       customCss: ['./src/styles/zoetrope.css'],
-      // The in-browser app lives at /app (a standalone Astro page, not a docs
-      // route), so surface it as a top-level CTA in the sidebar.
+      // Two locales: English at the root (no URL prefix) and Simplified Chinese
+      // under /zh/. Starlight ships built-in UI translations for zh-CN (the
+      // language switcher, search, prev/next labels), picked up from the
+      // locale's `lang`. The landing pages (/ and /zh/) are standalone Astro
+      // pages rendered from the same component — not docs routes.
+      locales: {
+        root: { label: 'English', lang: 'en' },
+        zh: { label: '简体中文', lang: 'zh-CN' },
+      },
+      // One sidebar shared by both locales: Starlight prefixes each `link`
+      // with the current locale itself (/guides/… → /zh/guides/…), and each
+      // item's `translations` (keyed by the locale's lang, here 'zh-CN')
+      // overrides its label. The lone exception is /app: it is a standalone
+      // page that self-localizes, so /zh/app is a redirect to it.
       sidebar: [
         {
           label: 'Start here',
+          translations: { 'zh-CN': '从这里开始' },
           items: [
-            { label: 'What is zoetrope?', link: '/' },
-            { label: 'Install', link: '/guides/install/' },
-            { label: 'Usage & keys', link: '/guides/usage/' },
+            {
+              label: 'What is zoetrope?',
+              translations: { 'zh-CN': '什么是 zoetrope？' },
+              link: '/',
+            },
+            {
+              label: 'Install',
+              translations: { 'zh-CN': '安装' },
+              link: '/guides/install/',
+            },
+            {
+              label: 'Usage & keys',
+              translations: { 'zh-CN': '用法与按键' },
+              link: '/guides/usage/',
+            },
           ],
         },
         {
           label: 'Concepts',
-          items: [{ label: 'Design & architecture', link: '/guides/design/' }],
+          translations: { 'zh-CN': '概念' },
+          items: [
+            {
+              label: 'Design & architecture',
+              translations: { 'zh-CN': '设计与架构' },
+              link: '/guides/design/',
+            },
+          ],
         },
         {
           label: 'Try it',
+          translations: { 'zh-CN': '试一试' },
           items: [
             {
               label: 'Open the browser app ↗',
+              translations: { 'zh-CN': '打开浏览器版 ↗' },
               link: '/app',
               attrs: { target: '_self' },
               badge: { text: 'wasm', variant: 'tip' },

@@ -27,6 +27,7 @@ use ratzilla::{WebGl2Backend, WebRenderer};
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
+use zoetrope::i18n::Locale;
 use zoetrope::state::{App, Camera, Mode};
 use zoetrope::tailer::{
     DemoSubagent, Source, UiEvent, Update, replay_from_jsonl, replay_from_session,
@@ -134,6 +135,7 @@ fn main() -> io::Result<()> {
     ];
     let (items, info) = replay_from_session(DEMO_MAIN, &subagents);
     let mut app = App::new("demo".to_string(), Mode::Replay);
+    app.set_locale(browser_locale());
     app.handle_ui_event(UiEvent::ReplayLoaded {
         session_id: "demo".to_string(),
         items,
@@ -272,6 +274,25 @@ fn parse_subs(json: &str) -> Vec<OwnedSub> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
+/// Detect the UI language from `navigator.language` (falling back through
+/// `navigator.languages`): the first tag that maps to a known locale wins,
+/// English otherwise. The environment is a stub on wasm, so the browser's own
+/// language list is the only signal.
+fn browser_locale() -> Locale {
+    let Some(nav) = web_sys::window().map(|w| w.navigator()) else {
+        return Locale::default();
+    };
+    let tags: Vec<String> = nav
+        .language()
+        .into_iter()
+        .chain(nav.languages().iter().filter_map(|t| t.as_string()))
+        .collect();
+    tags.iter()
+        .filter_map(|t| Locale::from_tag(t))
+        .next()
+        .unwrap_or_default()
+}
+
 /// Load a whole session into the view, replacing whatever is showing (the demo,
 /// or a previously loaded one). `main_text` is the main transcript; `subagents_json`
 /// is the (possibly empty) sidecar payload. `live` opens it at the edge in live
@@ -309,6 +330,20 @@ pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
             *rc.borrow_mut() = next;
         }
     });
+}
+
+/// Switch the UI language of the running app (the toolbar's 中/En toggle).
+/// Accepts the same tags as `--lang` (`en`, `zh`, `zh-CN`, …); an unknown tag
+/// leaves the current language untouched.
+#[wasm_bindgen]
+pub fn zoetrope_set_lang(tag: String) {
+    if let Some(locale) = Locale::from_tag(&tag) {
+        APP.with(|cell| {
+            if let Some(rc) = cell.borrow().as_ref() {
+                rc.borrow_mut().set_locale(locale);
+            }
+        });
+    }
 }
 
 /// Feed newly-appended bytes from a live-followed session as one batch (the wasm
@@ -424,6 +459,11 @@ fn handle_key(key: RKeyEvent, app: &mut App) {
         // Overlays.
         RKeyCode::Char('i') | RKeyCode::Char('I') => {
             app.show_info = !app.show_info;
+            return;
+        }
+        // Cycle the UI language. Shift-L: lowercase `l` pans the graph (hjkl).
+        RKeyCode::Char('L') => {
+            app.cycle_locale();
             return;
         }
         RKeyCode::Char('?') => {

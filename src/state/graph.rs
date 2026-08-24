@@ -10,6 +10,7 @@ use rataflow::{Edge, Flow, Handle, HandlePosition, Node, Reconnectable, Sugiyama
 use ratatui::style::Color;
 
 use super::session::{AgentInfo, AgentKind, AgentStatus, SessionModel};
+use crate::i18n::Locale;
 use crate::ui::edges::AgentEdge;
 use crate::ui::nodes::{AgentNode, MAIN_NODE_DIMS, SUB_NODE_DIMS};
 
@@ -67,13 +68,15 @@ fn node_dims(kind: AgentKind) -> (f64, f64) {
 /// Whether a node's content already mirrors the agent — allocation-free
 /// comparison so unchanged agents skip [`build_content`]'s String clones on
 /// every sync (the steady state for almost all agents on almost all ticks).
-fn content_matches(info: &AgentInfo, node: &AgentNode) -> bool {
+/// Locale is compared too: a language switch must rebuild every card.
+fn content_matches(info: &AgentInfo, node: &AgentNode, locale: Locale) -> bool {
     let title_ok = match info.kind {
         AgentKind::Main => node.title == "claude",
         AgentKind::WorkflowGroup => node.title == info.agent_type.as_deref().unwrap_or("workflow"),
         AgentKind::Subagent => node.title == info.agent_type.as_deref().unwrap_or("subagent"),
     };
     title_ok
+        && node.locale == locale
         && node.description.as_deref() == info.description.as_deref()
         && node.status == info.status
         && node.tool_count == info.tool_calls.len()
@@ -83,7 +86,7 @@ fn content_matches(info: &AgentInfo, node: &AgentNode) -> bool {
 }
 
 /// Build the [`AgentNode`] content mirrored from an [`AgentInfo`].
-fn build_content(info: &AgentInfo) -> AgentNode {
+fn build_content(info: &AgentInfo, locale: Locale) -> AgentNode {
     AgentNode {
         title: node_title(info),
         description: info.description.clone(),
@@ -92,6 +95,7 @@ fn build_content(info: &AgentInfo) -> AgentNode {
         last_tool: info.last_tool().map(str::to_string),
         output_tokens: info.output_tokens,
         interactive: info.is_interactive(),
+        locale,
     }
 }
 
@@ -111,8 +115,9 @@ const LOCAL_V_GAP: f64 = 5.0;
 /// `Sugiyama::vertical()` pass (which overwrites the local placements). When
 /// false — Manual camera: the user owns the view — nothing existing moves;
 /// the caller tracks dirtiness and relayouts when the camera re-engages.
+/// `locale` is stamped onto every card (the render layer has no App access).
 /// Returns `true` if structure changed.
-pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool {
+pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool, locale: Locale) -> bool {
     let mut structural = false;
 
     // First pass: nodes (must exist before their edges).
@@ -124,8 +129,8 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
             // Steady state: only rebuild (String clones) when something
             // visible changed — the per-second status tick and per-batch
             // syncs walk every agent, and most are unchanged.
-            if !content_matches(info, existing) {
-                *existing = build_content(info);
+            if !content_matches(info, existing, locale) {
+                *existing = build_content(info, locale);
             }
         } else {
             // Sibling index for local placement — computed only for the rare
@@ -142,7 +147,7 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
                         .count()
                 })
                 .unwrap_or(0);
-            let content = build_content(info);
+            let content = build_content(info, locale);
             let (w, h) = node_dims(info.kind);
             // Local placement: below the parent, fanned past prior siblings.
             // Overwritten by Sugiyama when `relayout` runs; kept verbatim in
@@ -271,7 +276,7 @@ mod tests {
     fn sync_creates_nodes_and_edge() {
         let model = model_with_subagent();
         let mut flow = new_flow();
-        let structural = sync(&mut flow, &model, true);
+        let structural = sync(&mut flow, &model, true, Locale::default());
         assert!(structural);
         assert!(flow.node_content_mut("main").is_some());
         assert!(flow.node_content_mut("abc123").is_some());
@@ -283,13 +288,13 @@ mod tests {
     fn sync_idempotent() {
         let model = model_with_subagent();
         let mut flow = new_flow();
-        let first = sync(&mut flow, &model, true);
+        let first = sync(&mut flow, &model, true, Locale::default());
         assert!(first);
         let node_count = flow.nodes().count();
         let edge_count = flow.edges().len();
 
         // Applying the same model again adds nothing structural.
-        let second = sync(&mut flow, &model, true);
+        let second = sync(&mut flow, &model, true, Locale::default());
         assert!(!second);
         assert_eq!(flow.nodes().count(), node_count);
         assert_eq!(flow.edges().len(), edge_count);
@@ -299,7 +304,7 @@ mod tests {
     fn sync_preserves_selection() {
         let model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, Locale::default());
         flow.select_node("abc123");
         assert_eq!(
             flow.selected_nodes().next().map(|n| n.id.clone()),
@@ -311,7 +316,7 @@ mod tests {
         if let Some(a) = model2.agents.get_mut("abc123") {
             a.output_tokens += 100;
         }
-        sync(&mut flow, &model2, true);
+        sync(&mut flow, &model2, true, Locale::default());
         assert_eq!(
             flow.selected_nodes().next().map(|n| n.id.clone()),
             Some("abc123".to_string())
@@ -322,7 +327,7 @@ mod tests {
     fn edge_animation_follows_status() {
         let mut model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, Locale::default());
         // Running subagent -> animated edge.
         let edge_id = edge_id("abc123");
         let animated = flow
@@ -339,7 +344,7 @@ mod tests {
         if let Some(a) = model.agents.get_mut("abc123") {
             a.status = AgentStatus::Done;
         }
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, Locale::default());
         let animated = flow
             .edges()
             .iter()
@@ -355,7 +360,7 @@ mod tests {
 
         let model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, Locale::default());
 
         for node in flow.nodes() {
             assert!(node.selectable, "nodes stay selectable (detail panel)");
@@ -375,7 +380,7 @@ mod tests {
         let mut model = model_with_subagent();
         let mut flow = new_flow();
         // Initial layout (camera engaged).
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, Locale::default());
         let main_pos = flow.node("main").unwrap().position;
         let first_sub = flow.node("abc123").unwrap().position;
 
@@ -387,7 +392,7 @@ mod tests {
             stopped_by_user: None,
         };
         model.apply_meta("def456", None, &meta2);
-        let structural = sync(&mut flow, &model, false);
+        let structural = sync(&mut flow, &model, false, Locale::default());
         assert!(structural);
 
         // Nothing existing moved...
@@ -407,7 +412,7 @@ mod tests {
 
         let model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, Locale::default());
         flow.request_fit_view();
 
         let area = Rect::new(0, 0, 100, 30);

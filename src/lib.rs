@@ -26,6 +26,7 @@
 //! ([`handler`]) are native-only (they pull tokio/crossterm/fs) and `cfg`-gated
 //! behind the `native` feature.
 
+pub mod i18n;
 pub mod state;
 pub mod tailer;
 pub mod transcript;

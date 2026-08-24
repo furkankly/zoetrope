@@ -11,9 +11,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
+use crate::i18n::{Locale, fill};
 use crate::state::App;
 use crate::state::session::{AgentInfo, ToolState};
-use crate::ui::{truncate, truncate_tail, wrap};
+use crate::ui::{pad_width, truncate, truncate_tail, wrap};
 
 /// Line cap for the prompt in the **provenance** header only — it sits in a
 /// fixed-height region, so an unbounded prompt would starve the tool list. The
@@ -72,6 +73,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
         era_cache,
         detail_scroll,
         detail_follow,
+        locale,
         ..
     } = app;
     let bg = Style::default().bg(palette.surface);
@@ -94,7 +96,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
             // "tail" while auto-following the newest call; the line offset once
             // the user has scrolled up (detached).
             let label = if *detail_follow {
-                " j/k ↕ tail ".to_string()
+                format!(" j/k ↕ {} ", locale.strs().panel_tail)
             } else {
                 format!(" j/k ↕ {}/{} ", detail_scroll, n)
             };
@@ -115,7 +117,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
     let Some(agent) = session.agent(agent_id) else {
         // Selected node has no model entry (stale selection) — show a hint.
         let para = Paragraph::new(Line::from(Span::styled(
-            "no detail for this agent",
+            locale.strs().panel_no_detail,
             Style::default().fg(palette.muted),
         )))
         .style(Style::default().bg(palette.surface));
@@ -156,9 +158,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
     ])
     .areas(inner);
 
-    render_header(frame, header_area, agent, &palette);
+    render_header(frame, header_area, agent, &palette, *locale);
     if provenance.is_some() {
-        render_provenance(frame, prov_area, &prov_prompt, &prov_thought, &palette);
+        render_provenance(
+            frame,
+            prov_area,
+            &prov_prompt,
+            &prov_thought,
+            &palette,
+            *locale,
+        );
     }
     // The panel auto-tails the newest call by default; scrolling up detaches it
     // (its own state, independent of the graph camera). The renderer clamps the
@@ -173,12 +182,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App, agent_id: &str) {
         detail_scroll,
         detail_follow,
         &palette,
+        *locale,
     );
 }
 
-fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rataflow::Palette) {
+fn render_header(
+    frame: &mut Frame,
+    area: Rect,
+    agent: &AgentInfo,
+    palette: &rataflow::Palette,
+    locale: Locale,
+) {
     // Single-source vocabulary + presence colors (shared with cards/inspect).
-    let status_text = agent.status_word();
+    let status_text = agent.status_word(locale);
     let status_color = crate::ui::status_color(agent.status, palette);
 
     let bg = Style::default().bg(palette.surface);
@@ -201,16 +217,18 @@ fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rat
     lines.push(Line::from(status_spans));
 
     // Timing: duration if both ends known, else first seen.
-    if let Some(timing) = fmt_timing(agent) {
+    if let Some(timing) = fmt_timing(agent, locale) {
         lines.push(Line::from(Span::styled(timing, bg.fg(palette.muted))));
     }
 
     // Counts: tools + tokens.
     lines.push(Line::from(Span::styled(
-        format!(
-            "{} tools · {} tok",
-            agent.tool_calls.len(),
-            agent.output_tokens
+        fill(
+            locale.strs().panel_counts,
+            &[
+                ("n", &agent.tool_calls.len().to_string()),
+                ("k", &agent.output_tokens.to_string()),
+            ],
         ),
         bg.fg(palette.muted),
     )));
@@ -237,6 +255,7 @@ fn render_provenance(
     prompt: &[String],
     reasoning: &[String],
     palette: &rataflow::Palette,
+    locale: Locale,
 ) {
     if area.height == 0 {
         return;
@@ -247,17 +266,31 @@ fn render_provenance(
 
     let block = Style::default().bg(palette.muted);
 
+    let triggered_by = locale.strs().panel_triggered_by;
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        "─ triggered by ".to_string() + &"─".repeat(width.saturating_sub(15)),
+        triggered_by.to_string()
+            + &"─"
+                .repeat(width.saturating_sub(unicode_width::UnicodeWidthStr::width(triggered_by))),
         bg.fg(palette.muted),
     ))];
+    // Label width in columns — the continuation indent and the prompt/thought
+    // labels must line up, and a CJK label is wider per char than a Latin one.
+    let prompt_label = locale.strs().panel_prompt_label;
+    let thought_label = locale.strs().panel_thought_label;
+    let label_w = unicode_width::UnicodeWidthStr::width(prompt_label)
+        .max(unicode_width::UnicodeWidthStr::width(thought_label));
+    let indent = " ".repeat(label_w);
     // The user's prompt: a label on the first line, continuations indented, all
     // on a full-width subtle GRAY block — a quiet anchor, since gold is reserved
     // for agent activity/focus, not context.
     for (i, l) in prompt.iter().enumerate() {
-        let prefix = if i == 0 { "↳ prompt  " } else { "          " };
+        let prefix = if i == 0 {
+            pad_width(prompt_label, label_w)
+        } else {
+            indent.clone()
+        };
         let pad = width.saturating_sub(
-            unicode_width::UnicodeWidthStr::width(prefix)
+            unicode_width::UnicodeWidthStr::width(prefix.as_str())
                 + unicode_width::UnicodeWidthStr::width(l.as_str()),
         );
         lines.push(Line::from(vec![
@@ -268,7 +301,11 @@ fn render_provenance(
     }
     // The assistant's reasoning: dim, no highlight (not the user's words).
     for (i, l) in reasoning.iter().enumerate() {
-        let prefix = if i == 0 { "↳ thought " } else { "          " };
+        let prefix = if i == 0 {
+            pad_width(thought_label, label_w)
+        } else {
+            indent.clone()
+        };
         lines.push(Line::from(vec![
             Span::styled(prefix, label),
             Span::styled(l.clone(), bg.fg(palette.subtle)),
@@ -288,13 +325,17 @@ fn render_tools(
     detail_scroll: &mut u16,
     detail_follow: &mut bool,
     palette: &rataflow::Palette,
+    locale: Locale,
 ) {
     let bg = Style::default().bg(palette.surface);
 
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(bg.fg(palette.muted))
-        .title(Span::styled(" tool calls ", bg.fg(palette.subtle)))
+        .title(Span::styled(
+            locale.strs().panel_tool_calls,
+            bg.fg(palette.subtle),
+        ))
         .style(bg);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -306,7 +347,7 @@ fn render_tools(
     if agent.tool_calls.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "no tool calls",
+                locale.strs().panel_no_tool_calls,
                 bg.fg(palette.muted),
             )))
             .style(bg),
@@ -503,7 +544,7 @@ fn tool_line(
 }
 
 /// Format a timing line from an agent's first/last timestamps.
-fn fmt_timing(agent: &AgentInfo) -> Option<String> {
+fn fmt_timing(agent: &AgentInfo, locale: Locale) -> Option<String> {
     match (agent.first_ts, agent.last_ts) {
         (Some(first), Some(last)) => {
             let secs = (last - first).num_seconds().max(0);
@@ -513,9 +554,15 @@ fn fmt_timing(agent: &AgentInfo) -> Option<String> {
                 Some(format!("⏱ {secs}s"))
             }
         }
-        (Some(first), None) => Some(format!(
-            "⏱ started {}",
-            first.with_timezone(&chrono::Local).format("%H:%M:%S")
+        (Some(first), None) => Some(fill(
+            locale.strs().panel_started,
+            &[(
+                "t",
+                &first
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+                    .to_string(),
+            )],
         )),
         _ => None,
     }
@@ -592,24 +639,24 @@ mod tests {
     #[test]
     fn timing_duration_under_a_minute() {
         let a = agent_with_ts(Some(100), Some(142));
-        assert_eq!(fmt_timing(&a).as_deref(), Some("⏱ 42s"));
+        assert_eq!(fmt_timing(&a, Locale::En).as_deref(), Some("⏱ 42s"));
     }
 
     #[test]
     fn timing_duration_over_a_minute() {
         let a = agent_with_ts(Some(0), Some(125));
-        assert_eq!(fmt_timing(&a).as_deref(), Some("⏱ 2m 5s"));
+        assert_eq!(fmt_timing(&a, Locale::En).as_deref(), Some("⏱ 2m 5s"));
     }
 
     #[test]
     fn timing_negative_clamped() {
         let a = agent_with_ts(Some(100), Some(50));
-        assert_eq!(fmt_timing(&a).as_deref(), Some("⏱ 0s"));
+        assert_eq!(fmt_timing(&a, Locale::En).as_deref(), Some("⏱ 0s"));
     }
 
     #[test]
     fn timing_none_when_no_first() {
         let a = agent_with_ts(None, None);
-        assert!(fmt_timing(&a).is_none());
+        assert!(fmt_timing(&a, Locale::En).is_none());
     }
 }

@@ -15,6 +15,7 @@ use self::graph::AgentFlow;
 pub use self::info::SessionInfo;
 use self::session::SessionModel;
 use self::timeline::Timeline;
+use crate::i18n::Locale;
 use crate::tailer::UiEvent;
 use crate::ui::chips::ChipTray;
 
@@ -179,6 +180,12 @@ pub struct App {
     /// costs ONE seek (a backward seek rebuilds the whole model), not one per
     /// mouse event.
     pub pending_seek: Option<f64>,
+    /// UI language for every surface rendered from the App (status bar,
+    /// overlays, cards, panel). The native frontend sets it from
+    /// `--lang`/environment detection; the browser frontend from
+    /// `navigator.language` (via `zoetrope_set_lang`). `L` cycles it at
+    /// runtime.
+    pub locale: crate::i18n::Locale,
 }
 
 impl App {
@@ -189,6 +196,7 @@ impl App {
             flow: graph::new_flow(),
             session: SessionModel::new(session_id.clone()),
             mode,
+            locale: Locale::default(),
             is_paused: false,
             current_session_id: session_id,
             camera: Camera::Overview,
@@ -210,6 +218,26 @@ impl App {
             pending_center: None,
             pending_seek: None,
         }
+    }
+
+    /// Switch the UI language at runtime. The locale is stamped onto every
+    /// `AgentNode` at graph sync, so an in-place refresh of the existing cards
+    /// is needed for the change to show before the next structural change —
+    /// a fresh `App` (the wasm loaders) just starts in the new locale.
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
+        let ids: Vec<String> = self.flow.nodes().map(|n| n.id.clone()).collect();
+        for id in ids {
+            if let Some(node) = self.flow.node_content_mut(&id) {
+                node.locale = locale;
+            }
+        }
+    }
+
+    /// Cycle to the next language (the `L` key).
+    pub fn cycle_locale(&mut self) {
+        let next = self.locale.next();
+        self.set_locale(next);
     }
 
     /// Derive the emergent transport state for display (status badge + scrubber
@@ -606,7 +634,7 @@ impl App {
         // fanned past siblings) and nothing existing moves until the user asks
         // to tidy (`r`, or re-engaging the camera with `o`/`f`). `layout_dirty`
         // tracks that there is un-applied growth for the on-demand path.
-        let structural = graph::sync(&mut self.flow, &self.session, false);
+        let structural = graph::sync(&mut self.flow, &self.session, false, self.locale);
         if structural {
             self.layout_dirty = true;
         }
@@ -646,7 +674,7 @@ impl App {
             self.session.recompute_workflow_status();
             // Status flips never change topology, so this is a content-only sync;
             // layout stays user-driven (no auto-relayout — see `resync`).
-            graph::sync(&mut self.flow, &self.session, false);
+            graph::sync(&mut self.flow, &self.session, false, self.locale);
         }
         if self.camera == Camera::Follow {
             self.track_activity();

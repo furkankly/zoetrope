@@ -60,6 +60,7 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
 | click | open an agent's detail panel |
 | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | scroll the detail panel |
 | <kbd>i</kbd> | session info overlay |
+| <kbd>L</kbd> | cycle the UI language |
 | <kbd>?</kbd> | help overlay |
 | <kbd>esc</kbd> | close an overlay / clear the selection |
 | <kbd>q</kbd> / <kbd>ctrl-c</kbd> | quit (native) |
@@ -96,3 +97,12 @@ Press <kbd>i</kbd> for the session overlay: mode, permission mode, queued
 operations, file edits, and the last prompt. This data stays off the timeline and
 shows only when you ask for it. The same data is available headless via
 `zoe inspect <file.jsonl>`.
+
+## UI language
+
+The interface follows your system language by default (the terminal reads
+`LANG`/`LC_ALL`, the browser reads `navigator.language`), and can be set
+explicitly: pass `--lang zh` at launch (or set `ZOETROPE_LANG`), or press
+<kbd>L</kbd> at runtime to cycle languages. English and Simplified Chinese are
+currently available; `zoe --help` prints its usage text in the active language
+too.

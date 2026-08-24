@@ -161,11 +161,12 @@ impl AgentStatus {
     }
 }
 
-/// The status word for display, from raw status + interactivity. Single source
-/// for the wording rule (cards, panel, inspect) — interactive agents say
+/// The English status word, from raw status + interactivity. The localized
+/// entry point is [`crate::i18n::Locale::status_word`]; this is its `En` arm,
+/// kept here next to the vocabulary it belongs to. Interactive agents say
 /// "active" (we know of recent entries, not that a task executes), spawned say
 /// "running". A free fn so `AgentNode` (no `AgentInfo`) shares it too.
-pub fn status_word(status: AgentStatus, interactive: bool) -> &'static str {
+pub fn status_word_en(status: AgentStatus, interactive: bool) -> &'static str {
     match status {
         AgentStatus::Running if interactive => "active",
         AgentStatus::Running => "running",
@@ -289,10 +290,11 @@ impl AgentInfo {
         self.interactive
     }
 
-    /// The status word for display — delegates to the free [`status_word`] so
-    /// cards (`AgentNode`, which has no `AgentInfo`) share the exact wording.
-    pub fn status_word(&self) -> &'static str {
-        status_word(self.status, self.interactive)
+    /// The status word for display, in `locale` — delegates to
+    /// [`crate::i18n::Locale::status_word`] so cards (`AgentNode`, which has
+    /// no `AgentInfo`) share the exact wording.
+    pub fn status_word(&self, locale: crate::i18n::Locale) -> &'static str {
+        locale.status_word(self.status, self.interactive)
     }
 
     /// Most recent tool call name, if any.

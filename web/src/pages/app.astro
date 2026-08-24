@@ -443,41 +443,43 @@ const wasmBase = '/wasm';
         </svg>
         zoetrope
       </a>
-      <span id="status" class="statusbar">loading wasm…</span>
+      <span id="status" class="statusbar" data-i18n="loading">loading wasm…</span>
       <span class="spacer"></span>
 
-      <button id="open-folder" class="act primary" title="Browse your Claude sessions and replay or follow one live.">
+      <button id="open-folder" class="act primary" title="Browse your Claude sessions and replay or follow one live." data-i18n-title="sessionsTitle" data-i18n="sessions">
         Sessions
       </button>
       <input id="dir-input" type="file" webkitdirectory hidden />
 
-      <button id="reset" class="act" title="Reload the bundled demo session">Demo</button>
+      <button id="reset" class="act" title="Reload the bundled demo session" data-i18n-title="demoTitle" data-i18n="demo">Demo</button>
+
+      <button id="lang" class="act" title="Switch language / 切换语言">中文</button>
 
       <a class="link" href={REPO_URL} target="_blank" rel="noopener">GitHub ↗</a>
     </div>
 
     <div id="terminal-container"></div>
 
-    <div id="drop" class="drop">Drop a session's &lt;uuid&gt;.jsonl here (with its &lt;uuid&gt;/ folder for subagents) to replay it, or use “Sessions” to browse your Claude projects.</div>
+    <div id="drop" class="drop" data-i18n="dropHint">Drop a session's &lt;uuid&gt;.jsonl here (with its &lt;uuid&gt;/ folder for subagents) to replay it, or use “Sessions” to browse your Claude projects.</div>
 
     <!-- Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
          Dismissable, so a curious phone visitor can still watch the replay. -->
     <div id="mobile-note" class="mnote">
       <div class="mnote-card">
         <div class="mnote-brand"><span class="glyph">●</span> zoetrope</div>
-        <h2>Built for a bigger screen</h2>
-        <p>The flow graph is dense and made for a larger display. Open zoetrope on a desktop to scrub, zoom, and load your own sessions.</p>
-        <button id="mobile-note-dismiss">Look around anyway</button>
+        <h2 data-i18n="mnoteTitle">Built for a bigger screen</h2>
+        <p data-i18n="mnoteBody">The flow graph is dense and made for a larger display. Open zoetrope on a desktop to scrub, zoom, and load your own sessions.</p>
+        <button id="mobile-note-dismiss" data-i18n="mnoteDismiss">Look around anyway</button>
       </div>
     </div>
 
     <div id="session-modal" class="modal">
       <div class="modal-panel">
         <div class="modal-head">
-          <span id="session-head">Pick a session</span>
+          <span id="session-head" data-i18n="pickSession">Pick a session</span>
           <span class="modal-actions">
-            <button id="session-refolder" class="modal-link" title="Choose a different folder">open a different folder…</button>
-            <button id="session-close" class="modal-x" title="Close">✕</button>
+            <button id="session-refolder" class="modal-link" title="Choose a different folder" data-i18n-title="refolderTitle" data-i18n="refolder">open a different folder…</button>
+            <button id="session-close" class="modal-x" title="Close" data-i18n-title="closeTitle">✕</button>
           </span>
         </div>
         <div id="session-list" class="session-list"></div>
@@ -489,31 +491,31 @@ const wasmBase = '/wasm';
     <div id="picker-help" class="modal">
       <div class="modal-panel">
         <div class="modal-head">
-          <span>Point zoetrope at your sessions</span>
-          <button id="help-close" class="modal-x" title="Close">✕</button>
+          <span data-i18n="pickerTitle">Point zoetrope at your sessions</span>
+          <button id="help-close" class="modal-x" title="Close" data-i18n-title="closeTitle">✕</button>
         </div>
         <div class="help-body">
           <p>
-            Your Claude sessions live in
+            <span data-i18n="pickerLive">Your Claude sessions live in</span>
             <code id="claude-path">~/.claude/projects</code>
-            <button id="copy-path" class="copy-btn" title="Copy the path">copy</button>
+            <button id="copy-path" class="copy-btn" title="Copy the path" data-i18n-title="copyTitle" data-i18n="copy">copy</button>
           </p>
-          <p class="help-dim">The file dialog won't open that folder for you, so:</p>
-          <ol class="help-steps">
+          <p class="help-dim" data-i18n="pickerHint">The file dialog won't open that folder for you, so:</p>
+          <ol class="help-steps" data-i18n-html="pickerSteps">
             <li><b>macOS:</b> press <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>, paste the path, then <kbd>return</kbd>.</li>
             <li><b>Windows / Linux:</b> press <kbd>Ctrl</kbd> <kbd>L</kbd>, or type the path in the location bar.</li>
             <li>Pick the <b>projects</b> folder, or a single project inside it.</li>
           </ol>
           <div class="help-actions">
-            <button id="help-open" class="act primary">Open the file picker →</button>
-            <button id="help-cancel" class="act">Cancel</button>
+            <button id="help-open" class="act primary" data-i18n="openPicker">Open the file picker →</button>
+            <button id="help-cancel" class="act" data-i18n="cancel">Cancel</button>
           </div>
         </div>
       </div>
     </div>
 
     <script is:inline type="module">
-      import init, { zoetrope_load, zoetrope_append } from '/wasm/web.js';
+      import init, { zoetrope_load, zoetrope_append, zoetrope_set_lang } from '/wasm/web.js';
 
       const statusEl = document.getElementById('status');
       const dropEl = document.getElementById('drop');
@@ -530,6 +532,182 @@ const wasmBase = '/wasm';
       const helpCancel = document.getElementById('help-cancel');
       const helpClose = document.getElementById('help-close');
       const copyPath = document.getElementById('copy-path');
+      const langBtn = document.getElementById('lang');
+
+      // ── i18n ────────────────────────────────────────────────────────────
+      // Every user-visible string on this page (the toolbar, the modals, the
+      // status messages below), one table per language. The in-canvas TUI
+      // (the wasm app) localizes itself: we hand it the language via
+      // `zoetrope_set_lang`, and the `L` key cycles it there too.
+      // Templates use {placeholders}, expanded by fmt().
+      const STRINGS = {
+        en: {
+          docTitle: 'zoetrope — browser app',
+          loading: 'loading wasm…',
+          sessions: 'Sessions',
+          sessionsTitle: 'Browse your Claude sessions and replay or follow one live.',
+          demo: 'Demo',
+          demoTitle: 'Reload the bundled demo session',
+          dropHint:
+            'Drop a session\'s <uuid>.jsonl here (with its <uuid>/ folder for subagents) to replay it, or use “Sessions” to browse your Claude projects.',
+          mnoteTitle: 'Built for a bigger screen',
+          mnoteBody:
+            'The flow graph is dense and made for a larger display. Open zoetrope on a desktop to scrub, zoom, and load your own sessions.',
+          mnoteDismiss: 'Look around anyway',
+          pickSession: 'Pick a session',
+          pickProject: 'Pick a project',
+          pickSessionIn: 'Pick a session · {name}',
+          refolder: 'open a different folder…',
+          refolderTitle: 'Choose a different folder',
+          closeTitle: 'Close',
+          pickerTitle: 'Point zoetrope at your sessions',
+          pickerLive: 'Your Claude sessions live in',
+          pickerHint: "The file dialog won't open that folder for you, so:",
+          pickerSteps:
+            '<li><b>macOS:</b> press <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>, paste the path, then <kbd>return</kbd>.</li>' +
+            '<li><b>Windows / Linux:</b> press <kbd>Ctrl</kbd> <kbd>L</kbd>, or type the path in the location bar.</li>' +
+            '<li>Pick the <b>projects</b> folder, or a single project inside it.</li>',
+          openPicker: 'Open the file picker →',
+          cancel: 'Cancel',
+          copy: 'copy',
+          copied: 'copied',
+          copyTitle: 'Copy the path',
+          noMainJsonl: 'No main .jsonl transcript found in the selection.',
+          replayMainOnly:
+            'replaying {name} · main agent only — drop its <uuid>/ folder too to see the subagents it spawned',
+          replaying: 'replaying {name} · {n} subagent{s}',
+          liveReplaying: 'live · {name} · {n} subagent{s}',
+          openingPicker: 'opening the file picker…',
+          folderDenied:
+            'Couldn\'t open that folder. In the dialog, use ⌘⇧G and go to ~/.claude/projects.',
+          demoHint: 'demo · use “Sessions” to browse your sessions, or drop a .jsonl',
+          scanning: 'scanning for sessions…',
+          folderUnreadable: 'Could not read that folder: {msg}',
+          noSessionsThere:
+            'No Claude sessions there. Pick ~/.claude/projects, or a project folder inside it.',
+          noSessionsIn: 'No sessions in {name}',
+          noSessionsFolder:
+            'No Claude sessions in that folder. Choose ~/.claude/projects, or a project inside it.',
+          opening: 'opening {label}…',
+          openFailed: 'Failed to open session: {msg}',
+          wasmFailed: 'Failed to load the wasm app: {msg}',
+          liveUnsupported:
+            'This browser can replay a session but not follow one live — it hands over a ' +
+            'snapshot of the files, so later writes never arrive. Live-follow needs Chrome or Edge.',
+          unknownTime: 'unknown',
+          justNow: 'just now',
+          minutesAgo: 'm ago',
+          hoursAgo: 'h ago',
+          daysAgo: 'd ago',
+          live: 'live',
+        },
+        zh: {
+          docTitle: 'zoetrope — 浏览器版',
+          loading: '正在加载 wasm…',
+          sessions: '会话',
+          sessionsTitle: '浏览你的 Claude 会话，回放或实时跟随。',
+          demo: '演示',
+          demoTitle: '重新加载内置演示会话',
+          dropHint:
+            '将会话的 <uuid>.jsonl 拖到此处（连同 <uuid>/ 文件夹以包含子 agent）即可回放，或点击「会话」浏览你的 Claude 项目。',
+          mnoteTitle: '为更大的屏幕而生',
+          mnoteBody:
+            '流程图信息密集，专为大屏设计。请在桌面端打开 zoetrope 来拖动进度条、缩放，并加载你自己的会话。',
+          mnoteDismiss: '仍然看看',
+          pickSession: '选择一个会话',
+          pickProject: '选择一个项目',
+          pickSessionIn: '选择会话 · {name}',
+          refolder: '打开其他文件夹…',
+          refolderTitle: '选择另一个文件夹',
+          closeTitle: '关闭',
+          pickerTitle: '让 zoetrope 指向你的会话',
+          pickerLive: '你的 Claude 会话位于',
+          pickerHint: '文件对话框不会自动打开那个文件夹，所以：',
+          pickerSteps:
+            '<li><b>macOS：</b>按 <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>，粘贴路径，然后按 <kbd>return</kbd>。</li>' +
+            '<li><b>Windows / Linux：</b>按 <kbd>Ctrl</kbd> <kbd>L</kbd>，或在地址栏输入路径。</li>' +
+            '<li>选择 <b>projects</b> 文件夹，或其中的单个项目。</li>',
+          openPicker: '打开文件选择器 →',
+          cancel: '取消',
+          copy: '复制',
+          copied: '已复制',
+          copyTitle: '复制路径',
+          noMainJsonl: '所选内容中没有主 .jsonl transcript。',
+          replayMainOnly: '正在回放 {name} · 仅主 agent——把它的 <uuid>/ 文件夹也拖进来才能看到它派生的子 agent',
+          replaying: '正在回放 {name} · {n} 个子 agent',
+          liveReplaying: '直播 · {name} · {n} 个子 agent',
+          openingPicker: '正在打开文件选择器…',
+          folderDenied: '无法打开该文件夹。请在对话框中按 ⌘⇧G 并前往 ~/.claude/projects。',
+          demoHint: '演示 · 使用「会话」浏览你的会话，或拖入 .jsonl 文件',
+          scanning: '正在扫描会话…',
+          folderUnreadable: '无法读取该文件夹：{msg}',
+          noSessionsThere: '那里没有 Claude 会话。请选择 ~/.claude/projects，或其中的项目文件夹。',
+          noSessionsIn: '其中没有会话：{name}',
+          noSessionsFolder: '该文件夹中没有 Claude 会话。请选择 ~/.claude/projects，或其中的项目。',
+          opening: '正在打开 {label}…',
+          openFailed: '打开会话失败：{msg}',
+          wasmFailed: '加载 wasm 应用失败：{msg}',
+          liveUnsupported:
+            '此浏览器可以回放会话但无法实时跟随——它拿到的是文件的快照，后续写入不会到达。实时跟随需要 Chrome 或 Edge。',
+          unknownTime: '未知',
+          justNow: '刚刚',
+          minutesAgo: '分钟前',
+          hoursAgo: '小时前',
+          daysAgo: '天前',
+          live: '直播',
+        },
+      };
+
+      // The active table. Resolved once at boot (?lang= > localStorage >
+      // navigator.language), then swapped by the toolbar toggle.
+      let lang = (() => {
+        const qs = new URLSearchParams(location.search).get('lang');
+        if (qs && STRINGS[qs]) return qs;
+        const saved = localStorage.getItem('zoe-lang');
+        if (saved && STRINGS[saved]) return saved;
+        const nav = navigator.language || 'en';
+        return nav.toLowerCase().startsWith('zh') ? 'zh' : 'en';
+      })();
+      let t = STRINGS[lang];
+
+      // Named {placeholder} expansion — mirrors the Rust core's `fill`.
+      function fmt(template, vars) {
+        return template.replace(/\{(\w+)\}/g, (_, k) => (k in vars ? vars[k] : '{' + k + '}'));
+      }
+
+      // Apply the table to every marked node (data-i18n → textContent,
+      // data-i18n-html → innerHTML, data-i18n-title → the title attribute) and
+      // flip <html lang> + the document title.
+      function applyI18n() {
+        document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+        document.title = t.docTitle;
+        for (const el of document.querySelectorAll('[data-i18n]')) {
+          const key = el.dataset.i18n;
+          if (key in t) el.textContent = t[key];
+        }
+        for (const el of document.querySelectorAll('[data-i18n-html]')) {
+          const key = el.dataset.i18nHtml;
+          if (key in t) el.innerHTML = t[key];
+        }
+        for (const el of document.querySelectorAll('[data-i18n-title]')) {
+          const key = el.dataset.i18nTitle;
+          if (key in t) el.title = t[key];
+        }
+        // The toggle shows the language you'd switch TO.
+        langBtn.textContent = lang === 'zh' ? 'En' : '中文';
+        zoetrope_set_lang(lang === 'zh' ? 'zh-CN' : 'en');
+      }
+
+      function switchLang(next) {
+        lang = next;
+        localStorage.setItem('zoe-lang', lang);
+        t = STRINGS[lang];
+        applyI18n();
+        // Re-narrate the current state in the new language where we can.
+        setStatus(t.demoHint);
+      }
+
+      langBtn.addEventListener('click', () => switchLang(lang === 'zh' ? 'en' : 'zh'));
 
       let ready = false;
       let liveState = null;
@@ -620,7 +798,7 @@ const wasmBase = '/wasm';
         if (!files.length) return;
         const { mainText, mainName, subs } = await buildSession(files);
         if (!mainText) {
-          setStatus('No main .jsonl transcript found in the selection.', true);
+          setStatus(t.noMainJsonl, true);
           return;
         }
         stopLive();
@@ -632,11 +810,9 @@ const wasmBase = '/wasm';
         // behind — an easy mistake that otherwise renders as a lone main agent
         // with nothing to say it is incomplete.
         if (!n && SPAWNS_RE.test(mainText)) {
-          setStatus(
-            `replaying ${mainName} · main agent only — drop its <uuid>/ folder too to see the subagents it spawned`,
-          );
+          setStatus(fmt(t.replayMainOnly, { name: mainName }));
         } else {
-          setStatus(`replaying ${mainName} · ${n} subagent${n === 1 ? '' : 's'}`);
+          setStatus(fmt(t.replaying, { name: mainName, n, s: n === 1 ? '' : 's' }));
         }
       }
 
@@ -709,26 +885,26 @@ const wasmBase = '/wasm';
         if (!ready) return;
         // The guidance modal (shown before this) explains how to reach the hidden
         // ~/.claude/projects target, so here just narrate the picker itself.
-        setStatus('opening the file picker…');
+        setStatus(t.openingPicker);
         let dir;
         try {
           dir = await window.showDirectoryPicker({ id: 'zoetrope-sessions', mode: 'read' });
         } catch (e) {
           if (e && e.name !== 'AbortError')
-            setStatus('Couldn’t open that folder. In the dialog, use ⌘⇧G and go to ~/.claude/projects.', true);
-          else setStatus('demo · use “Sessions” to browse your sessions, or drop a .jsonl');
+            setStatus(t.folderDenied, true);
+          else setStatus(t.demoHint);
           return;
         }
-        setStatus('scanning for sessions…');
+        setStatus(t.scanning);
         let found;
         try {
           found = await detect(dir);
         } catch (e) {
-          setStatus('Could not read that folder: ' + (e?.message ?? e), true);
+          setStatus(fmt(t.folderUnreadable, { msg: e?.message ?? e }), true);
           return;
         }
         if (!found) {
-          setStatus('No Claude sessions there. Pick ~/.claude/projects, or a project folder inside it.', true);
+          setStatus(t.noSessionsThere, true);
           return;
         }
         if (found.repo) {
@@ -736,7 +912,7 @@ const wasmBase = '/wasm';
         } else if (found.repos.length === 1) {
           const s = await collectSessions(found.repos[0].handle);
           if (s) openRepo({ name: found.repos[0].name, ...s });
-          else setStatus('No sessions in ' + found.repos[0].name, true);
+          else setStatus(fmt(t.noSessionsIn, { name: found.repos[0].name }), true);
         } else {
           showRepoPicker(
             found.repos
@@ -747,7 +923,7 @@ const wasmBase = '/wasm';
                 onPick: async () => {
                   const s = await collectSessions(r.handle);
                   if (s) openRepo({ name: r.name, ...s });
-                  else setStatus('No sessions in ' + r.name, true);
+                  else setStatus(fmt(t.noSessionsIn, { name: r.name }), true);
                 },
               }))
           );
@@ -804,10 +980,10 @@ const wasmBase = '/wasm';
         if (!ready) return;
         const files = Array.from(fileList);
         if (!files.length) return;
-        setStatus('scanning for sessions…');
+        setStatus(t.scanning);
         const repos = detectFromFiles(files);
         if (!repos.length) {
-          setStatus('No Claude sessions in that folder. Choose ~/.claude/projects, or a project inside it.', true);
+          setStatus(t.noSessionsFolder, true);
           return;
         }
         if (repos.length === 1) openFileRepo(repos[0]);
@@ -881,7 +1057,7 @@ const wasmBase = '/wasm';
       // Rows: { label, subtitle, onPick }. Shared by the FS-handle and
       // webkitdirectory paths, which each build their own rows.
       function showRepoPicker(rows) {
-        sessionHead.textContent = 'Pick a project';
+        sessionHead.textContent = t.pickProject;
         sessionList.innerHTML = '';
         for (const r of rows) {
           const row = document.createElement('button');
@@ -923,7 +1099,7 @@ const wasmBase = '/wasm';
       function showSessionPicker(sessions, repoName) {
         lastSessions = sessions; // retained so "Sessions" can re-open instantly
         lastRepoName = repoName || '';
-        sessionHead.textContent = repoName ? 'Pick a session · ' + prettyRepo(repoName) : 'Pick a session';
+        sessionHead.textContent = repoName ? fmt(t.pickSessionIn, { name: prettyRepo(repoName) }) : t.pickSession;
         sessionList.innerHTML = '';
         // Live-follow needs a directory HANDLE that can be re-read as the file
         // grows. Without the File System Access API the browser hands over
@@ -932,9 +1108,7 @@ const wasmBase = '/wasm';
         if (!('showDirectoryPicker' in window)) {
           const note = document.createElement('p');
           note.className = 'list-note';
-          note.textContent =
-            'This browser can replay a session but not follow one live — it hands over a ' +
-            'snapshot of the files, so later writes never arrive. Live-follow needs Chrome or Edge.';
+          note.textContent = t.liveUnsupported;
           sessionList.appendChild(note);
         }
         for (const s of sessions) {
@@ -945,7 +1119,7 @@ const wasmBase = '/wasm';
           title.textContent = s.title || s.uuid;
           const meta = document.createElement('span');
           meta.className = 's-meta';
-          const badge = s.live ? '<span class="dot">●</span> live · ' : '';
+          const badge = s.live ? '<span class="dot">●</span> ' + t.live + ' · ' : '';
           meta.innerHTML = badge + escapeHtml(`${relTime(s.lastModified)} · ${fmtSize(s.size)} · ${s.uuid.slice(0, 8)}`);
           row.append(title, meta);
           row.addEventListener('click', () => {
@@ -1023,7 +1197,7 @@ const wasmBase = '/wasm';
       async function loadSession(s, live) {
         stopLive();
         const label = s.title || s.uuid.slice(0, 8);
-        setStatus(`opening ${label}…`);
+        setStatus(fmt(t.opening, { label }));
         try {
           // webkitdirectory session (plain File objects) — replay only.
           if (s.mainFile) {
@@ -1040,7 +1214,7 @@ const wasmBase = '/wasm';
               subs.push({ agent_id: '', meta: '', transcript: await f.text(), workflow: wfId, journal: true });
             }
             zoetrope_load(await s.mainFile.text(), JSON.stringify(subs), false);
-            setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
+            setStatus(fmt(t.replaying, { name: label, n: subs.length, s: subs.length === 1 ? '' : 's' }));
             return;
           }
           // File System Access session (handles) — replay or live.
@@ -1070,7 +1244,7 @@ const wasmBase = '/wasm';
             }
             zoetrope_load(m.fresh, JSON.stringify(subsInit), true);
             liveState = state;
-            setStatus(`live · ${label} · ${subsInit.length} subagent${subsInit.length === 1 ? '' : 's'}`, false, true);
+            setStatus(fmt(t.liveReplaying, { name: label, n: subsInit.length, s: subsInit.length === 1 ? '' : 's' }), false, true);
             liveTimer = setTimeout(pollLive, 1000);
           } else {
             const subs = [];
@@ -1084,20 +1258,20 @@ const wasmBase = '/wasm';
               await pushWorkflowPayload(await indexWorkflows(subagentsDir), subs, null);
             }
             zoetrope_load(mainText, JSON.stringify(subs), false);
-            setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
+            setStatus(fmt(t.replaying, { name: label, n: subs.length, s: subs.length === 1 ? '' : 's' }));
           }
         } catch (e) {
-          setStatus('Failed to open session: ' + (e?.message ?? e), true);
+          setStatus(fmt(t.openFailed, { msg: e?.message ?? e }), true);
         }
       }
 
       function relTime(ms) {
-        if (!ms) return 'unknown';
+        if (!ms) return t.unknownTime;
         const s = Math.max(0, (Date.now() - ms) / 1000);
-        if (s < 60) return 'just now';
-        if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-        if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-        return `${Math.floor(s / 86400)}d ago`;
+        if (s < 60) return t.justNow;
+        if (s < 3600) return `${Math.floor(s / 60)}${t.minutesAgo}`;
+        if (s < 86400) return `${Math.floor(s / 3600)}${t.hoursAgo}`;
+        return `${Math.floor(s / 86400)}${t.daysAgo}`;
       }
       function fmtSize(bytes) {
         if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
@@ -1219,8 +1393,8 @@ const wasmBase = '/wasm';
       copyPath.addEventListener('click', async () => {
         try {
           await navigator.clipboard.writeText('~/.claude/projects');
-          copyPath.textContent = 'copied';
-          setTimeout(() => (copyPath.textContent = 'copy'), 1200);
+          copyPath.textContent = t.copied;
+          setTimeout(() => (copyPath.textContent = t.copy), 1200);
         } catch {
           /* clipboard unavailable — the path is right there to type */
         }
@@ -1292,9 +1466,10 @@ const wasmBase = '/wasm';
       try {
         await init();
         ready = true;
-        setStatus('demo · use “Sessions” to browse your sessions, or drop a .jsonl');
+        applyI18n(); // hands the language to the wasm app via zoetrope_set_lang
+        setStatus(t.demoHint);
       } catch (e) {
-        setStatus('Failed to load the wasm app: ' + (e?.message ?? e), true);
+        setStatus(fmt(t.wasmFailed, { msg: e?.message ?? e }), true);
         throw e;
       }
     </script>

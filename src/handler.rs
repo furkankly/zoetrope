@@ -156,6 +156,12 @@ fn handle_key(key: &KeyEvent, app: &mut App) -> bool {
             return false;
         }
 
+        // Cycle the UI language. Shift-L: lowercase `l` pans the graph (hjkl).
+        KeyCode::Char('L') => {
+            app.cycle_locale();
+            return false;
+        }
+
         // Close the help overlay, else the detail panel (clear selection).
         // Without this there is no way out of the panel: pane-clicks
         // deliberately don't deselect (drag-friendly) and the whitelist
@@ -371,6 +377,7 @@ mod tests {
                 (x, 0.0),
                 (10.0, 5.0),
                 crate::ui::nodes::AgentNode {
+                    locale: crate::i18n::Locale::En,
                     title: id.into(),
                     description: None,
                     status: crate::state::session::AgentStatus::Running,
@@ -424,6 +431,7 @@ mod tests {
             (0.0, 0.0),
             (10.0, 5.0),
             crate::ui::nodes::AgentNode {
+                locale: crate::i18n::Locale::En,
                 title: "a".into(),
                 description: None,
                 status: crate::state::session::AgentStatus::Running,
@@ -455,6 +463,7 @@ mod tests {
             (0.0, 0.0),
             (10.0, 5.0),
             crate::ui::nodes::AgentNode {
+                locale: crate::i18n::Locale::En,
                 title: "a".into(),
                 description: None,
                 status: crate::state::session::AgentStatus::Running,
