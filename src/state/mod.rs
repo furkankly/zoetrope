@@ -821,6 +821,8 @@ impl App {
         }
         if structural {
             self.layout_dirty = true;
+            // A session that just gained a node may now overlap its neighbour.
+            graph::repack_if_overlapping(&mut self.flow);
         }
         structural
     }
@@ -856,6 +858,7 @@ impl App {
         model.recompute_liveness(Some(now));
         if graph::sync(&mut self.flow, model, false) {
             self.layout_dirty = true;
+            graph::repack_if_overlapping(&mut self.flow);
         }
     }
 

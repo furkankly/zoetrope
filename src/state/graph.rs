@@ -296,7 +296,7 @@ pub fn remove_session(flow: &mut AgentFlow, session: &str) -> bool {
 /// the per-agent diffing in [`sync`].
 pub fn relayout(flow: &mut AgentFlow) {
     flow.apply_layout(Sugiyama::vertical());
-    spread_sessions(flow);
+    pack_sessions(flow);
 }
 
 /// Where a newly-appearing session root goes: clear of everything on the
@@ -315,64 +315,203 @@ fn next_root_x(flow: &AgentFlow) -> f64 {
 /// look like one tree with an odd branch.
 const SESSION_GUTTER: f64 = MAIN_NODE_DIMS.0;
 
-/// Lay each session's tree out beside the previous one.
+/// Vertical gap between two rows of sessions.
 ///
-/// **Required after every Sugiyama pass.** rust-sugiyama lays out each
-/// weakly-connected component in its own coordinate space, and rataflow applies
-/// each component's coordinates verbatim — it iterates `for (result, _, _)`,
-/// discarding exactly the per-component width and height that would let it
-/// offset them. With one session that is invisible (one component). With
-/// several it stacks every session's tree at the origin, overlapping.
+/// Smaller in world units than [`SESSION_GUTTER`] on purpose: a terminal cell
+/// is about twice as tall as it is wide, so a vertical gap costs roughly twice
+/// the apparent space of a horizontal one the same size. One card height reads
+/// on screen about as wide as the horizontal gutter does.
+const SESSION_ROW_GUTTER: f64 = MAIN_NODE_DIMS.1;
+
+/// How much taller than wide a terminal cell renders.
 ///
-/// Sessions keep their first-seen order (the flow's node order), so a session
-/// appearing does not reshuffle the ones already on screen; it appends to the
-/// right. Vertical positions are left alone: every root is rank 0, so leaving
-/// `y` as Sugiyama produced it is what keeps the roots on one line.
-fn spread_sessions(flow: &mut AgentFlow) {
-    // Per session, in first-seen order: its node ids and horizontal extent.
+/// World units map 1:1 to cells, so a 30x7 card takes 30 columns and 7 rows —
+/// but those rows are about twice as tall as the columns are wide. A layout
+/// that reasons about shape has to convert, or it will "square up" an
+/// arrangement that then renders twice as tall as intended.
+const CELL_ASPECT: f64 = 2.0;
+
+/// Width-to-height ratio the packer aims the whole arrangement at, in SCREEN
+/// proportions (i.e. after [`CELL_ASPECT`]). Terminals are wide, so this is
+/// wider than square.
+const TARGET_ASPECT: f64 = 2.0;
+
+/// One session's extent on the canvas.
+struct SessionBox {
+    session: String,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Measure every session's bounding box, in first-seen (flow node) order.
+fn session_boxes(flow: &AgentFlow) -> Vec<SessionBox> {
     let mut order: Vec<String> = Vec::new();
-    let mut extent: std::collections::HashMap<String, (f64, f64)> =
+    let mut bounds: std::collections::HashMap<String, (f64, f64, f64, f64)> =
         std::collections::HashMap::new();
 
     for node in flow.nodes() {
         let Some((session, _)) = split_node_id(&node.id) else {
             continue;
         };
-        let (left, right) = (node.position.x, node.position.x + node.width);
-        match extent.get_mut(session) {
-            Some(span) => {
-                span.0 = span.0.min(left);
-                span.1 = span.1.max(right);
+        let (l, t) = (node.position.x, node.position.y);
+        let (r, b) = (l + node.width, t + node.height);
+        match bounds.get_mut(session) {
+            Some(bb) => {
+                bb.0 = bb.0.min(l);
+                bb.1 = bb.1.min(t);
+                bb.2 = bb.2.max(r);
+                bb.3 = bb.3.max(b);
             }
             None => {
                 order.push(session.to_string());
-                extent.insert(session.to_string(), (left, right));
+                bounds.insert(session.to_string(), (l, t, r, b));
             }
         }
     }
-    if order.len() < 2 {
+
+    order
+        .into_iter()
+        .filter_map(|session| {
+            let &(l, t, r, b) = bounds.get(&session)?;
+            Some(SessionBox {
+                session,
+                left: l,
+                top: t,
+                width: r - l,
+                height: b - t,
+            })
+        })
+        .collect()
+}
+
+/// Shelf-pack `boxes` into rows no wider than `target_width`, returning each
+/// session's new top-left corner plus the overall extent.
+///
+/// First-fit in the given order and never reordering: a session keeps its place
+/// relative to those that appeared before it, so a new one cannot reshuffle
+/// what is already on screen.
+fn shelf_pack(boxes: &[SessionBox], target_width: f64) -> (Vec<(f64, f64)>, f64, f64) {
+    let mut placed = Vec::with_capacity(boxes.len());
+    let (mut cursor_x, mut row_y, mut row_height) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut widest, mut total_height) = (0.0f64, 0.0f64);
+
+    for bb in boxes {
+        // Wrap when this session would overflow the row — but never wrap a row
+        // that is still empty, or a session wider than the target could never
+        // be placed at all.
+        if cursor_x > 0.0 && cursor_x + bb.width > target_width {
+            row_y += row_height + SESSION_ROW_GUTTER;
+            cursor_x = 0.0;
+            row_height = 0.0;
+        }
+        placed.push((cursor_x, row_y));
+        cursor_x += bb.width + SESSION_GUTTER;
+        row_height = row_height.max(bb.height);
+        widest = widest.max(cursor_x - SESSION_GUTTER);
+        total_height = row_y + row_height;
+    }
+
+    (placed, widest, total_height)
+}
+
+/// Whether any two sessions' bounding boxes intersect.
+fn sessions_overlap(boxes: &[SessionBox]) -> bool {
+    boxes.iter().enumerate().any(|(i, a)| {
+        boxes[i + 1..].iter().any(|b| {
+            a.left < b.left + b.width
+                && b.left < a.left + a.width
+                && a.top < b.top + b.height
+                && b.top < a.top + a.height
+        })
+    })
+}
+
+/// Repack only if sessions have grown into each other. Returns whether it did.
+///
+/// Called on every structural change, but deliberately does nothing while the
+/// canvas is tidy. A session's tree WIDENS as it spawns agents — local
+/// placement puts new nodes beside their siblings — so a session that was
+/// clear of its neighbour at layout time can grow into it, and layout is never
+/// automatic here, so nothing would separate them until the user pressed `r`.
+///
+/// Gating on actual overlap is what lets that be fixed without also undoing a
+/// session the user dragged somewhere deliberately: a drag that does not
+/// collide is left exactly where it was put.
+pub fn repack_if_overlapping(flow: &mut AgentFlow) -> bool {
+    let boxes = session_boxes(flow);
+    if boxes.len() < 2 || !sessions_overlap(&boxes) {
+        return false;
+    }
+    pack_sessions(flow);
+    true
+}
+
+/// Lay every session's tree out in shelf-packed rows.
+///
+/// **Required after anything that changes what is on the canvas.** rataflow
+/// applies each weakly-connected component's Sugiyama coordinates verbatim — it
+/// iterates `for (result, _, _)`, discarding exactly the per-component width and
+/// height that would let it offset them — so without this every session's tree
+/// stacks at the origin.
+///
+/// Rows rather than one long line, because the canvas is a screen and not a
+/// ribbon: a single row grows sideways forever and wastes the whole vertical
+/// half. The row width is picked by trying every row count and keeping whichever
+/// overall shape lands closest to [`TARGET_ASPECT`] once [`CELL_ASPECT`] is
+/// accounted for.
+///
+/// Only ever moves whole sessions. Positions WITHIN a session are left exactly
+/// as they were, so a Sugiyama pass, the incremental local placement in
+/// [`sync`], and any arrangement the user dragged all survive — which is what
+/// makes this safe to run on every structural change instead of only when the
+/// user asks for a tidy. That in turn is what stops a session that GROWS from
+/// overlapping its neighbour: it is repacked as soon as it gains a node.
+pub fn pack_sessions(flow: &mut AgentFlow) {
+    let boxes = session_boxes(flow);
+    if boxes.len() < 2 {
         return;
     }
 
-    // Shift each session so the trees sit side by side, the first one keeping
-    // the origin the single-session layout would have given it.
-    let mut cursor = extent.get(&order[0]).map_or(0.0, |e| e.0);
-    let mut shift: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::with_capacity(order.len());
-    for session in &order {
-        let Some(&(left, right)) = extent.get(session) else {
-            continue;
-        };
-        shift.insert(session.clone(), cursor - left);
-        cursor += (right - left) + SESSION_GUTTER;
-    }
+    // Sessions are few (the monitor fleet is capped), so trying every row count
+    // is cheaper than reasoning about which one is best.
+    let total_width: f64 = boxes.iter().map(|b| b.width + SESSION_GUTTER).sum();
+    let widest = boxes.iter().fold(0.0f64, |m, b| m.max(b.width));
+    let best = (1..=boxes.len())
+        .map(|rows| {
+            let target = (total_width / rows as f64).max(widest);
+            let (placed, w, h) = shelf_pack(&boxes, target);
+            // Compare SCREEN shape, not world-unit shape.
+            let aspect = if h > 0.0 {
+                w / (h * CELL_ASPECT)
+            } else {
+                f64::MAX
+            };
+            ((aspect - TARGET_ASPECT).abs(), placed)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+
+    let Some((_, placed)) = best else {
+        return;
+    };
+
+    // Translate each session as a unit.
+    let shift: std::collections::HashMap<&str, (f64, f64)> = boxes
+        .iter()
+        .zip(&placed)
+        .map(|(bb, &(x, y))| (bb.session.as_str(), (x - bb.left, y - bb.top)))
+        .collect();
 
     let moved: Vec<(String, (f64, f64))> = flow
         .nodes()
         .filter_map(|node| {
             let (session, _) = split_node_id(&node.id)?;
-            let dx = shift.get(session)?;
-            Some((node.id.clone(), (node.position.x + dx, node.position.y)))
+            let &(dx, dy) = shift.get(session)?;
+            Some((
+                node.id.clone(),
+                (node.position.x + dx, node.position.y + dy),
+            ))
         })
         .collect();
     flow.set_node_positions(moved.iter().map(|(id, pos)| (id, *pos)));
@@ -494,6 +633,126 @@ mod tests {
         assert_eq!(root_y(S), root_y("s2"));
     }
 
+    /// Build `n` sessions, each with `subs` subagents, synced into one flow.
+    fn flow_with_sessions(n: usize, subs: usize) -> AgentFlow {
+        let mut flow = new_flow();
+        for i in 0..n {
+            let mut m = SessionModel::new(format!("s{i}"));
+            for k in 0..subs {
+                m.apply_meta(&format!("a{i}_{k}"), None, &meta());
+            }
+            sync(&mut flow, &m, false);
+        }
+        relayout(&mut flow);
+        flow
+    }
+
+    /// Every session's bounding box, keyed by session id.
+    fn boxes_of(flow: &AgentFlow) -> std::collections::HashMap<String, (f64, f64, f64, f64)> {
+        session_boxes(flow)
+            .into_iter()
+            .map(|b| (b.session, (b.left, b.top, b.width, b.height)))
+            .collect()
+    }
+
+    fn any_overlap(flow: &AgentFlow) -> bool {
+        sessions_overlap(&session_boxes(flow))
+    }
+
+    /// Many sessions must wrap into rows rather than growing one endless
+    /// ribbon sideways — and the rows must not overlap each other either.
+    #[test]
+    fn many_sessions_wrap_into_rows() {
+        let flow = flow_with_sessions(8, 3);
+        let boxes = session_boxes(&flow);
+        assert_eq!(boxes.len(), 8);
+        assert!(
+            !sessions_overlap(&boxes),
+            "packed sessions must not overlap"
+        );
+
+        let rows: std::collections::BTreeSet<i64> = boxes.iter().map(|b| b.top as i64).collect();
+        assert!(
+            rows.len() > 1,
+            "eight sessions should occupy more than one row, got tops {rows:?}"
+        );
+
+        // And the result should read wider than tall on screen, not the reverse.
+        let width = boxes.iter().fold(0.0f64, |m, b| m.max(b.left + b.width));
+        let height = boxes.iter().fold(0.0f64, |m, b| m.max(b.top + b.height));
+        assert!(
+            width > height * CELL_ASPECT,
+            "arrangement is taller than wide on screen: {width} x {height}"
+        );
+    }
+
+    /// Packing must be idempotent: it runs on every structural change, so a
+    /// second pass that moved anything would make the canvas drift.
+    #[test]
+    fn packing_twice_changes_nothing() {
+        let mut flow = flow_with_sessions(5, 2);
+        let before = boxes_of(&flow);
+        pack_sessions(&mut flow);
+        assert_eq!(boxes_of(&flow), before);
+        assert!(
+            !repack_if_overlapping(&mut flow),
+            "tidy canvas needs no repack"
+        );
+    }
+
+    /// The growth bug: a session that gains agents widens, and with layout
+    /// never automatic it would sit on top of its neighbour until the user
+    /// pressed `r`.
+    #[test]
+    fn a_growing_session_stops_overlapping_its_neighbour() {
+        let mut flow = new_flow();
+        let mut a = SessionModel::new("s0".into());
+        a.apply_meta("a0", None, &meta());
+        let mut b = SessionModel::new("s1".into());
+        b.apply_meta("b0", None, &meta());
+        sync(&mut flow, &a, false);
+        sync(&mut flow, &b, false);
+        relayout(&mut flow);
+        assert!(!any_overlap(&flow));
+
+        // `s0` spawns a fan of subagents. Local placement fans them sideways,
+        // straight into where `s1` sits.
+        for k in 1..8 {
+            a.apply_meta(&format!("a{k}"), None, &meta());
+        }
+        sync(&mut flow, &a, false);
+        assert!(
+            any_overlap(&flow),
+            "precondition: unchecked growth should collide"
+        );
+
+        assert!(repack_if_overlapping(&mut flow));
+        assert!(!any_overlap(&flow), "repack must separate them");
+    }
+
+    /// Repacking moves whole sessions, never rearranges one internally — so a
+    /// Sugiyama pass, local placement and a user's drag all survive it.
+    #[test]
+    fn packing_preserves_arrangement_within_a_session() {
+        let mut flow = flow_with_sessions(4, 3);
+        let relative = |flow: &AgentFlow| -> Vec<(String, f64, f64)> {
+            let boxes = boxes_of(flow);
+            let mut out: Vec<_> = flow
+                .nodes()
+                .filter_map(|n| {
+                    let (session, _) = split_node_id(&n.id)?;
+                    let &(left, top, _, _) = boxes.get(session)?;
+                    Some((n.id.clone(), n.position.x - left, n.position.y - top))
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+        let before = relative(&flow);
+        pack_sessions(&mut flow);
+        assert_eq!(relative(&flow), before, "intra-session offsets changed");
+    }
+
     /// A session appearing while the canvas is live must not land on top of
     /// one already there. Layout is never automatic, so incremental placement —
     /// not a Sugiyama pass — is what has to get this right.
@@ -534,7 +793,7 @@ mod tests {
             .map(|n| (n.id.clone(), n.position.x, n.position.y))
             .collect();
 
-        spread_sessions(&mut flow);
+        pack_sessions(&mut flow);
         let after: Vec<_> = flow
             .nodes()
             .map(|n| (n.id.clone(), n.position.x, n.position.y))
