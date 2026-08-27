@@ -54,82 +54,90 @@ pub struct SessionRef {
     /// Total bytes across the main transcript and every sidecar.
     pub bytes: u64,
     /// Sidecar transcripts found (direct subagents, workflow subagents,
-    /// journals).
-    pub sidecar_count: usize,
+    /// journals), captured by the same walk that produced the stats above.
+    pub sidecars: Vec<PathBuf>,
 }
 
 impl SessionRef {
     /// Every transcript file belonging to this session, main first.
     ///
-    /// Re-scans the sidecar directories, so a file created since [`discover`]
-    /// ran is picked up. Journals are included: a workflow's completion ledger
-    /// is session activity like any other.
+    /// The sidecars come from the sweep that discovered the session rather than
+    /// a fresh directory walk — indexing them would otherwise re-enumerate the
+    /// very directories discovery just read, twice per session per sweep. A
+    /// sidecar created since then is picked up by the next sweep.
     pub fn files(&self) -> Vec<PathBuf> {
-        let mut out = vec![self.main_path.clone()];
-        let Some(subs) = transcript::subagents_dir(&self.main_path) else {
-            return out;
-        };
-        out.extend(
-            transcript::scan_subagent_files(&subs, None)
-                .into_iter()
-                .map(|f| f.transcript),
-        );
-        for wf_id in transcript::scan_workflow_ids(&subs) {
-            let dir = transcript::workflow_dir(&subs, &wf_id);
-            out.extend(
-                transcript::scan_subagent_files(&dir, Some(&wf_id))
-                    .into_iter()
-                    .map(|f| f.transcript),
-            );
-            let journal = transcript::workflow_journal(&subs, &wf_id);
-            if journal.is_file() {
-                out.push(journal);
-            }
-        }
+        let mut out = Vec::with_capacity(self.sidecars.len() + 1);
+        out.push(self.main_path.clone());
+        out.extend(self.sidecars.iter().cloned());
         out
+    }
+
+    /// Sidecar transcripts found for this session.
+    pub fn sidecar_count(&self) -> usize {
+        self.sidecars.len()
     }
 }
 
-/// Newest mtime and total size across a session's sidecars, plus how many there
-/// are. Returns `None` when the session has no `subagents/` directory at all.
-fn sidecar_stats(main_path: &Path) -> Option<(SystemTime, u64, usize)> {
+/// Everything one walk of a session's sidecar tree yields.
+struct Sidecars {
+    paths: Vec<PathBuf>,
+    newest: SystemTime,
+    bytes: u64,
+}
+
+/// Walk a session's sidecar tree once, collecting the transcripts AND their
+/// stats together.
+///
+/// One walk rather than two: discovery needs the newest mtime and total size,
+/// summarizing needs the file list, and re-deriving one from a second
+/// `read_dir` of the same directories is the sweep's largest avoidable cost.
+///
+/// Which files count is [`transcript::scan_subagent_files`]'s rule — the
+/// `agent-<id>.jsonl` pairs plus each workflow's journal — not "every `.jsonl`
+/// here", so the stats describe exactly the files that get indexed.
+fn sidecars(main_path: &Path) -> Option<Sidecars> {
     let subs = transcript::subagents_dir(main_path)?;
     if !subs.is_dir() {
         return None;
     }
-    let mut newest = SystemTime::UNIX_EPOCH;
-    let mut bytes = 0u64;
-    let mut count = 0usize;
 
-    // A closure rather than recursion: the sidecar layout is exactly two levels
-    // (`subagents/` and `subagents/workflows/<id>/`), so a general directory
-    // walk would be scope the format does not have.
-    let mut visit = |dir: &Path| {
-        let Ok(read) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in read.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            count += 1;
-            bytes += meta.len();
-            if let Ok(m) = meta.modified() {
-                newest = newest.max(m);
-            }
-        }
-    };
-
-    visit(&subs);
+    let mut paths: Vec<PathBuf> = transcript::scan_subagent_files(&subs, None)
+        .into_iter()
+        .map(|f| f.transcript)
+        .collect();
     for wf_id in transcript::scan_workflow_ids(&subs) {
-        visit(&transcript::workflow_dir(&subs, &wf_id));
+        let dir = transcript::workflow_dir(&subs, &wf_id);
+        paths.extend(
+            transcript::scan_subagent_files(&dir, Some(&wf_id))
+                .into_iter()
+                .map(|f| f.transcript),
+        );
+        let journal = transcript::workflow_journal(&subs, &wf_id);
+        if journal.is_file() {
+            paths.push(journal);
+        }
+    }
+    if paths.is_empty() {
+        return None;
     }
 
-    (count > 0).then_some((newest, bytes, count))
+    let mut newest = SystemTime::UNIX_EPOCH;
+    let mut bytes = 0u64;
+    for path in &paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        bytes += meta.len();
+        if let Ok(m) = meta.modified() {
+            newest = newest.max(m);
+        }
+    }
+
+    Some(Sidecars {
+        paths,
+        newest,
+        bytes,
+    })
 }
 
 /// Stat one main transcript into a [`SessionRef`].
@@ -141,14 +149,14 @@ fn session_ref(project_dir: &Path, main_path: PathBuf) -> Option<SessionRef> {
     let main_mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let mut last_touched = main_mtime;
     let mut bytes = meta.len();
-    let mut sidecar_count = 0;
+    let mut sidecar_paths = Vec::new();
     let mut touched_by_sidecar = false;
 
-    if let Some((sidecar_mtime, sidecar_bytes, count)) = sidecar_stats(&main_path) {
-        bytes += sidecar_bytes;
-        sidecar_count = count;
-        if sidecar_mtime > last_touched {
-            last_touched = sidecar_mtime;
+    if let Some(found) = sidecars(&main_path) {
+        bytes += found.bytes;
+        sidecar_paths = found.paths;
+        if found.newest > last_touched {
+            last_touched = found.newest;
             touched_by_sidecar = true;
         }
     }
@@ -160,7 +168,7 @@ fn session_ref(project_dir: &Path, main_path: PathBuf) -> Option<SessionRef> {
         last_touched,
         touched_by_sidecar,
         bytes,
-        sidecar_count,
+        sidecars: sidecar_paths,
     })
 }
 
@@ -358,9 +366,7 @@ pub fn rail_row(session: &SessionRef, summary: &Summary) -> RailRow {
         // `Summary::agents` counts distinct sidecar `agentId`s; the main agent
         // has none, and it is always there.
         agents: summary.agents + 1,
-        tool_calls: summary.tool_calls,
         failures: summary.failures,
-        prompts: summary.prompts,
         last_activity: summary.last_activity,
         sidecar_active: session.touched_by_sidecar,
     }
@@ -519,7 +525,7 @@ mod tests {
         let found = discover(&f.root, SystemTime::UNIX_EPOCH);
         assert_eq!(found.len(), 1);
         let s = &found[0];
-        assert_eq!(s.sidecar_count, 1);
+        assert_eq!(s.sidecar_count(), 1);
         assert!(
             s.last_touched >= sidecar_mtime.min(main_mtime),
             "activity is the newest across all files"

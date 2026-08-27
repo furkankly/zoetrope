@@ -208,7 +208,7 @@ fn bench_sessions(c: &mut Criterion) {
     let n = sessions::discover(&root, SystemTime::UNIX_EPOCH).len();
     let files: usize = sessions::discover(&root, SystemTime::UNIX_EPOCH)
         .iter()
-        .map(|s| s.sidecar_count + 1)
+        .map(|s| s.sidecar_count() + 1)
         .sum();
     g.throughput(Throughput::Elements(files as u64));
     assert_eq!(n, 80, "the wide corpus is 40 projects x 2 sessions");
