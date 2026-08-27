@@ -104,6 +104,37 @@ impl CameraGlide {
     }
 }
 
+/// Items folded between two rungs of the snapshot ladder.
+///
+/// The trade is latency against memory: a backward seek re-folds at most this
+/// many items, and the ladder holds `folded / STRIDE` rungs. Snapshots are
+/// cheap because [`SessionModel`] is built from persistent collections — a rung
+/// shares structure with its neighbours instead of copying the model.
+///
+/// Measured on the pathological bench scale (~31k items, 293 agents), halving
+/// this to 512 bought no measurable seek time but cost ~9 MB of retained
+/// rungs. That is because the fold is no longer what a backward seek spends
+/// its time on: `rebuild_to` still discards the whole `Flow` and re-projects
+/// every node, which dominates whatever the fold costs. Shrink this only once
+/// that is fixed — until then it would buy memory for nothing.
+const SNAPSHOT_STRIDE: usize = 1024;
+
+/// A folded model captured at a known point on the timeline.
+struct Snapshot {
+    /// How many items were folded into `model`.
+    folded: usize,
+    /// The [`Timeline::generation`] this was taken under. A rung from an older
+    /// generation describes a prefix that no longer exists — see the field's
+    /// docs — and must be discarded rather than restored.
+    generation: u64,
+    /// The model as of `folded` items. Restoring it is a clone, which is O(1).
+    ///
+    /// This includes derived projections (liveness, workflow rollups) as they
+    /// stood when the rung was taken, which are meaningless at a different
+    /// playhead — every restore re-runs them via `resync`.
+    model: SessionModel,
+}
+
 /// The central application state, owned by the single UI task.
 pub struct App {
     /// The rendered flow graph (agent cards + step edges).
@@ -198,6 +229,9 @@ pub struct App {
     /// [`UiEvent::Sessions`](crate::tailer::UiEvent::Sessions) sweeps; empty in
     /// the browser frontend, which has no filesystem to sweep.
     pub rail: crate::state::rail::SessionRail,
+    /// Ladder of folded-model snapshots, ascending by `folded`, used to start a
+    /// backward seek near its target instead of re-folding from item zero.
+    snapshots: Vec<Snapshot>,
     /// A session the user asked to focus, queued for the event loop to send to
     /// the tailer as a `Watch`. Queued rather than sent directly because input
     /// handling is synchronous and owns no channel — the same shape as
@@ -237,6 +271,7 @@ impl App {
             pending_center: None,
             pending_seek: None,
             rail: Default::default(),
+            snapshots: Vec::new(),
             pending_watch: None,
         }
     }
@@ -404,6 +439,7 @@ impl App {
                     }
                     self.timeline.append_live(activity);
                     self.timeline.folded = self.timeline.items.len();
+                    self.note_fold();
                     self.commit_fold(structural);
                 } else {
                     // Scrubbed back: new live data extends the (sorted) timeline
@@ -460,6 +496,10 @@ impl App {
                 self.others.remove(&session_id);
                 self.current_session_id = session_id.clone();
                 self.session = SessionModel::new(session_id);
+                // A different session (or a truncated one) shares nothing with
+                // the rungs we hold, and a fresh `Timeline` restarts the
+                // generation counter — so they cannot be told apart by it.
+                self.snapshots.clear();
                 // A reset is a fresh live timeline (only live emits resets — the
                 // initial announce, truncation, or auto-switch). Replay arrives
                 // via ReplayLoaded, never a reset.
@@ -507,12 +547,67 @@ impl App {
         if target <= self.timeline.folded {
             return;
         }
-        let mut structural = false;
-        for i in self.timeline.folded..target {
-            structural |= self.session.apply_update(&self.timeline.items[i].update);
-        }
+        let structural = self.fold_range(self.timeline.folded, target);
         self.timeline.folded = target;
         self.commit_fold(structural);
+    }
+
+    /// Fold `items[from..to]` into the model, taking a ladder rung every
+    /// [`SNAPSHOT_STRIDE`] items. Returns whether anything structural changed.
+    ///
+    /// Rungs are taken INSIDE the loop, not after it: a jump straight to the
+    /// live edge folds the whole timeline in one call, and a ladder that only
+    /// recorded where each fold *ended* would hold a single rung at the edge —
+    /// useless for seeking backward, which needs a rung at or before its target.
+    fn fold_range(&mut self, from: usize, to: usize) -> bool {
+        let generation = self.timeline.generation;
+        self.drop_stale_rungs(generation);
+        let mut structural = false;
+        for i in from..to {
+            structural |= self.session.apply_update(&self.timeline.items[i].update);
+            let folded = i + 1;
+            let last = self.snapshots.last().map_or(0, |s| s.folded);
+            if folded >= last + SNAPSHOT_STRIDE {
+                self.snapshots.push(Snapshot {
+                    folded,
+                    generation,
+                    model: self.session.clone(),
+                });
+            }
+        }
+        structural
+    }
+
+    /// Record a ladder rung for a fold that did not go through
+    /// [`fold_range`](Self::fold_range) — the live `Batch` path, which applies
+    /// updates directly (the model is order-independent) and jumps `folded` to
+    /// the edge. Successive batches leave rungs roughly a stride apart, which
+    /// is what a later backward seek restores from.
+    fn note_fold(&mut self) {
+        let generation = self.timeline.generation;
+        self.drop_stale_rungs(generation);
+        let folded = self.timeline.folded;
+        let last = self.snapshots.last().map_or(0, |s| s.folded);
+        if folded >= last + SNAPSHOT_STRIDE {
+            self.snapshots.push(Snapshot {
+                folded,
+                generation,
+                model: self.session.clone(),
+            });
+        }
+    }
+
+    /// Discard every rung if the item list has been re-sorted or replaced since
+    /// they were taken. Generation is monotonic, so one stale rung means all of
+    /// them are stale.
+    fn drop_stale_rungs(&mut self, generation: u64) {
+        if self
+            .snapshots
+            .last()
+            .is_some_and(|s| s.generation != generation)
+        {
+            self.snapshots.clear();
+        }
     }
 
     /// Post-apply step shared by `fold_to` (forward, index-based — replay pacing
@@ -612,9 +707,7 @@ impl App {
         if target < self.timeline.folded {
             self.rebuild_to(target);
         } else {
-            for i in self.timeline.folded..target {
-                self.session.apply_update(&self.timeline.items[i].update);
-            }
+            self.fold_range(self.timeline.folded, target);
             self.timeline.folded = target;
             self.resync();
         }
@@ -653,12 +746,39 @@ impl App {
             .map(|n| (n.id.clone(), (n.position.x, n.position.y)))
             .collect();
 
-        // Fresh model + flow, re-fold the prefix.
-        self.session = SessionModel::new(self.current_session_id.clone());
-        self.flow = graph::new_flow();
-        for i in 0..target {
-            self.session.apply_update(&self.timeline.items[i].update);
+        // Start from the newest ladder rung at or before the target instead of
+        // from item zero. Restoring a rung is a clone of a persistent model —
+        // O(1) — so the fold that follows is bounded by SNAPSHOT_STRIDE rather
+        // than by how far back the user seeked.
+        let generation = self.timeline.generation;
+        if self
+            .snapshots
+            .last()
+            .is_some_and(|s| s.generation != generation)
+        {
+            self.snapshots.clear();
         }
+        let resume = self
+            .snapshots
+            .iter()
+            .rev()
+            .find(|s| s.folded <= target)
+            .map(|s| (s.model.clone(), s.folded));
+
+        let start = match resume {
+            Some((model, folded)) => {
+                self.session = model;
+                folded
+            }
+            None => {
+                self.session = SessionModel::new(self.current_session_id.clone());
+                0
+            }
+        };
+        self.flow = graph::new_flow();
+        // Re-folding also rebuilds the ladder above `start`, so a scrub that
+        // walks backward repeatedly keeps finding rungs near where it lands.
+        self.fold_range(start, target);
         self.timeline.folded = target;
         self.resync();
 
@@ -1312,6 +1432,102 @@ mod tests {
         );
         assert_eq!(app.camera, Camera::Manual);
         assert!(app.camera_glide.is_none(), "user pan must cancel the glide");
+    }
+
+    /// The ladder is only allowed to be FASTER. Restoring a rung and folding
+    /// forward from it must land on exactly the model a from-scratch rebuild
+    /// would produce — otherwise a backward seek silently shows a different
+    /// session than the same seek did yesterday.
+    #[test]
+    fn a_ladder_restore_matches_a_full_rebuild() {
+        // Enough items that several rungs are taken.
+        let count = SNAPSHOT_STRIDE * 3 + 17;
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let items = |n: usize| -> Vec<crate::tailer::ReplayItem> {
+            (0..n)
+                .map(|i| {
+                    crate::tailer::ReplayItem::at(
+                        Some(t0 + chrono::Duration::seconds(i as i64)),
+                        // Re-touch earlier agents as well as adding new ones, so
+                        // the fold is not purely insert-only.
+                        meta_update(&format!("sub{}", i % (n / 4).max(1))),
+                    )
+                })
+                .collect()
+        };
+
+        let load = |app: &mut App| {
+            app.handle_ui_event(UiEvent::ReplayLoaded {
+                session_id: "s".into(),
+                items: items(count),
+                speed: 8.0,
+                info: Default::default(),
+            });
+            app.go_live();
+        };
+
+        let target = SNAPSHOT_STRIDE * 2 + 5;
+
+        // With the ladder: fold to the edge (taking rungs), then seek back.
+        let mut laddered = App::new("s".to_string(), Mode::Replay);
+        load(&mut laddered);
+        assert!(
+            laddered.snapshots.len() >= 3,
+            "expected several rungs, got {}",
+            laddered.snapshots.len()
+        );
+        laddered.seek_to_fraction(target as f64 / count as f64);
+        let restored_from = laddered.timeline.folded;
+
+        // Without: same App, same seek, but the ladder emptied first so
+        // `rebuild_to` has to fold from item zero.
+        let mut plain = App::new("s".to_string(), Mode::Replay);
+        load(&mut plain);
+        plain.snapshots.clear();
+        plain.seek_to_fraction(target as f64 / count as f64);
+
+        assert_eq!(
+            restored_from, plain.timeline.folded,
+            "both paths must land on the same item"
+        );
+        assert!(
+            laddered.session == plain.session,
+            "ladder restore diverged from a full rebuild"
+        );
+    }
+
+    /// A re-sort moves existing items, so every rung taken before it describes
+    /// a prefix that no longer exists. They must be discarded, not restored.
+    #[test]
+    fn a_generation_bump_voids_the_ladder() {
+        let mut app = App::new("s".to_string(), Mode::Live);
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        app.handle_ui_event(UiEvent::ReplayLoaded {
+            session_id: "s".into(),
+            items: (0..SNAPSHOT_STRIDE * 2)
+                .map(|i| {
+                    crate::tailer::ReplayItem::at(
+                        Some(t0 + chrono::Duration::seconds(i as i64)),
+                        meta_update(&format!("sub{i}")),
+                    )
+                })
+                .collect(),
+            speed: 8.0,
+            info: Default::default(),
+        });
+        app.go_live();
+        assert!(!app.snapshots.is_empty(), "rungs were taken");
+
+        // Simulate the re-sort that `append_live` performs when a late batch
+        // dates a previously-pending item.
+        app.timeline.generation = app.timeline.generation.wrapping_add(1);
+        app.seek_to_fraction(0.25);
+        assert!(
+            app.snapshots
+                .iter()
+                .all(|s| s.generation == app.timeline.generation),
+            "a stale-generation rung survived the seek"
+        );
     }
 
     #[test]
