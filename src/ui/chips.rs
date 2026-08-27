@@ -95,16 +95,18 @@ fn group_state(
     start: usize,
     count: usize,
 ) -> Option<ToolState> {
-    let calls = model
-        .agent(agent_id)?
-        .tool_calls
-        .get(start..start + count)?;
-    if calls.is_empty() {
+    let tool_calls = &model.agent(agent_id)?.tool_calls;
+    // `tool_calls` is a persistent `Vector`, which has no slicing by shared
+    // reference (its `slice` splits the vector in place), so walk the window
+    // instead. Out-of-range is still `None`, matching the previous
+    // `get(range)?` — a truncated run means the model was rebuilt underneath us.
+    if count == 0 || start + count > tool_calls.len() {
         return None;
     }
-    if calls.iter().any(|c| c.state == ToolState::Pending) {
+    let calls = || tool_calls.iter().skip(start).take(count);
+    if calls().any(|c| c.state == ToolState::Pending) {
         Some(ToolState::Pending)
-    } else if calls.iter().any(|c| c.state == ToolState::Err) {
+    } else if calls().any(|c| c.state == ToolState::Err) {
         Some(ToolState::Err)
     } else {
         Some(ToolState::Ok)
@@ -228,8 +230,12 @@ impl ChipTray {
                     i += 1;
                 }
                 let count = i - start;
-                let settled = !calls[start..i]
+                // Window-walk rather than slice: `calls` is a persistent
+                // `Vector` and cannot be sliced through a shared reference.
+                let settled = !calls
                     .iter()
+                    .skip(start)
+                    .take(count)
                     .any(|c| c.state == ToolState::Pending);
                 let prev = prior.get(&(id.clone(), start)).copied();
 
@@ -450,14 +456,16 @@ mod tests {
         m.apply_meta("sub1", None, &meta);
         let agent = m.agents.get_mut("sub1").unwrap();
         for i in 0..n {
-            agent.tool_calls.push(crate::state::session::ToolCallInfo {
-                id: format!("toolu_{i}"),
-                name: "Bash".into(),
-                summary: None,
-                ts: None,
-                end_ts: None,
-                state: ToolState::Pending,
-            });
+            agent
+                .tool_calls
+                .push_back(crate::state::session::ToolCallInfo {
+                    id: format!("toolu_{i}"),
+                    name: "Bash".into(),
+                    summary: None,
+                    ts: None,
+                    end_ts: None,
+                    state: ToolState::Pending,
+                });
         }
         m
     }
@@ -475,14 +483,16 @@ mod tests {
         m.apply_meta("sub1", None, &meta);
         let agent = m.agents.get_mut("sub1").unwrap();
         for (i, name) in names.iter().enumerate() {
-            agent.tool_calls.push(crate::state::session::ToolCallInfo {
-                id: format!("toolu_{i}"),
-                name: (*name).into(),
-                summary: None,
-                ts: None,
-                end_ts: None,
-                state: ToolState::Pending,
-            });
+            agent
+                .tool_calls
+                .push_back(crate::state::session::ToolCallInfo {
+                    id: format!("toolu_{i}"),
+                    name: (*name).into(),
+                    summary: None,
+                    ts: None,
+                    end_ts: None,
+                    state: ToolState::Pending,
+                });
         }
         m
     }
