@@ -99,3 +99,16 @@ name = "zoe"
 path = "src/main.rs"
 # Native terminal binary — skipped by a `--no-default-features` build.
 required-features = ["native"]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+# Baselines for the parse -> timeline -> fold -> seek pipeline, over synthetic
+# sessions (benches/common).
+[[bench]]
+name = "timeline"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
