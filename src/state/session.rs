@@ -7,7 +7,7 @@
 //! group node. Spawn order is tracked explicitly so layout and navigation are
 //! deterministic.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use imbl::{HashMap, HashSet, OrdMap, Vector};
 
 use chrono::{DateTime, Utc};
 
@@ -25,18 +25,23 @@ pub const MAIN_ID: &str = "main";
 const INTERACTIVE_IDLE_SECS: i64 = 120;
 
 /// The full derived view of a session.
+///
+/// `Clone` is O(1): every growing collection here is persistent
+/// ([`imbl`]), so cloning shares structure rather than copying it. That is what
+/// makes a snapshot cheap enough to keep several of.
+#[derive(Clone, PartialEq)]
 pub struct SessionModel {
     pub session_id: String,
     /// Agents keyed by stable node id (`"main"`, `agentId`, or `wf-id`).
-    pub agents: BTreeMap<String, AgentInfo>,
+    pub agents: OrdMap<String, AgentInfo>,
     /// Stable spawn order of node ids (insertion order). Drives layout/nav.
-    pub spawn_order: Vec<String>,
+    pub spawn_order: Vector<String>,
     /// Most recent activity timestamp seen across all files.
     pub last_activity: Option<DateTime<Utc>>,
     /// `runId → (workflowName, summary)` from main-transcript workflow launches,
     /// kept as a FACT rather than applied on arrival: the launch and the group's
     /// first subagent meta can fold in either order, so both sides consult this.
-    workflow_labels: BTreeMap<String, (Option<String>, Option<String>)>,
+    workflow_labels: OrdMap<String, (Option<String>, Option<String>)>,
     /// Completion facts, kept so model state is a function of the fact SET,
     /// not of arrival order — a completion can arrive before its target
     /// exists (live attach applies the main transcript before directory scans
@@ -64,7 +69,7 @@ pub struct SessionModel {
     /// Every plain user prompt in the main transcript, in order — the
     /// session's spine. Tool calls and spawns attribute to a prompt era via
     /// [`Self::prompt_for_ts`] (timestamp-derived, order-independent).
-    pub prompts: Vec<PromptInfo>,
+    pub prompts: Vector<PromptInfo>,
     /// Excerpt of the most recent assistant text in the main transcript.
     /// One logical turn spans several JSONL lines, so the reasoning for a
     /// spawn usually lives on an EARLIER line than the tool_use — this is the
@@ -93,7 +98,7 @@ pub enum LogKind {
 
 /// One user prompt in the main transcript — an era boundary on the session's
 /// timeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PromptInfo {
     /// One-line excerpt of the prompt text.
     pub excerpt: String,
@@ -105,7 +110,7 @@ pub struct PromptInfo {
 /// DERIVED from it via [`SessionModel::prompt_for_ts`] — order-independent,
 /// like all era attribution) and the assistant text immediately preceding the
 /// spawning tool call (stored: reasoning is not timestamp-derivable).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpawnContext {
     /// Timestamp of the spawning `tool_use` entry.
     pub ts: Option<DateTime<Utc>>,
@@ -188,7 +193,7 @@ pub enum ToolState {
 }
 
 /// One tool invocation within an agent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallInfo {
     /// `tool_use.id` — join key for the result.
     pub id: String,
@@ -215,6 +220,11 @@ impl ToolCallInfo {
 }
 
 /// Everything known about one agent node.
+///
+/// Cloned whenever the containing map copy-on-writes the node holding it, so
+/// its own growing collections are persistent too — a plain `Vec` of tool calls
+/// here would make every tool-call append copy the agent's whole history.
+#[derive(Clone, PartialEq)]
 pub struct AgentInfo {
     pub kind: AgentKind,
     /// Interactive category (main-session semantics: no completion evidence
@@ -240,7 +250,7 @@ pub struct AgentInfo {
     pub(crate) terminal: bool,
     pub model: Option<String>,
     /// Tool calls in observed order.
-    pub tool_calls: Vec<ToolCallInfo>,
+    pub tool_calls: Vector<ToolCallInfo>,
     /// tool_use id → index into `tool_calls`, so the per-entry dedup check and
     /// per-result completion are O(1) instead of scanning every prior call
     /// (which made folding a tool-heavy agent quadratic).
@@ -272,7 +282,7 @@ impl AgentInfo {
             status: AgentStatus::Running,
             terminal: false,
             model: None,
-            tool_calls: Vec::new(),
+            tool_calls: Vector::new(),
             tool_index: HashMap::new(),
             output_tokens: 0,
             first_ts: None,
@@ -316,19 +326,19 @@ impl SessionModel {
     /// Create an empty model for the given session id, with the `"main"` agent
     /// pre-seeded as [`AgentStatus::Running`].
     pub fn new(session_id: String) -> Self {
-        let mut agents = BTreeMap::new();
+        let mut agents = OrdMap::new();
         agents.insert(MAIN_ID.to_string(), AgentInfo::new(AgentKind::Main));
         SessionModel {
             session_id,
             agents,
-            spawn_order: vec![MAIN_ID.to_string()],
+            spawn_order: Vector::unit(MAIN_ID.to_string()),
             last_activity: None,
-            workflow_labels: BTreeMap::new(),
+            workflow_labels: OrdMap::new(),
             completed_spawns: HashMap::new(),
             task_terminal: HashMap::new(),
             journal_done: HashSet::new(),
             spawn_context: HashMap::new(),
-            prompts: Vec::new(),
+            prompts: Vector::new(),
             last_main_text: None,
         }
     }
@@ -346,7 +356,7 @@ impl SessionModel {
             info.terminal = true;
         }
         self.agents.insert(id.to_string(), info);
-        self.spawn_order.push(id.to_string());
+        self.spawn_order.push_back(id.to_string());
         true
     }
 
@@ -473,7 +483,7 @@ impl SessionModel {
                         // replay). A genuine repeat at a *different* ts is kept.
                         let dup = self.prompts.iter().any(|p| p.excerpt == ex && p.ts == ts);
                         if !dup {
-                            self.prompts.push(PromptInfo { excerpt: ex, ts });
+                            self.prompts.push_back(PromptInfo { excerpt: ex, ts });
                         }
                     }
                 }
@@ -532,7 +542,7 @@ impl SessionModel {
                 // same cumulative usage; count it once per `requestId`. Lines
                 // with no `requestId` can't be deduped, so they sum per line.
                 match &e.envelope.request_id {
-                    Some(req) if !agent.seen_request_ids.insert(req.clone()) => {}
+                    Some(req) if agent.seen_request_ids.insert(req.clone()).is_some() => {}
                     // Saturating: counts come from untrusted transcript
                     // content; overflow must not panic (debug) or wrap.
                     _ => agent.output_tokens = agent.output_tokens.saturating_add(out),
@@ -568,7 +578,7 @@ impl SessionModel {
                     }
                     let summary = summarize_tool(&name, &tu.input, e.envelope.cwd.as_deref());
                     agent.tool_index.insert(id.clone(), agent.tool_calls.len());
-                    agent.tool_calls.push(ToolCallInfo {
+                    agent.tool_calls.push_back(ToolCallInfo {
                         id: id.clone(),
                         name,
                         summary,
@@ -1206,12 +1216,12 @@ mod tests {
                 }
             };
         let mut m = SessionModel::new("s".into());
-        m.prompts.push(PromptInfo {
+        m.prompts.push_back(PromptInfo {
             excerpt: "review the codebase".into(),
             ts: Some(ts("2026-06-05T10:00:00Z")),
         });
         let main = m.agents.get_mut(MAIN_ID).unwrap();
-        main.tool_calls.push(tool(
+        main.tool_calls.push_back(tool(
             "s1",
             "Agent",
             "hunt bugs",
@@ -1220,7 +1230,7 @@ mod tests {
             ToolState::Ok,
         ));
         // A slow Bash: started 10:10, failed (result) at 10:12.
-        main.tool_calls.push(tool(
+        main.tool_calls.push_back(tool(
             "b1",
             "Bash",
             "cargo test",
@@ -1229,7 +1239,7 @@ mod tests {
             ToolState::Err,
         ));
         // A later SUCCESSFUL non-spawn tool is not a log event.
-        main.tool_calls.push(tool(
+        main.tool_calls.push_back(tool(
             "r1",
             "Read",
             "src/lib.rs",
@@ -1277,7 +1287,7 @@ mod tests {
             .get_mut(MAIN_ID)
             .unwrap()
             .tool_calls
-            .push(ToolCallInfo {
+            .push_back(ToolCallInfo {
                 id: "call1".into(),
                 name: "Agent".into(),
                 summary: Some("hunt bugs".into()),
