@@ -36,6 +36,8 @@ pub mod ui;
 #[cfg(feature = "native")]
 pub mod index;
 #[cfg(feature = "native")]
+pub mod monitor;
+#[cfg(feature = "native")]
 pub mod sessions;
 
 #[cfg(feature = "native")]

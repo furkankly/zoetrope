@@ -21,6 +21,17 @@ pub fn handle_event(event: &Event, app: &mut App) -> bool {
     match event {
         Event::Key(key) => handle_key(key, app),
         Event::Mouse(mouse) => {
+            // A left click inside the rail focuses that session. Intercepted
+            // before the flow, which would otherwise read it as a pane drag.
+            if let Some(area) = app.rail_area
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.column >= area.x
+                && mouse.column < area.x + area.width
+                && let Some(index) = crate::ui::rail::row_at(area, mouse.row, app.rail.rows.len())
+            {
+                app.focus_session_index(index);
+                return false;
+            }
             // A press/drag on the scrubber row seeks the playhead — intercept it
             // before the flow sees it (else it reads as a pane drag → pan).
             if let Some(bar) = app.scrubber_area
@@ -144,6 +155,19 @@ fn handle_key(key: &KeyEvent, app: &mut App) -> bool {
             return false;
         }
 
+        // Session rail: show/hide, move the focus, switch layout.
+        KeyCode::Char('w') | KeyCode::Char('W') => {
+            app.rail.toggle_visible();
+            return false;
+        }
+        KeyCode::Char('n') => {
+            app.focus_session(1);
+            return false;
+        }
+        KeyCode::Char('p') | KeyCode::Char('N') => {
+            app.focus_session(-1);
+            return false;
+        }
         // Help overlay.
         KeyCode::Char('?') => {
             app.show_help = !app.show_help;
@@ -382,9 +406,12 @@ mod tests {
             )
         };
         let mut app = App::new("s".into(), Mode::Live);
+        // Flow ids are session-qualified everywhere `sync` writes them, so a
+        // hand-built test node uses the same form.
+        let (id_a, id_b) = (app.node_id("a"), app.node_id("b"));
         // Two nodes far apart so the second is off-screen when we focus the first.
-        app.flow.add_node(mk("a", 0.0)).unwrap();
-        app.flow.add_node(mk("b", 500.0)).unwrap();
+        app.flow.add_node(mk(&id_a, 0.0)).unwrap();
+        app.flow.add_node(mk(&id_b, 500.0)).unwrap();
         // Render so the flow has a canvas, then zoom/focus tightly on "a" so "b"
         // is well off-screen (the library WOULD pan to reveal it).
         let area = ratatui::layout::Rect::new(0, 0, 60, 20);
@@ -392,7 +419,7 @@ mod tests {
         (&mut app.flow).render(area, &mut buf);
         app.flow.zoom_to(5.0);
         app.flow.center_on((5.0, 2.5));
-        app.flow.select_node("a");
+        app.flow.select_node(&id_a);
         let before = (app.flow.viewport.x, app.flow.viewport.y);
 
         // Tab to "b": the flow is `SelectionReveal::None`, so the selection moves
@@ -410,7 +437,7 @@ mod tests {
         );
         assert_eq!(
             app.pending_center.as_deref(),
-            Some("b"),
+            Some(id_b.as_str()),
             "the newly-selected node is queued for a smooth center-glide instead"
         );
     }
@@ -420,7 +447,7 @@ mod tests {
         let mut app = App::new("s".into(), Mode::Live);
         // A selected, default-flags node — deletable=true in the library.
         let node = rataflow::Node::new(
-            "a",
+            app.node_id("a"),
             (0.0, 0.0),
             (10.0, 5.0),
             crate::ui::nodes::AgentNode {
@@ -433,13 +460,14 @@ mod tests {
                 interactive: false,
             },
         );
+        let id_a = app.node_id("a");
         app.flow.add_node(node).unwrap();
-        app.flow.select_node("a");
+        app.flow.select_node(&id_a);
 
         // Delete must NOT remove the selected node (read-only graph).
         let del = Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
         handle_event(&del, &mut app);
-        assert!(app.flow.node("a").is_some(), "Delete must be inert");
+        assert!(app.flow.node(&id_a).is_some(), "Delete must be inert");
 
         // 'i' must NOT toggle the viewport lock.
         let i = Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
@@ -451,7 +479,7 @@ mod tests {
     fn esc_closes_the_detail_panel() {
         let mut app = App::new("s".into(), Mode::Live);
         let node = rataflow::Node::new(
-            "a",
+            app.node_id("a"),
             (0.0, 0.0),
             (10.0, 5.0),
             crate::ui::nodes::AgentNode {
@@ -464,8 +492,9 @@ mod tests {
                 interactive: false,
             },
         );
+        let id_a = app.node_id("a");
         app.flow.add_node(node).unwrap();
-        app.flow.select_node("a");
+        app.flow.select_node(&id_a);
         assert!(app.selected_agent_id().is_some());
 
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -525,10 +554,12 @@ mod tests {
 
         // A USER selection gesture (click or spatial nav) drops Follow so the
         // camera stops chasing activity and gliding back over the selection.
+        // Flow events carry flow ids, which are session-qualified.
+        let id_a = app.node_id("a");
         process_flow_events(
             &mut app,
             vec![FlowEvent::SelectionChanged {
-                node_ids: vec!["a".into()],
+                node_ids: vec![id_a.clone()],
                 edge_ids: vec![],
             }]
             .into_iter(),
@@ -540,7 +571,7 @@ mod tests {
         );
         assert_eq!(
             app.pending_center.as_deref(),
-            Some("a"),
+            Some(id_a.as_str()),
             "the selected node is queued for a center-glide on the next draw"
         );
     }
@@ -548,7 +579,7 @@ mod tests {
     #[test]
     fn deselection_clears_a_pending_center() {
         let mut app = App::new("s".into(), Mode::Live);
-        app.pending_center = Some("a".into());
+        app.pending_center = Some(app.node_id("a"));
         process_flow_events(
             &mut app,
             vec![FlowEvent::SelectionChanged {

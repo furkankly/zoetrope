@@ -31,11 +31,14 @@ const STATUS_TICK: Duration = Duration::from_secs(1);
 /// iteration. Returns when the user quits.
 pub async fn run(
     mut app: App,
-    // Held for the run only to keep the request channel open: the tailer treats a
-    // closed channel as "exit", so dropping this sender would kill tailing. No
-    // input path sends on it (auto-switch is internal to the tailer).
-    _tail_tx: mpsc::Sender<TailRequest>,
+    // Kept open for the whole run: the tailer treats a closed channel as
+    // "exit". Also carries session switches from the rail — the tailer's own
+    // auto-switch remains internal to it.
+    tail_tx: mpsc::Sender<TailRequest>,
     mut ui_rx: mpsc::Receiver<UiEvent>,
+    // Publishes which session is focused, so the monitor supervisor does not
+    // put a second tailer on it (which would double every append).
+    focus_tx: tokio::sync::watch::Sender<String>,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
@@ -128,6 +131,25 @@ pub async fn run(
         }
         while let Ok(ev) = ui_rx.try_recv() {
             app.handle_ui_event(ev);
+        }
+
+        // A rail focus change reaches the tailer here: input handling is
+        // synchronous and owns no channel, so it queues the request instead
+        // (same shape as `pending_seek`). `try_send` keeps the render loop
+        // non-blocking; on a full channel the request stays queued and goes out
+        // next frame rather than being dropped, because a swallowed switch
+        // leaves the rail marker pointing at a session nobody is watching.
+        if let Some(path) = app.pending_watch.take()
+            && tail_tx.try_send(TailRequest::Watch(path.clone())).is_err()
+        {
+            app.pending_watch = Some(path);
+        }
+
+        // The focus can change without any input — the tailer's own
+        // auto-switch moves it — so publish from the loop rather than from the
+        // key handler.
+        if *focus_tx.borrow() != app.current_session_id {
+            let _ = focus_tx.send(app.current_session_id.clone());
         }
 
         if quit || app.should_quit {

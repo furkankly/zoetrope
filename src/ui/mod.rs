@@ -10,6 +10,7 @@ pub mod chips;
 pub mod edges;
 pub mod nodes;
 pub mod panel;
+pub mod rail;
 
 use rataflow::{Background, MiniMap, MiniMapPosition};
 use ratatui::Frame;
@@ -53,6 +54,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // whole row) so the input handler maps a click to the same width the
     // playhead is drawn over.
     app.scrubber_area = None;
+    // Same contract for the rail: a frame that does not draw it must not leave
+    // a stale rect behind to swallow canvas clicks.
+    app.rail_area = None;
+
+    // The session rail takes a fixed column off the left of the canvas, before
+    // the detail panel splits what remains — the rail is workspace-level
+    // furniture, the panel is about the selected agent inside one session.
+    let now = chrono::Utc::now();
+    // NOT gated on `rail.layout()`: the forest renderer does not exist yet, so
+    // letting the layout choice hide the rail meant three concurrent sessions
+    // silently removed it — and `w` then looked broken, because the auto-switch
+    // was overriding it. The rail hides only when the user says so or the
+    // terminal is too narrow to hold it and a usable canvas.
+    let show_rail = app.rail.should_show() && canvas_area.width > rail::RAIL_WIDTH * 2;
+    let canvas_area = if show_rail {
+        let [rail_area, rest] =
+            Layout::horizontal([Constraint::Length(rail::RAIL_WIDTH), Constraint::Fill(1)])
+                .areas(canvas_area);
+        rail::render(frame, rail_area, app, now);
+        rest
+    } else {
+        canvas_area
+    };
 
     // Copy the selected agent id out *before* borrowing the flow mutably for
     // the canvas render (borrow split: companions take &Flow, Widget is &mut).
@@ -545,7 +569,7 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
 /// Centered help overlay: full key reference + status-glyph legend.
 fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
     let w = area.width.min(60);
-    let h = area.height.min(18);
+    let h = area.height.min(19);
     if w < 24 || h < 9 {
         return;
     }
@@ -570,7 +594,7 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
         "q · ctrl-c"
     };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(" camera    ", key),
@@ -631,6 +655,18 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
             Span::styled("green edges = agent running", dim),
         ]),
     ];
+
+    // The rail is native-only: the browser frontend is handed one session's
+    // bytes and has no filesystem to discover others in, so listing its keys
+    // there would advertise something that cannot happen.
+    #[cfg(not(target_arch = "wasm32"))]
+    lines.insert(
+        3,
+        Line::from(vec![
+            Span::styled(" sessions  ", key),
+            Span::styled("canvas shows all live · w rail · n/p focus", txt),
+        ]),
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)

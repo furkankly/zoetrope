@@ -9,6 +9,7 @@
 //! zoe <file> --follow       follow a file's live edge instead of replaying
 //! zoe <file> --speed N      playback speed multiplier (default 8.0)
 //! zoe inspect <file.jsonl>  headless: print the session tree + info
+//! zoe sessions [--since M]  headless: list every session active in a window
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use tokio::sync::mpsc;
 use zoetrope::state::session::{AgentKind, SessionModel, ToolState};
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{Source, TailRequest, UiEvent, Update};
-use zoetrope::{tailer, transcript, tui};
+use zoetrope::{monitor, sessions, tailer, transcript, tui};
 
 /// Channel capacity for the bounded request/event channels.
 const CHANNEL_CAP: usize = 32;
@@ -42,10 +43,21 @@ pub enum Cli {
     },
     /// Headless: parse and print the session tree + info; no TUI.
     Inspect { file: PathBuf },
+    /// Headless: discover every session touched within `window` and summarize
+    /// each from its skeleton index. No TUI, no transcript bodies parsed.
+    Sessions {
+        window: std::time::Duration,
+        /// Projects root to sweep. `None` = `~/.claude/projects`.
+        root: Option<PathBuf>,
+    },
 }
 
 /// Default replay speed multiplier.
 const DEFAULT_REPLAY_SPEED: f64 = 8.0;
+
+/// Default `sessions` window: a day. Wide enough that "what was I running?"
+/// is answerable, narrow enough that the sweep stays a stat sweep.
+const DEFAULT_SESSION_WINDOW_MINS: u64 = 24 * 60;
 
 const USAGE: &str = "\
 zoetrope — visualize Claude Code agent sessions as a flow graph
@@ -57,7 +69,12 @@ USAGE:
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
     zoe inspect <file>      headless: print the session tree + info
+    zoe sessions [--since M] [--root DIR]
+                            headless: list sessions active in the last M minutes
     zoe --version           print the version and exit
+
+ENV:
+    ZOE_PROJECTS_ROOT       use this tree instead of ~/.claude/projects
 
 Once open, scrub/follow/pause/go-live are available no matter how you launched.";
 
@@ -65,6 +82,39 @@ Once open, scrub/follow/pause/go-live are available no matter how you launched."
 fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     // Skip argv[0].
     let mut args = args.skip(1).peekable();
+
+    // `sessions [--since <minutes>]`: the headless multi-session sweep.
+    if args.peek().map(String::as_str) == Some("sessions") {
+        args.next();
+        let mut minutes = DEFAULT_SESSION_WINDOW_MINS;
+        let mut root: Option<PathBuf> = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                // Sweeping an arbitrary root is what makes this command
+                // testable: pointing it at a fixture tree exercises discovery
+                // without reading anybody's real transcripts.
+                "--root" => {
+                    let v = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--root requires a directory\n\n{USAGE}"))?;
+                    root = Some(PathBuf::from(v));
+                }
+                "--since" => {
+                    let v = args.next().ok_or_else(|| {
+                        anyhow!("--since requires a number of minutes\n\n{USAGE}")
+                    })?;
+                    minutes = v
+                        .parse::<u64>()
+                        .with_context(|| format!("invalid --since value: {v:?}"))?;
+                }
+                other => bail!("unexpected argument {other:?}\n\n{USAGE}"),
+            }
+        }
+        return Ok(Cli::Sessions {
+            window: std::time::Duration::from_secs(minutes * 60),
+            root,
+        });
+    }
 
     // `inspect <file>` is the one distinct (headless) subcommand.
     if args.peek().map(String::as_str) == Some("inspect") {
@@ -253,6 +303,84 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Run the `sessions` subcommand: discover every session touched within
+/// `window` and summarize each from its skeleton index.
+///
+/// Prints the two phases' costs separately, because they scale differently and
+/// the distinction is the whole point of the design: discovery is a stat sweep
+/// over every project, summarizing is a byte scan over the survivors — and on a
+/// warm index cache the second phase reads headers rather than transcripts.
+fn run_sessions(window: std::time::Duration, root: Option<PathBuf>) -> Result<()> {
+    let root = match root {
+        Some(r) => r,
+        None => transcript::claude_projects_root()
+            .ok_or_else(|| anyhow!("no Claude projects directory (is $HOME set?)"))?,
+    };
+    let since = std::time::SystemTime::now()
+        .checked_sub(window)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let t0 = std::time::Instant::now();
+    let found = sessions::discover(&root, since);
+    let discover_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+    let mins = window.as_secs() / 60;
+    println!(
+        "{} — sessions touched in the last {mins} min",
+        root.display()
+    );
+    if found.is_empty() {
+        println!("  (none)");
+        return Ok(());
+    }
+
+    let t1 = std::time::Instant::now();
+    let summaries: Vec<_> = found.iter().map(sessions::Summary::of).collect();
+    let index_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+    println!();
+    println!(
+        "{:<10} {:>6} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6}  last activity",
+        "session", "files", "MB", "lines", "prompts", "tools", "spawn", "fail"
+    );
+    for (s, sum) in found.iter().zip(&summaries) {
+        let last = sum
+            .last_activity
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "—".to_string());
+        // A session whose newest bytes are a subagent's is the case the naive
+        // main-file mtime filter drops; mark it so the sweep can be eyeballed.
+        let mark = if s.touched_by_sidecar { " ·sub" } else { "" };
+        let prompts = if sum.ambiguous_prompts > 0 {
+            format!("{}+{}?", sum.prompts, sum.ambiguous_prompts)
+        } else {
+            sum.prompts.to_string()
+        };
+        println!(
+            "{:<10} {:>6} {:>6.1} {:>8} {:>7} {:>7} {:>6} {:>6}  {last}{mark}",
+            &s.session_id[..8.min(s.session_id.len())],
+            sum.files,
+            sum.bytes as f64 / 1e6,
+            sum.lines,
+            prompts,
+            sum.tool_calls,
+            sum.spawns,
+            sum.failures,
+        );
+    }
+
+    let total_mb: f64 = summaries.iter().map(|s| s.bytes as f64).sum::<f64>() / 1e6;
+    let total_files: usize = summaries.iter().map(|s| s.files).sum();
+    println!();
+    println!(
+        "{} session(s), {total_files} file(s), {total_mb:.1} MB",
+        found.len()
+    );
+    println!("  discover (stat sweep): {discover_ms:.1} ms");
+    println!("  index + summarize:     {index_ms:.1} ms");
+    Ok(())
+}
+
 /// Build `SessionInfo` from the main file's untimed flat-metadata (mirrors the
 /// timeline feeder's extraction, for the headless `inspect` path). Latest-wins by
 /// file order; counts accumulate.
@@ -401,6 +529,14 @@ async fn run_tui(cli: Cli) -> Result<()> {
         .await
         .map_err(|_| anyhow!("tailer channel closed before start"))?;
 
+    // Multi-session discovery + the monitor fleet: publishes the rail rows and
+    // keeps a tailer on every live session that is not focused, so the canvas
+    // shows all of them. The focus tailer below still owns the one session with
+    // a timeline; `focus_tx` tells the supervisor which that is.
+    let (focus_tx, focus_rx) = tokio::sync::watch::channel(session_id.clone());
+    let sweep_tx = ui_tx.clone();
+    tokio::spawn(async move { monitor::supervise(sweep_tx, focus_rx).await });
+
     // Spawn the tailer task — owns all files of the watched session.
     tokio::spawn(async move {
         if let Err(e) = tailer::run(tail_rx, ui_tx.clone(), replay, speed).await {
@@ -409,7 +545,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     });
 
     let app = App::new(session_id, mode);
-    tui::run(app, tail_tx, ui_rx).await
+    tui::run(app, tail_tx, ui_rx, focus_tx).await
 }
 
 #[tokio::main]
@@ -426,6 +562,7 @@ async fn main() -> Result<()> {
     let cli = parse_cli(std::env::args())?;
     match cli {
         Cli::Inspect { file } => run_inspect(file).await,
+        Cli::Sessions { window, root } => run_sessions(window, root),
         other => run_tui(other).await,
     }
 }

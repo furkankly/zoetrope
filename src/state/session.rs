@@ -27,6 +27,13 @@ const INTERACTIVE_IDLE_SECS: i64 = 120;
 /// The full derived view of a session.
 pub struct SessionModel {
     pub session_id: String,
+    /// Human-readable name for this session's project, shown on the root card.
+    ///
+    /// Not derivable from the transcript alone at fold time — it comes from the
+    /// session's `cwd` via the discovery sweep — and every root card would
+    /// otherwise read "claude", which is unreadable the moment the canvas holds
+    /// more than one session.
+    pub label: Option<String>,
     /// Agents keyed by stable node id (`"main"`, `agentId`, or `wf-id`).
     pub agents: BTreeMap<String, AgentInfo>,
     /// Stable spawn order of node ids (insertion order). Drives layout/nav.
@@ -320,6 +327,7 @@ impl SessionModel {
         agents.insert(MAIN_ID.to_string(), AgentInfo::new(AgentKind::Main));
         SessionModel {
             session_id,
+            label: None,
             agents,
             spawn_order: vec![MAIN_ID.to_string()],
             last_activity: None,

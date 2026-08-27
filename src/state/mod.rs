@@ -108,8 +108,19 @@ impl CameraGlide {
 pub struct App {
     /// The rendered flow graph (agent cards + step edges).
     pub flow: AgentFlow,
-    /// The pure domain model the graph is projected from.
+    /// The pure domain model the graph is projected from — the **focused**
+    /// session: the one the timeline, scrubber and detail panel are bound to.
     pub session: SessionModel,
+    /// Models for every other watched session, keyed by session id.
+    ///
+    /// Deliberately separate from [`session`](Self::session) rather than one
+    /// map holding all of them, because the asymmetry is real: the focused
+    /// session has a [`Timeline`] and can be scrubbed, the others are folded
+    /// straight off their live edge and only ever render. Flattening the two
+    /// would mean either giving every session a timeline it never uses, or
+    /// pretending the focused one is not special when every seek path says it
+    /// is. Never contains [`current_session_id`](Self::current_session_id).
+    pub others: std::collections::BTreeMap<String, SessionModel>,
     /// Live vs replay.
     pub mode: Mode,
     /// Play/pause state — freezes the playhead in **both** replay and live (a
@@ -153,6 +164,9 @@ pub struct App {
     /// Screen rect of the scrubber bar from the last render, so the input
     /// handler can map a click/drag on it to a seek. `None` when not drawn.
     pub scrubber_area: Option<ratatui::layout::Rect>,
+    /// Inner rect of the session rail from the last render, so a click can be
+    /// mapped back to a row. `None` when the rail is not drawn.
+    pub rail_area: Option<ratatui::layout::Rect>,
     /// Cached per-column scrubber tallies (head-independent), recomputed only when
     /// the item count or bar width changes — not every frame. See
     /// [`crate::ui::ScrubberTally`].
@@ -180,6 +194,16 @@ pub struct App {
     /// costs ONE seek (a backward seek rebuilds the whole model), not one per
     /// mouse event.
     pub pending_seek: Option<f64>,
+    /// Every live session, and how the workspace is laid out. Populated by
+    /// [`UiEvent::Sessions`](crate::tailer::UiEvent::Sessions) sweeps; empty in
+    /// the browser frontend, which has no filesystem to sweep.
+    pub rail: crate::state::rail::SessionRail,
+    /// A session the user asked to focus, queued for the event loop to send to
+    /// the tailer as a `Watch`. Queued rather than sent directly because input
+    /// handling is synchronous and owns no channel — the same shape as
+    /// [`pending_seek`](Self::pending_seek) and
+    /// [`pending_center`](Self::pending_center).
+    pub pending_watch: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -189,6 +213,7 @@ impl App {
         App {
             flow: graph::new_flow(),
             session: SessionModel::new(session_id.clone()),
+            others: std::collections::BTreeMap::new(),
             mode,
             is_paused: false,
             current_session_id: session_id,
@@ -203,6 +228,7 @@ impl App {
             camera_glide: None,
             timeline: Timeline::new(),
             scrubber_area: None,
+            rail_area: None,
             scrubber_tally: None,
             era_cache: None,
             last_batch_at: None,
@@ -210,6 +236,8 @@ impl App {
             show_info: false,
             pending_center: None,
             pending_seek: None,
+            rail: Default::default(),
+            pending_watch: None,
         }
     }
 
@@ -297,6 +325,31 @@ impl App {
         }
     }
 
+    /// Ask to watch the session `delta` rows away in the rail.
+    ///
+    /// Queues the switch rather than performing it: the tailer owns which files
+    /// are open, and it reports the change back as a
+    /// [`SessionReset`](crate::tailer::UiEvent::SessionReset), which is what
+    /// moves `current_session_id` and therefore the rail's marker. A no-op when
+    /// there is nowhere to move.
+    pub fn focus_session(&mut self, delta: isize) {
+        if let Some(path) = self.rail.step_focus(&self.current_session_id, delta) {
+            self.pending_watch = Some(path);
+        }
+    }
+
+    /// Ask to watch the rail row at `index` (a click).
+    pub fn focus_session_index(&mut self, index: usize) {
+        if let Some(path) = self.rail.focus_index(&self.current_session_id, index) {
+            self.pending_watch = Some(path);
+        }
+    }
+
+    /// The rail row for the session being watched, if the rail lists it.
+    pub fn focused_row(&self) -> Option<&crate::state::rail::RailRow> {
+        self.rail.focused_row(&self.current_session_id)
+    }
+
     /// Re-pin to the timeline edge ("go live" / jump to end) and resume playback.
     pub fn go_live(&mut self) {
         self.is_paused = false;
@@ -309,10 +362,11 @@ impl App {
 
     /// Fold a tailer [`UiEvent`] into state.
     ///
-    /// Drops events whose `session_id` is not [current](Self::is_current),
-    /// applies batched updates to the [`SessionModel`], re-syncs the graph, and
-    /// re-fits the view on structural changes while the follow camera is
-    /// engaged. Switches the current session id on reset.
+    /// Routes by `session_id` rather than dropping: the canvas shows every
+    /// watched session, so a batch for a session that is not focused folds into
+    /// [`others`](Self::others) instead of being discarded. Only the focused
+    /// session's batches reach the [`Timeline`] — see
+    /// [`fold_other`](Self::fold_other).
     pub fn handle_ui_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::Batch {
@@ -392,10 +446,20 @@ impl App {
                 // graph — there is nothing to wipe, and resetting view state
                 // there would clobber a camera/pin choice the user made while
                 // waiting for the session to appear.
-                let genuine = !self.is_current(&session_id) || self.flow.nodes().count() > 0;
+                let had_nodes = self
+                    .flow
+                    .nodes()
+                    .any(|n| graph::split_node_id(&n.id).is_some_and(|(s, _)| s == session_id));
+                let genuine = !self.is_current(&session_id) || had_nodes;
+                // Take only the OLD focused session off the canvas — a whole
+                // flow rebuild would drop every OTHER session's nodes too.
+                graph::remove_session(&mut self.flow, &self.current_session_id);
+                // Switching to a session that was being monitored: the focused
+                // model replaces its monitored one, which would otherwise
+                // render the same agents twice.
+                self.others.remove(&session_id);
                 self.current_session_id = session_id.clone();
                 self.session = SessionModel::new(session_id);
-                self.flow = graph::new_flow();
                 // A reset is a fresh live timeline (only live emits resets — the
                 // initial announce, truncation, or auto-switch). Replay arrives
                 // via ReplayLoaded, never a reset.
@@ -408,6 +472,23 @@ impl App {
                     self.chips.clear();
                     self.camera_glide = None;
                 }
+            }
+            UiEvent::MonitorBatch {
+                session_id,
+                updates,
+            } => {
+                // `fold_other` projects just this session — see its docs.
+                self.fold_other(&session_id, updates);
+            }
+            UiEvent::MonitorReset { session_id } => {
+                self.forget_session(&session_id);
+            }
+            UiEvent::Sessions(rows) => {
+                // Not gated on `is_current`: a sweep describes the whole
+                // workspace, not one session, so it is never stale for the
+                // watched one.
+                self.apply_session_labels(&rows);
+                self.rail.adopt(rows);
             }
             UiEvent::Error(msg) => {
                 self.last_error = Some(msg);
@@ -559,8 +640,9 @@ impl App {
     /// rebuild: node positions (the user's arrangement / a stable layout) and
     /// the selected node are carried over by id.
     fn rebuild_to(&mut self, target: usize) {
-        // Snapshot view state to carry across the wipe.
-        let selected = self.selected_agent_id();
+        // Snapshot view state to carry across the wipe. The FLOW id, not the
+        // local agent id — `select_node` speaks flow ids.
+        let selected = self.selected_node_id();
         // The camera/viewport (pan + zoom) is the user's — a fresh `Flow` would
         // reset it to the origin, snapping the graph on every backward seek even
         // in Manual/Overview. Carry it across.
@@ -607,11 +689,101 @@ impl App {
         // fanned past siblings) and nothing existing moves until the user asks
         // to tidy (`r`, or re-engaging the camera with `o`/`f`). `layout_dirty`
         // tracks that there is un-applied growth for the on-demand path.
-        let structural = graph::sync(&mut self.flow, &self.session, false);
+        let mut structural = graph::sync(&mut self.flow, &self.session, false);
+        // Every other watched session is on the same canvas. Their liveness is
+        // wall-clock derived (they have no playhead of their own), and their
+        // workflow rollups need the same pass the focused session gets.
+        let now = chrono::Utc::now();
+        for model in self.others.values_mut() {
+            model.recompute_workflow_status();
+            model.recompute_liveness(Some(now));
+            structural |= graph::sync(&mut self.flow, model, false);
+        }
         if structural {
             self.layout_dirty = true;
         }
         structural
+    }
+
+    /// Fold a batch belonging to a session that is NOT focused.
+    ///
+    /// Straight into that session's model — no timeline, so no pacing and no
+    /// seeking. A monitored session is something you watch move, not something
+    /// you scrub; giving it a playhead would mean holding its whole item list
+    /// for a view that only ever shows the live edge.
+    fn fold_other(&mut self, session_id: &str, updates: Vec<crate::tailer::Update>) {
+        // A monitor's batch can still be in flight when its session becomes the
+        // focused one. Folding it here would build a second model projecting
+        // onto the same node ids as the focused model, and the two would
+        // overwrite each other's card content every sync.
+        if self.is_current(session_id) {
+            return;
+        }
+        let now = chrono::Utc::now();
+        let model = self
+            .others
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionModel::new(session_id.to_string()));
+        for update in &updates {
+            model.apply_update(update);
+        }
+        // Project ONLY this session. Every monitor polls several times a second
+        // and a full `resync` walks every agent of every model, so syncing the
+        // whole canvas per batch scales with sessions squared for no reason —
+        // nothing else changed. Time-derived liveness for the other sessions is
+        // refreshed by `status_tick` regardless.
+        model.recompute_workflow_status();
+        model.recompute_liveness(Some(now));
+        if graph::sync(&mut self.flow, model, false) {
+            self.layout_dirty = true;
+        }
+    }
+
+    /// Name each watched session's root card from the sweep's project names.
+    ///
+    /// The models are folded from transcripts, which do not carry a project
+    /// name; the sweep reads it from each session's `cwd`. Applied on every
+    /// sweep rather than once, because a session can be folded from its batches
+    /// before discovery has ever described it.
+    fn apply_session_labels(&mut self, rows: &[crate::state::rail::RailRow]) {
+        let mut changed = false;
+        for row in rows {
+            let label = Some(row.project.clone());
+            if self.is_current(&row.session_id) {
+                if self.session.label != label {
+                    self.session.label = label;
+                    changed = true;
+                }
+            } else if let Some(model) = self.others.get_mut(&row.session_id)
+                && model.label != label
+            {
+                model.label = label;
+                changed = true;
+            }
+        }
+        // One resync for the whole sweep: it walks every agent of every model,
+        // so doing it per row would scale with sessions squared.
+        if changed {
+            self.resync();
+        }
+    }
+
+    /// Stop watching `session_id`: drop its model and take its subtree off the
+    /// canvas. No-op for the focused session, which is owned elsewhere.
+    pub fn forget_session(&mut self, session_id: &str) {
+        if session_id == self.current_session_id {
+            return;
+        }
+        if self.others.remove(session_id).is_some() {
+            graph::remove_session(&mut self.flow, session_id);
+            self.layout_dirty = true;
+        }
+    }
+
+    /// Every watched session id, focused first.
+    pub fn watched_sessions(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.current_session_id.as_str())
+            .chain(self.others.keys().map(String::as_str))
     }
 
     /// Tidy the graph on demand (`r`): run Sugiyama now and reframe for the
@@ -661,15 +833,17 @@ impl App {
     /// is an eased glide (`focus_camera` + per-frame
     /// [`tick_camera`](Self::tick_camera)) rather than a teleport.
     pub fn track_activity(&mut self) {
-        let Some(id) = self.session.last_active_agent_id() else {
+        let Some(agent) = self.session.last_active_agent_id() else {
             return;
         };
+        // Model id → flow id: the camera and selection speak flow ids.
+        let id = self.node_id(&agent);
         self.center_node(&id, true); // Follow: clamp zoom for readability.
         // In Follow the panel narrates the followed agent. `select_node` is quiet
         // (no SelectionChanged), so this never trips the drop-Follow detection in
         // the handler — a user selection, which does fire it, drops to Manual and
         // stops this auto-narration entirely.
-        if self.selected_agent_id().as_deref() != Some(id.as_str()) {
+        if self.selected_agent_id().as_deref() != Some(agent.as_str()) {
             self.flow.select_node(&id);
             self.detail_scroll = 0;
             self.detail_follow = true;
@@ -764,7 +938,23 @@ impl App {
     /// The node id of the currently selected agent, if any (read from the flow
     /// during render; copy it out before borrowing `app` mutably).
     pub fn selected_agent_id(&self) -> Option<String> {
+        let node = self.selected_node_id()?;
+        let (session, agent) = graph::split_node_id(&node)?;
+        // A node from another session has no agent in THIS model; returning its
+        // id would make the detail panel look it up here and come back empty.
+        (session == self.current_session_id).then(|| agent.to_string())
+    }
+
+    /// The selected node's `Flow` id — session-qualified, unlike
+    /// [`selected_agent_id`](Self::selected_agent_id). This is what the camera
+    /// and selection APIs take.
+    pub fn selected_node_id(&self) -> Option<String> {
         self.flow.selected_nodes().next().map(|n| n.id.clone())
+    }
+
+    /// The `Flow` node id for an agent in the session being watched.
+    pub fn node_id(&self, agent: &str) -> String {
+        graph::node_id(&self.current_session_id, agent)
     }
 
     /// Unified play/pause (`space`) that works from any state — **including at a
@@ -838,6 +1028,76 @@ mod tests {
                 stopped_by_user: None,
             },
         }
+    }
+
+    /// The whole point of the canvas: sessions the user is NOT focused on are
+    /// folded and drawn too, each under its own root.
+    #[test]
+    fn the_canvas_shows_every_watched_session() {
+        let mut app = App::new("focused".to_string(), Mode::Live);
+        let t: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+
+        // The focused session, through the timeline as usual.
+        app.handle_ui_event(UiEvent::ReplayLoaded {
+            session_id: "focused".into(),
+            items: vec![crate::tailer::ReplayItem::at(Some(t), meta_update("sub-a"))],
+            speed: 8.0,
+            info: Default::default(),
+        });
+
+        // A monitored session, folded straight off its live edge.
+        app.handle_ui_event(UiEvent::MonitorBatch {
+            session_id: "other".into(),
+            updates: vec![meta_update("sub-b")],
+        });
+
+        fn has(app: &App, session: &str, agent: &str) -> bool {
+            app.flow.node(&graph::node_id(session, agent)).is_some()
+        }
+        assert!(has(&app, "focused", "main"), "focused root");
+        assert!(has(&app, "focused", "sub-a"), "focused subagent");
+        assert!(has(&app, "other", "main"), "monitored root");
+        assert!(has(&app, "other", "sub-b"), "monitored subagent");
+
+        // The monitored session has a model of its own, and the focused
+        // session's model is untouched by it.
+        assert!(app.others.contains_key("other"));
+        assert!(app.session.agent("sub-b").is_none());
+        assert_eq!(app.watched_sessions().count(), 2);
+
+        // Selecting a monitored node reports no agent in the FOCUSED model —
+        // the detail panel reads that model, and would otherwise render blank
+        // for a node that plainly exists.
+        app.flow.select_node(&graph::node_id("other", "sub-b"));
+        assert!(app.selected_agent_id().is_none());
+        app.flow.select_node(&graph::node_id("focused", "sub-a"));
+        assert_eq!(app.selected_agent_id().as_deref(), Some("sub-a"));
+
+        // When it stops being live, it leaves the canvas without disturbing
+        // the focused session.
+        app.handle_ui_event(UiEvent::MonitorReset {
+            session_id: "other".into(),
+        });
+        assert!(!has(&app, "other", "main"));
+        assert!(has(&app, "focused", "main"));
+        assert!(app.others.is_empty());
+    }
+
+    /// A monitor batch that arrives after its session became the focused one
+    /// must be ignored: two models projecting onto the same node ids would
+    /// overwrite each other's card content on every sync.
+    #[test]
+    fn a_late_monitor_batch_cannot_shadow_the_focused_session() {
+        let mut app = App::new("s".to_string(), Mode::Live);
+        app.handle_ui_event(UiEvent::MonitorBatch {
+            session_id: "s".into(),
+            updates: vec![meta_update("sub")],
+        });
+        assert!(
+            app.others.is_empty(),
+            "no shadow model for the focused session"
+        );
+        assert!(app.session.agent("sub").is_none());
     }
 
     #[test]
@@ -1002,7 +1262,10 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 100, 30);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut app.flow).render(area, &mut buf);
-        assert!(app.flow.node("sub1").is_some(), "the subagent node exists");
+        assert!(
+            app.flow.node(&app.node_id("sub1")).is_some(),
+            "the subagent node exists"
+        );
 
         // Zoom OUT past the readable band — the clamp WOULD want to snap it in.
         app.flow.zoom_to(0.3);
@@ -1010,7 +1273,8 @@ mod tests {
         assert!(zoom < FOLLOW_ZOOM);
 
         // Manual spatial-nav (clamp_zoom = false) → pans, leaves the zoom alone.
-        app.center_node("sub1", false);
+        let node = app.node_id("sub1");
+        app.center_node(&node, false);
         assert_eq!(
             app.flow.viewport.zoom, zoom,
             "arrow-nav must not touch the user's zoom"
@@ -1018,7 +1282,7 @@ mod tests {
 
         // Follow / explicit center (clamp_zoom = true) → snaps the zoom in for
         // readability — the movement that used to ride along with every arrow.
-        app.center_node("sub1", true);
+        app.center_node(&app.node_id("sub1"), true);
         assert!(
             app.flow.viewport.zoom > zoom,
             "Follow still bumps zoom for readability"
@@ -1074,7 +1338,8 @@ mod tests {
         // Seek to the end: forward fold brings sub2 in. Select it... then sub1.
         app.seek(t2);
         assert!(app.session.agent("sub2").is_some());
-        app.flow.select_node("sub1");
+        let node = app.node_id("sub1");
+        app.flow.select_node(&node);
 
         // Seek back before sub2 existed: rebuild must drop it AND keep selection.
         app.seek("2026-06-05T10:00:05.000Z".parse().unwrap());
