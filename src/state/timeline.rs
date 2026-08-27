@@ -76,6 +76,15 @@ pub struct Timeline {
     /// must re-run dating. Lets `append_live` skip the full date-and-sort for
     /// the common in-order, fully-timed batch.
     undated_agents: HashSet<String>,
+    /// Bumped whenever an item's INDEX may have changed meaning: a bulk
+    /// replay load, or a re-sort that moved already-present items.
+    ///
+    /// Anything that caches a result keyed by item index — the snapshot ladder
+    /// in particular — records the generation it was built under and must
+    /// discard itself when this moves. Without it a snapshot of `items[0..N]`
+    /// silently describes a different prefix after a late batch dates a
+    /// previously-pending item and the whole list re-sorts around it.
+    pub generation: u64,
     /// Skip inactivity: compress dead-air gaps during paced playback (see
     /// `compress_gap`). On by default (review-friendly); toggle off for
     /// faithful real-time pacing. Presentation-only — never affects content.
@@ -137,6 +146,7 @@ impl Timeline {
             gap_progress: 0.0,
             undated_agents: HashSet::new(),
             compress_gaps: true,
+            generation: 0,
         }
     }
 
@@ -155,6 +165,7 @@ impl Timeline {
         self.ended = false;
         self.gap_anchor = start;
         self.gap_progress = 0.0;
+        self.generation = self.generation.wrapping_add(1);
         self.rescan_undated();
     }
 
@@ -211,8 +222,12 @@ impl Timeline {
             self.items.push(item);
         }
         if needs_dating || !in_order {
+            // Existing items can move: an item that was `Pending` sorts ahead
+            // of every dated one and jumps into place once its date resolves,
+            // shifting every index in between. Index-keyed caches are void.
             crate::tailer::date_and_sort_live(&mut self.items);
             self.rescan_undated();
+            self.generation = self.generation.wrapping_add(1);
         }
         if self.items.len() != before {
             self.ended = false;
