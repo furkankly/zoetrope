@@ -594,6 +594,8 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
         "q · ctrl-c"
     };
 
+    // The `mut` is only used by the native-only sessions row appended below.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
