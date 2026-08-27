@@ -118,3 +118,7 @@ harness = false
 [[bench]]
 name = "memory"
 harness = false
+
+[[bench]]
+name = "index"
+harness = false
