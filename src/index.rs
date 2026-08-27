@@ -406,10 +406,9 @@ struct EnvelopeFields<'a> {
     timestamp: Option<&'a [u8]>,
     agent_id: Option<&'a [u8]>,
     is_sidechain: bool,
-    /// The raw `origin` value, and whether the key was present at all — an
-    /// absent `origin` is what makes a legacy `user` line ambiguous.
+    /// The raw `origin` value. Its ABSENCE is what makes a legacy `user` line
+    /// ambiguous, so `None` here is itself the signal — see `index_line`.
     origin: Option<&'a [u8]>,
-    saw_origin: bool,
     /// The raw `message` value, captured here so [`count_blocks`] does not walk
     /// the line a second time to re-find it. It is the largest value on the
     /// line, and the envelope walk has already paid to skip past it.
@@ -429,10 +428,7 @@ fn scan_envelope(line: &[u8]) -> EnvelopeFields<'_> {
             b"timestamp" => out.timestamp = unquote(value),
             b"agentId" => out.agent_id = unquote(value),
             b"isSidechain" => out.is_sidechain = value == b"true",
-            b"origin" => {
-                out.saw_origin = true;
-                out.origin = Some(value);
-            }
+            b"origin" => out.origin = Some(value),
             b"message" => out.message = Some(value),
             _ => {}
         }
@@ -643,10 +639,6 @@ fn index_line(line: &[u8], offset: u64) -> Option<Rec> {
         None if kind == Kind::User => flag_bits |= flags::AMBIGUOUS_PROMPT,
         None => {}
     }
-    debug_assert!(
-        env.saw_origin == env.origin.is_some(),
-        "origin presence and value must agree"
-    );
 
     let counts = count_blocks(env.message, kind);
 
@@ -804,12 +796,7 @@ fn cache_path(transcript: &Path) -> Option<PathBuf> {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| {
-            #[allow(deprecated)]
-            std::env::home_dir()
-                .filter(|h| !h.as_os_str().is_empty())
-                .map(|h| h.join(".cache"))
-        })?;
+        .or_else(|| crate::transcript::home_dir().map(|h| h.join(".cache")))?;
     let key = fnv1a64(transcript.as_os_str().as_encoded_bytes());
     Some(
         root.join("zoetrope")

@@ -175,9 +175,7 @@ mod tests {
             project: "p".to_string(),
             main_path: PathBuf::from(format!("/p/{id}.jsonl")),
             agents: 1,
-            tool_calls: 0,
             failures: 0,
-            prompts: 0,
             last_activity: Some(now - chrono::Duration::seconds(ago)),
             sidecar_active: false,
         }

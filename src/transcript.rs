@@ -690,16 +690,28 @@ pub fn sanitize_cwd(cwd: &std::path::Path) -> String {
 /// whole app sees one consistent root rather than a half-redirected one.
 pub const PROJECTS_ROOT_ENV: &str = "ZOE_PROJECTS_ROOT";
 
+/// The user's home directory, or `None` if it cannot be resolved.
+///
+/// Shared so every dotfile-style root zoetrope reads or writes agrees on where
+/// home is — `std::env::home_dir` with a `$HOME` fallback, both rejecting an
+/// empty value (which would silently resolve to the filesystem root).
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[allow(deprecated)]
+    std::env::home_dir()
+        .filter(|h| !h.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+}
+
 /// The `~/.claude/projects` root, or whatever [`PROJECTS_ROOT_ENV`] names.
 pub fn claude_projects_root() -> Option<std::path::PathBuf> {
     if let Some(root) = std::env::var_os(PROJECTS_ROOT_ENV).filter(|v| !v.is_empty()) {
         return Some(std::path::PathBuf::from(root));
     }
-    #[allow(deprecated)]
-    let home = std::env::home_dir()
-        .filter(|h| !h.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))?;
-    Some(home.join(".claude").join("projects"))
+    Some(home_dir()?.join(".claude").join("projects"))
 }
 
 /// Absolute path to the `~/.claude/projects/<sanitized-cwd>` directory for a

@@ -470,20 +470,29 @@ fn subagent_transcript(aid: &str, start: u64, spec: Spec) -> String {
 /// The index and discovery benches measure the filesystem path (mmap, cache
 /// sidecars, directory sweeps), so they need real files rather than strings.
 pub fn write_to_disk(s: &Session, project_dir: &std::path::Path, uuid: &str) -> std::path::PathBuf {
+    use zoetrope::transcript::{subagents_dir, workflow_dir, workflow_journal};
+
     std::fs::create_dir_all(project_dir).unwrap();
     let main = project_dir.join(format!("{uuid}.jsonl"));
     std::fs::write(&main, &s.main).unwrap();
 
-    let subs = project_dir.join(uuid).join("subagents");
+    // Derive the sidecar layout from the same helpers the app reads it with,
+    // so a layout change cannot leave the benches testing a stale shape.
+    let subs = subagents_dir(&main).unwrap();
     std::fs::create_dir_all(&subs).unwrap();
     for sc in &s.sidecars {
         let dir = match &sc.workflow {
-            Some(wf) => subs.join("workflows").join(wf),
+            Some(wf) => workflow_dir(&subs, wf),
             None => subs.clone(),
         };
         std::fs::create_dir_all(&dir).unwrap();
         if sc.journal {
-            std::fs::write(dir.join("journal.jsonl"), &sc.transcript).unwrap();
+            let journal = sc
+                .workflow
+                .as_deref()
+                .map(|wf| workflow_journal(&subs, wf))
+                .unwrap_or_else(|| dir.join("journal.jsonl"));
+            std::fs::write(journal, &sc.transcript).unwrap();
             continue;
         }
         std::fs::write(

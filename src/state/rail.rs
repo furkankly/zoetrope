@@ -42,12 +42,7 @@ pub struct RailRow {
     pub main_path: PathBuf,
     /// Agents in the session, including the main agent.
     pub agents: usize,
-    pub tool_calls: usize,
     pub failures: usize,
-    /// Prompts the index could vouch for. A lower bound on legacy transcripts
-    /// (see `index::flags::AMBIGUOUS_PROMPT`); the rail shows a count, not a
-    /// claim about the era spine, so a lower bound is honest enough here.
-    pub prompts: usize,
     /// Newest timestamp across the session's files.
     pub last_activity: Option<DateTime<Utc>>,
     /// The newest bytes came from a subagent, not the main transcript — the
@@ -205,9 +200,7 @@ mod tests {
             project: project.to_string(),
             main_path: PathBuf::from(format!("/p/{id}.jsonl")),
             agents: 1,
-            tool_calls: 0,
             failures: 0,
-            prompts: 0,
             last_activity: Some(now - chrono::Duration::seconds(ago_secs)),
             sidecar_active: false,
         }
