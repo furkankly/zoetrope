@@ -875,41 +875,57 @@ impl SessionModel {
         let Some(reference) = now.or(self.last_activity) else {
             return false;
         };
-        let mut changed = false;
-        for agent in self.agents.values_mut() {
-            let Some(ts) = agent.last_ts else {
-                continue;
-            };
-            // An unresolved tool_call is direct evidence the agent is still
-            // working — stronger than "no transcript line for 120s". Without it,
-            // an agent blocked on a long tool (a 2-minute Bash) looks quiet and
-            // settles to Done/Idle mid-tool, then snaps back when the result
-            // lands. A reliably-terminal agent short-circuits below, so this
-            // can't revive a genuinely finished one.
-            let active = (reference - ts).num_seconds() <= INTERACTIVE_IDLE_SECS
-                || agent
-                    .tool_calls
-                    .iter()
-                    .any(|c| c.state == ToolState::Pending);
-            let next = if agent.is_interactive() {
-                if active {
+        // Two passes: decide in a read-only walk, then write ONLY the agents
+        // whose status actually moved.
+        //
+        // The obvious single `values_mut()` loop takes a mutable borrow of
+        // every agent on every call — and this runs once a second from
+        // `status_tick`, plus on every resync, overwhelmingly finding nothing
+        // to change. That is wasted work with plain maps and actively harmful
+        // with persistent ones, where touching an entry copies it.
+        let pending: Vec<(String, AgentStatus)> = self
+            .agents
+            .iter()
+            .filter_map(|(id, agent)| {
+                let ts = agent.last_ts?;
+                // An unresolved tool_call is direct evidence the agent is still
+                // working — stronger than "no transcript line for 120s". Without
+                // it, an agent blocked on a long tool (a 2-minute Bash) looks
+                // quiet and settles to Done/Idle mid-tool, then snaps back when
+                // the result lands. A reliably-terminal agent short-circuits
+                // below, so this can't revive a genuinely finished one.
+                let active = (reference - ts).num_seconds() <= INTERACTIVE_IDLE_SECS
+                    || agent
+                        .tool_calls
+                        .iter()
+                        .any(|c| c.state == ToolState::Pending);
+                let next = if agent.is_interactive() {
+                    if active {
+                        AgentStatus::Running
+                    } else {
+                        AgentStatus::Idle
+                    }
+                } else if agent.terminal {
+                    // A reliably-completed subagent (sync ack / journal) is terminal.
+                    agent.status
+                } else if active {
+                    // Async agent still producing activity — and REVERSIBLE: a
+                    // long gap (e.g. a subagent running `cargo test`) that
+                    // settled it to Done flips straight back to Running when it
+                    // resumes.
                     AgentStatus::Running
                 } else {
-                    AgentStatus::Idle
-                }
-            } else if agent.terminal {
-                // A reliably-completed subagent (sync ack / journal) is terminal.
-                agent.status
-            } else if active {
-                // Async agent still producing activity — and REVERSIBLE: a long
-                // gap (e.g. a subagent running `cargo test`) that settled it to
-                // Done flips straight back to Running when it resumes.
-                AgentStatus::Running
-            } else {
-                AgentStatus::Done
-            };
-            changed |= agent.status != next;
-            agent.status = next;
+                    AgentStatus::Done
+                };
+                (next != agent.status).then(|| (id.clone(), next))
+            })
+            .collect();
+
+        let changed = !pending.is_empty();
+        for (id, next) in pending {
+            if let Some(agent) = self.agents.get_mut(&id) {
+                agent.status = next;
+            }
         }
         changed
     }
@@ -918,16 +934,31 @@ impl SessionModel {
     /// agent goes `Idle` — the recording is over, nothing is active, and
     /// completion remains unclaimable.
     pub fn end_of_stream(&mut self) {
-        for agent in self.agents.values_mut() {
-            if agent.is_interactive() {
-                // Interactive agents (main/forks) never "complete" — the stream
-                // ending just means they went quiet.
-                agent.status = AgentStatus::Idle;
-            } else if agent.status == AgentStatus::Running {
-                // A subagent still Running at the recording's end has finished
-                // (its async spawn-ack Done was superseded by its own later
-                // activity via `resolve_spawn_status`; now there's no more).
-                agent.status = AgentStatus::Done;
+        // Same two-pass shape as `recompute_liveness`, for the same reason.
+        let pending: Vec<(String, AgentStatus)> = self
+            .agents
+            .iter()
+            .filter_map(|(id, agent)| {
+                let next = if agent.is_interactive() {
+                    // Interactive agents (main/forks) never "complete" — the
+                    // stream ending just means they went quiet.
+                    AgentStatus::Idle
+                } else if agent.status == AgentStatus::Running {
+                    // A subagent still Running at the recording's end has
+                    // finished (its async spawn-ack Done was superseded by its
+                    // own later activity via `resolve_spawn_status`; now there's
+                    // no more).
+                    AgentStatus::Done
+                } else {
+                    return None;
+                };
+                (next != agent.status).then(|| (id.clone(), next))
+            })
+            .collect();
+
+        for (id, next) in pending {
+            if let Some(agent) = self.agents.get_mut(&id) {
+                agent.status = next;
             }
         }
     }
