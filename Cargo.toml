@@ -47,6 +47,8 @@ native = [
   "dep:crossterm",
   "dep:futures",
   "dep:anyhow",
+  "dep:memchr",
+  "dep:memmap2",
   "ratatui/crossterm",
   "rataflow/crossterm",
 ]
@@ -85,6 +87,10 @@ tokio = { version = "1", features = [
 ], optional = true }
 futures = { version = "0.3", optional = true }
 anyhow = { version = "1", optional = true }
+# Skeleton indexing (src/index.rs): SIMD substring search over transcript
+# bytes, and mmap so a re-scan of an already-indexed file costs no copy.
+memchr = { version = "2.8", optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 # The library's own wasm requirement, independent of any frontend: chrono needs
 # its wasm time binding for `Utc::now()` to work in-browser. A browser backend

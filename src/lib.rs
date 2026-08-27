@@ -31,7 +31,11 @@ pub mod tailer;
 pub mod transcript;
 pub mod ui;
 
-// The native frontend: terminal loop + crossterm input.
+// Native-only: skeleton indexing (needs the filesystem), the terminal loop,
+// and input.
+#[cfg(feature = "native")]
+pub mod index;
+
 #[cfg(feature = "native")]
 pub mod autopilot;
 #[cfg(feature = "native")]
