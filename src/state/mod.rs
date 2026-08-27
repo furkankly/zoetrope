@@ -8,6 +8,7 @@
 
 pub mod graph;
 pub mod info;
+pub mod rail;
 pub mod session;
 pub mod timeline;
 

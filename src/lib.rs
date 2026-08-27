@@ -31,10 +31,12 @@ pub mod tailer;
 pub mod transcript;
 pub mod ui;
 
-// Native-only: skeleton indexing (needs the filesystem), the terminal loop,
-// and input.
+// Native-only: skeleton indexing + multi-session discovery (both need the
+// filesystem), the terminal loop, and input.
 #[cfg(feature = "native")]
 pub mod index;
+#[cfg(feature = "native")]
+pub mod sessions;
 
 #[cfg(feature = "native")]
 pub mod autopilot;

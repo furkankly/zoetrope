@@ -681,8 +681,20 @@ pub fn sanitize_cwd(cwd: &std::path::Path) -> String {
         .collect()
 }
 
-/// The `~/.claude/projects` root, if a home directory can be resolved.
-fn claude_projects_root() -> Option<std::path::PathBuf> {
+/// Environment override for the projects root.
+///
+/// Set it to point zoetrope at a different tree of transcripts. It exists
+/// because the multi-session rail is otherwise only exercisable by running
+/// several real Claude Code sessions at once: with this, a fixture workspace
+/// is a directory. It relocates discovery AND [`project_dir`] together, so the
+/// whole app sees one consistent root rather than a half-redirected one.
+pub const PROJECTS_ROOT_ENV: &str = "ZOE_PROJECTS_ROOT";
+
+/// The `~/.claude/projects` root, or whatever [`PROJECTS_ROOT_ENV`] names.
+pub fn claude_projects_root() -> Option<std::path::PathBuf> {
+    if let Some(root) = std::env::var_os(PROJECTS_ROOT_ENV).filter(|v| !v.is_empty()) {
+        return Some(std::path::PathBuf::from(root));
+    }
     #[allow(deprecated)]
     let home = std::env::home_dir()
         .filter(|h| !h.as_os_str().is_empty())
@@ -1263,6 +1275,38 @@ mod tests {
     }
 
     // --- Subagent path helpers --------------------------------------------
+
+    /// The projects-root override must relocate discovery and `project_dir`
+    /// together — a half-redirected app would list fixture sessions while
+    /// resolving the current project against the real home directory.
+    ///
+    /// Serialized against other env-touching tests by running them in one test
+    /// function: `set_var` is process-global and Rust runs tests in threads.
+    #[test]
+    fn the_projects_root_override_relocates_everything() {
+        let real = claude_projects_root();
+
+        // SAFETY: no other thread reads this variable during this test; the
+        // override is restored before returning.
+        unsafe { std::env::set_var(PROJECTS_ROOT_ENV, "/tmp/zoe-fixture") };
+        assert_eq!(
+            claude_projects_root(),
+            Some(std::path::PathBuf::from("/tmp/zoe-fixture"))
+        );
+        assert_eq!(
+            project_dir(std::path::Path::new("/home/u/repo/app")),
+            Some(std::path::PathBuf::from(
+                "/tmp/zoe-fixture/-home-u-repo-app"
+            ))
+        );
+
+        // Empty is treated as unset, not as the filesystem root.
+        unsafe { std::env::set_var(PROJECTS_ROOT_ENV, "") };
+        assert_eq!(claude_projects_root(), real);
+
+        unsafe { std::env::remove_var(PROJECTS_ROOT_ENV) };
+        assert_eq!(claude_projects_root(), real);
+    }
 
     #[test]
     fn subagents_dir_derivation() {
