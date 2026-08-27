@@ -565,17 +565,23 @@ impl App {
         let mut structural = false;
         for i in from..to {
             structural |= self.session.apply_update(&self.timeline.items[i].update);
-            let folded = i + 1;
-            let last = self.snapshots.last().map_or(0, |s| s.folded);
-            if folded >= last + SNAPSHOT_STRIDE {
-                self.snapshots.push(Snapshot {
-                    folded,
-                    generation,
-                    model: self.session.clone(),
-                });
-            }
+            self.maybe_snapshot(i + 1, generation);
         }
         structural
+    }
+
+    /// Push a rung if `folded` is a full stride past the last one.
+    ///
+    /// Shared by both fold paths so the cadence cannot drift between them.
+    fn maybe_snapshot(&mut self, folded: usize, generation: u64) {
+        let last = self.snapshots.last().map_or(0, |s| s.folded);
+        if folded >= last + SNAPSHOT_STRIDE {
+            self.snapshots.push(Snapshot {
+                folded,
+                generation,
+                model: self.session.clone(),
+            });
+        }
     }
 
     /// Record a ladder rung for a fold that did not go through
@@ -586,15 +592,7 @@ impl App {
     fn note_fold(&mut self) {
         let generation = self.timeline.generation;
         self.drop_stale_rungs(generation);
-        let folded = self.timeline.folded;
-        let last = self.snapshots.last().map_or(0, |s| s.folded);
-        if folded >= last + SNAPSHOT_STRIDE {
-            self.snapshots.push(Snapshot {
-                folded,
-                generation,
-                model: self.session.clone(),
-            });
-        }
+        self.maybe_snapshot(self.timeline.folded, generation);
     }
 
     /// Discard every rung if the item list has been re-sorted or replaced since
@@ -814,11 +812,11 @@ impl App {
         // wall-clock derived (they have no playhead of their own), and their
         // workflow rollups need the same pass the focused session gets.
         let now = chrono::Utc::now();
-        for model in self.others.values_mut() {
-            model.recompute_workflow_status();
-            model.recompute_liveness(Some(now));
-            structural |= graph::sync(&mut self.flow, model, false);
+        let mut others = std::mem::take(&mut self.others);
+        for model in others.values_mut() {
+            structural |= Self::project(&mut self.flow, model, now);
         }
+        self.others = others;
         if structural {
             self.layout_dirty = true;
             // A session that just gained a node may now overlap its neighbour.
@@ -841,11 +839,12 @@ impl App {
         if self.is_current(session_id) {
             return;
         }
-        let now = chrono::Utc::now();
-        let model = self
+        // Taken OUT of the map so the model and the flow can be borrowed at
+        // once; put back below.
+        let mut model = self
             .others
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionModel::new(session_id.to_string()));
+            .remove(session_id)
+            .unwrap_or_else(|| SessionModel::new(session_id.to_string()));
         for update in &updates {
             model.apply_update(update);
         }
@@ -854,12 +853,28 @@ impl App {
         // whole canvas per batch scales with sessions squared for no reason —
         // nothing else changed. Time-derived liveness for the other sessions is
         // refreshed by `status_tick` regardless.
-        model.recompute_workflow_status();
-        model.recompute_liveness(Some(now));
-        if graph::sync(&mut self.flow, model, false) {
+        let structural = Self::project(&mut self.flow, &mut model, chrono::Utc::now());
+        self.others.insert(session_id.to_string(), model);
+        if structural {
             self.layout_dirty = true;
             graph::repack_if_overlapping(&mut self.flow);
         }
+    }
+
+    /// Re-derive a monitored session's projections and draw it on `flow`.
+    ///
+    /// The order matters: the workflow rollup reads child statuses that
+    /// liveness has yet to set, so it runs first — the same sequence `resync`
+    /// applies to the focused session. Returns whether the canvas gained or
+    /// lost nodes.
+    fn project(
+        flow: &mut graph::AgentFlow,
+        model: &mut SessionModel,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        model.recompute_workflow_status();
+        model.recompute_liveness(Some(now));
+        graph::sync(flow, model, false)
     }
 
     /// Name each watched session's root card from the sweep's project names.

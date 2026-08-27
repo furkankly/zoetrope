@@ -28,6 +28,14 @@ pub const ID_SEP: char = '/';
 
 /// The `Flow` node id for `agent` within `session`.
 pub fn node_id(session: &str, agent: &str) -> String {
+    // The round trip through `split_node_id` relies on neither half containing
+    // the separator. That holds for every id the format produces, but it was
+    // only ever stated in a comment — a differently-sourced id would corrupt
+    // the parse silently rather than fail here.
+    debug_assert!(
+        !session.contains(ID_SEP) && !agent.contains(ID_SEP),
+        "node id parts must not contain {ID_SEP:?}: {session} / {agent}"
+    );
     format!("{session}{ID_SEP}{agent}")
 }
 
@@ -444,7 +452,10 @@ pub fn repack_if_overlapping(flow: &mut AgentFlow) -> bool {
     if boxes.len() < 2 || !sessions_overlap(&boxes) {
         return false;
     }
-    pack_sessions(flow);
+    // Hand the measurements on rather than letting `pack_sessions` re-take
+    // them: this runs after every structural change, for every session, and
+    // measuring walks every node on the canvas.
+    pack(flow, &boxes);
     true
 }
 
@@ -473,15 +484,22 @@ pub fn pack_sessions(flow: &mut AgentFlow) {
     if boxes.len() < 2 {
         return;
     }
+    pack(flow, &boxes);
+}
 
+/// Place already-measured session boxes and move their nodes to match.
+fn pack(flow: &mut AgentFlow, boxes: &[SessionBox]) {
     // Sessions are few (the monitor fleet is capped), so trying every row count
     // is cheaper than reasoning about which one is best.
+    if boxes.len() < 2 {
+        return;
+    }
     let total_width: f64 = boxes.iter().map(|b| b.width + SESSION_GUTTER).sum();
     let widest = boxes.iter().fold(0.0f64, |m, b| m.max(b.width));
     let best = (1..=boxes.len())
         .map(|rows| {
             let target = (total_width / rows as f64).max(widest);
-            let (placed, w, h) = shelf_pack(&boxes, target);
+            let (placed, w, h) = shelf_pack(boxes, target);
             // Compare SCREEN shape, not world-unit shape.
             let aspect = if h > 0.0 {
                 w / (h * CELL_ASPECT)
