@@ -1193,6 +1193,14 @@ impl App {
                 // draw, which sees the post-split canvas width. A deselection
                 // clears any not-yet-consumed one.
                 self.pending_center = node_ids.first().cloned();
+                // Selecting a card in a session we are only monitoring used to
+                // do nothing visible: the node highlights, but the detail panel
+                // reads the FOCUSED model and finds no such agent, so it renders
+                // blank with no hint why. Reading a card is a request to look at
+                // that session, so treat it as one.
+                if let Some(id) = node_ids.first() {
+                    self.focus_selected_session(id);
+                }
             }
         }
     }
@@ -1270,45 +1278,128 @@ mod tests {
         assert!(app.others.is_empty());
     }
 
-    /// A monitor batch that arrives after its session became the focused one
-    /// must be ignored: two models projecting onto the same node ids would
-    /// overwrite each other's card content on every sync.
+    /// Selecting a card in a monitored session asks to focus that session,
+    /// rather than highlighting a node whose detail panel can only be blank.
     #[test]
-    fn a_late_monitor_batch_cannot_shadow_the_focused_session() {
-        let mut app = App::new("s".to_string(), Mode::Live);
-        app.handle_ui_event(UiEvent::MonitorBatch {
-            session_id: "s".into(),
+    fn selecting_a_monitored_node_focuses_its_session() {
+        use rataflow::FlowEvent;
+
+        let mut app = App::new("focused".to_string(), Mode::Live);
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "other".into(),
             updates: vec![meta_update("sub")],
         });
-        assert!(
-            app.others.is_empty(),
-            "no shadow model for the focused session"
+        let n = chrono::Utc::now();
+        app.rail.adopt(vec![crate::state::rail::RailRow {
+            session_id: "other".to_string(),
+            project: "bravo".to_string(),
+            main_path: std::path::PathBuf::from("/p/other.jsonl"),
+            agents: 2,
+            failures: 0,
+            last_activity: Some(n),
+            sidecar_active: false,
+        }]);
+
+        let foreign = graph::node_id("other", "sub");
+        app.process_flow_events(
+            vec![FlowEvent::SelectionChanged {
+                node_ids: vec![foreign.clone()],
+                edge_ids: vec![],
+            }]
+            .into_iter(),
         );
-        assert!(app.session.agent("sub").is_none());
+        assert_eq!(
+            app.pending_watch,
+            Some(std::path::PathBuf::from("/p/other.jsonl")),
+            "reading a monitored card should ask to watch that session"
+        );
+
+        // Selecting inside the focused session is not a switch.
+        app.pending_watch = None;
+        app.process_flow_events(
+            vec![FlowEvent::SelectionChanged {
+                node_ids: vec![graph::node_id("focused", "main")],
+                edge_ids: vec![],
+            }]
+            .into_iter(),
+        );
+        assert_eq!(app.pending_watch, None);
+
+        // Neither is selecting a session discovery has never heard of — there
+        // is no transcript path to watch.
+        app.process_flow_events(
+            vec![FlowEvent::SelectionChanged {
+                node_ids: vec![graph::node_id("unknown", "main")],
+                edge_ids: vec![],
+            }]
+            .into_iter(),
+        );
+        assert_eq!(app.pending_watch, None);
     }
 
+    /// One event pair, routed by `session_id`. The App is the only thing that
+    /// knows which session is focused, so it is the only thing that decides
+    /// whether a batch goes to the timeline or to a monitored model.
     #[test]
-    fn auto_switch_reset_adopts_new_session_id() {
-        // The auto-switch path emits SessionReset stamped with the NEW id, then
-        // the post-switch tailer emits Batches under the NEW id. The App must
-        // adopt the new id so those batches are not dropped by is_current.
-        let mut app = App::new("OLD".into(), Mode::Live);
+    fn batches_route_by_session_id() {
+        let mut app = App::new("focused".to_string(), Mode::Live);
 
-        // Reset carrying the NEW session id (auto-switch signal).
-        app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "NEW".into(),
-        });
-        assert_eq!(app.current_session_id, "NEW");
-
-        // A batch from the new session must be accepted, not dropped.
         app.handle_ui_event(UiEvent::Batch {
-            session_id: "NEW".into(),
-            updates: vec![meta_update("newsub")],
+            session_id: "focused".into(),
+            updates: vec![meta_update("mine")],
         });
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "other".into(),
+            updates: vec![meta_update("theirs")],
+        });
+
+        assert!(app.session.agent("mine").is_some(), "focused → the model");
         assert!(
-            app.session.agent("newsub").is_some(),
-            "new-session subagent must be present after auto-switch"
+            app.session.agent("theirs").is_none(),
+            "another session must not land in the focused model"
         );
+        assert!(
+            app.others["other"].agent("theirs").is_some(),
+            "→ that session's own model"
+        );
+    }
+
+    /// A reset names the session it is about, and nothing else. It used to be
+    /// able to mean "the focused session is now a different one", which is why
+    /// an unfamiliar id was ambiguous.
+    #[test]
+    fn a_reset_only_touches_the_session_it_names() {
+        let mut app = App::new("focused".to_string(), Mode::Live);
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "focused".into(),
+            updates: vec![meta_update("mine")],
+        });
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "other".into(),
+            updates: vec![meta_update("theirs")],
+        });
+
+        // A monitored session rotates: it leaves, the focused one is untouched
+        // and stays focused.
+        app.handle_ui_event(UiEvent::SessionReset {
+            session_id: "other".into(),
+        });
+        assert_eq!(
+            app.current_session_id, "focused",
+            "focus is not the tailer's"
+        );
+        assert!(app.others.is_empty());
+        assert!(app.flow.node(&graph::node_id("other", "theirs")).is_none());
+        assert!(app.session.agent("mine").is_some());
+        assert!(app.flow.node(&graph::node_id("focused", "mine")).is_some());
+
+        // The focused session rotates: its model is rebuilt in place.
+        app.handle_ui_event(UiEvent::SessionReset {
+            session_id: "focused".into(),
+        });
+        assert_eq!(app.current_session_id, "focused");
+        assert!(app.session.agent("mine").is_none(), "rebuilt from scratch");
+        assert!(app.flow.node(&graph::node_id("focused", "mine")).is_none());
     }
 
     #[test]
