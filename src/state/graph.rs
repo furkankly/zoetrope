@@ -277,25 +277,33 @@ fn edge_id(child: &str) -> String {
     format!("e-{child}")
 }
 
+/// Remove several of a session's agents in ONE pass.
+///
+/// Bulk, not a loop of single removals: `Flow::remove_node` costs O(nodes plus
+/// edges) every time — it shifts every lookup index and rebuilds the edge
+/// lookup per call — so removing k of them is quadratic. `retain_nodes` makes a
+/// single pass over each vec and drops the connected edges itself.
+pub fn remove_agents(flow: &mut AgentFlow, session: &str, agents: &[String]) {
+    if agents.is_empty() {
+        return;
+    }
+    let doomed: std::collections::HashSet<String> =
+        agents.iter().map(|a| node_id(session, a)).collect();
+    flow.retain_nodes(|n| !doomed.contains(&n.id));
+}
+
 /// Remove every node and edge belonging to `session`.
 ///
 /// Used when a session stops being watched: its subtree leaves the canvas
 /// without disturbing the others, which a whole-flow rebuild would (it drops
 /// every node position the user arranged).
 pub fn remove_session(flow: &mut AgentFlow, session: &str) -> bool {
-    let doomed: Vec<String> = flow
-        .nodes()
-        .filter(|n| split_node_id(&n.id).is_some_and(|(s, _)| s == session))
-        .map(|n| n.id.clone())
-        .collect();
-    let removed = !doomed.is_empty();
-    for id in doomed {
-        // Edges are keyed off the child node id, so removing the node's edge by
-        // the same derivation keeps the two in step.
-        flow.remove_edge(&edge_id(&id));
-        flow.remove_node(&id);
+    let belongs = |id: &str| split_node_id(id).is_some_and(|(s, _)| s == session);
+    let present = flow.nodes().any(|n| belongs(&n.id));
+    if present {
+        flow.retain_nodes(|n| !belongs(&n.id));
     }
-    removed
+    present
 }
 
 /// Apply the Sugiyama vertical layout to `flow`.
@@ -533,17 +541,6 @@ fn pack(flow: &mut AgentFlow, boxes: &[SessionBox]) {
         })
         .collect();
     flow.set_node_positions(moved.iter().map(|(id, pos)| (id, *pos)));
-}
-
-/// Restore saved positions onto whichever nodes still exist (used after a
-/// backward-seek rebuild to carry the user's manual arrangement across — and to
-/// avoid a layout jump, since a rebuilt subset would otherwise re-place from
-/// scratch). Nodes absent from `positions` keep their fresh local placement.
-pub fn restore_positions(
-    flow: &mut AgentFlow,
-    positions: &std::collections::HashMap<String, (f64, f64)>,
-) {
-    flow.set_node_positions(positions.iter().map(|(id, &pos)| (id, pos)));
 }
 
 #[cfg(test)]
