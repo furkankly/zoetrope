@@ -731,62 +731,52 @@ impl App {
     /// rebuild: node positions (the user's arrangement / a stable layout) and
     /// the selected node are carried over by id.
     fn rebuild_to(&mut self, target: usize) {
-        // Snapshot view state to carry across the wipe. The FLOW id, not the
-        // local agent id — `select_node` speaks flow ids.
-        let selected = self.selected_node_id();
-        // The camera/viewport (pan + zoom) is the user's — a fresh `Flow` would
-        // reset it to the origin, snapping the graph on every backward seek even
-        // in Manual/Overview. Carry it across.
-        let viewport = self.flow.viewport;
-        let positions: std::collections::HashMap<String, (f64, f64)> = self
-            .flow
-            .nodes()
-            .map(|n| (n.id.clone(), (n.position.x, n.position.y)))
-            .collect();
-
         // Start from the newest ladder rung at or before the target instead of
         // from item zero. Restoring a rung is a clone of a persistent model —
         // O(1) — so the fold that follows is bounded by SNAPSHOT_STRIDE rather
         // than by how far back the user seeked.
         let generation = self.timeline.generation;
-        if self
-            .snapshots
-            .last()
-            .is_some_and(|s| s.generation != generation)
-        {
-            self.snapshots.clear();
-        }
+        self.drop_stale_rungs(generation);
         let resume = self
             .snapshots
             .iter()
             .rev()
             .find(|s| s.folded <= target)
             .map(|s| (s.model.clone(), s.folded));
-
-        let start = match resume {
-            Some((model, folded)) => {
-                self.session = model;
-                folded
-            }
-            None => {
-                self.session = SessionModel::new(self.current_session_id.clone());
-                0
-            }
+        let (model, start) = match resume {
+            Some((model, folded)) => (model, folded),
+            None => (SessionModel::new(self.current_session_id.clone()), 0),
         };
-        self.flow = graph::new_flow();
+
+        // Keep the model we are replacing, to work out what left the canvas.
+        let previous = std::mem::replace(&mut self.session, model);
         // Re-folding also rebuilds the ladder above `start`, so a scrub that
         // walks backward repeatedly keeps finding rungs near where it lands.
         self.fold_range(start, target);
         self.timeline.folded = target;
-        self.resync();
 
-        // Carry the arrangement + selection + viewport across so a seek doesn't
-        // jump the layout or the camera.
-        graph::restore_positions(&mut self.flow, &positions);
-        self.flow.viewport = viewport;
-        if let Some(id) = selected {
-            self.flow.select_node(&id);
-        }
+        // Seeking back can only REMOVE agents (a fold never un-spawns one that
+        // the earlier prefix already had), and `sync` adds and updates but never
+        // removes — so taking those few nodes off the canvas is the whole
+        // difference between here and a full rebuild.
+        //
+        // `OrdMap::diff` skips subtrees the two models share, and they share
+        // almost everything: the new model is a rung cloned from this very
+        // lineage. So this costs what actually changed, not what exists.
+        let departed: Vec<String> = previous
+            .agents
+            .diff(&self.session.agents)
+            .filter_map(|change| match change {
+                imbl::ordmap::DiffItem::Remove(id, _) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        graph::remove_agents(&mut self.flow, &self.current_session_id, &departed);
+
+        // No flow wipe, so node positions, the viewport, the selection and every
+        // OTHER session's subtree survive on their own — none of it has to be
+        // captured and restored around a teardown any more.
+        self.resync();
     }
 
     /// Roll workflow-group status up from children, then project the model onto
@@ -1456,6 +1446,76 @@ mod tests {
     /// forward from it must land on exactly the model a from-scratch rebuild
     /// would produce — otherwise a backward seek silently shows a different
     /// session than the same seek did yesterday.
+    /// Seeking back patches the canvas instead of rebuilding it: agents that do
+    /// not exist yet at the target leave, and everything the old teardown had to
+    /// capture and restore by hand — node positions, the viewport, the
+    /// selection, other sessions' subtrees — survives because nothing is thrown
+    /// away.
+    #[test]
+    fn seeking_back_patches_the_canvas_instead_of_rebuilding_it() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let mut app = App::new("focused".to_string(), Mode::Replay);
+        app.handle_ui_event(UiEvent::ReplayLoaded {
+            session_id: "focused".into(),
+            items: (0..6)
+                .map(|i| {
+                    crate::tailer::ReplayItem::at(
+                        Some(t0 + chrono::Duration::seconds(i as i64)),
+                        meta_update(&format!("sub{i}")),
+                    )
+                })
+                .collect(),
+            speed: 8.0,
+            info: Default::default(),
+        });
+        app.go_live();
+
+        // A second session shares the canvas, and must be untouched by a seek
+        // in the focused one.
+        app.handle_ui_event(UiEvent::MonitorBatch {
+            session_id: "other".into(),
+            updates: vec![meta_update("watched")],
+        });
+
+        let early = graph::node_id("focused", "sub1");
+        let late = graph::node_id("focused", "sub5");
+        let foreign = graph::node_id("other", "watched");
+        assert!(app.flow.node(&late).is_some(), "precondition: sub5 exists");
+
+        // Arrange the canvas the way a user would: drag a node, pan, select.
+        app.flow
+            .set_node_positions(std::iter::once((&early, (123.0, 456.0))));
+        app.flow.zoom_to(2.5);
+        let viewport = app.flow.viewport;
+        app.flow.select_node(&early);
+
+        // Seek back to before sub5 (and sub4, sub3…) were ever spawned.
+        app.seek_to_fraction(2.0 / 6.0);
+
+        assert!(
+            app.flow.node(&late).is_none(),
+            "an agent that does not exist at this playhead must leave the canvas"
+        );
+        assert!(app.session.agent("sub5").is_none(), "and leave the model");
+        assert!(app.flow.node(&early).is_some(), "sub1 predates the target");
+
+        // The three things the old rebuild had to save and restore explicitly.
+        let node = app.flow.node(&early).unwrap();
+        assert_eq!(
+            (node.position.x, node.position.y),
+            (123.0, 456.0),
+            "a dragged position survived the seek"
+        );
+        assert_eq!(app.flow.viewport.zoom, viewport.zoom, "viewport survived");
+        assert_eq!(app.selected_agent_id().as_deref(), Some("sub1"));
+
+        // And the monitored session was never in the focused model's diff.
+        assert!(
+            app.flow.node(&foreign).is_some(),
+            "another session's subtree must not be collateral"
+        );
+    }
+
     #[test]
     fn a_ladder_restore_matches_a_full_rebuild() {
         // Enough items that several rungs are taken.

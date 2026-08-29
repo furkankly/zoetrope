@@ -162,6 +162,18 @@ fn bench_seek(c: &mut Criterion) {
             )
         });
 
+        // One SMALL backward hop — what a scrubber drag actually delivers once
+        // `pending_seek` coalesces a burst to one seek per frame. The big jumps
+        // above are the worst case for patching the canvas; this is the case
+        // it exists for.
+        g.bench_with_input(BenchmarkId::new("back_one_hop", name), &s, |b, s| {
+            b.iter_batched_ref(
+                || app_at_edge(s),
+                |app| app.seek_to_fraction(black_box(0.95)),
+                BatchSize::PerIteration,
+            )
+        });
+
         // A scrub drag: ten backward hops. This is what holding the mouse down
         // on the scrubber actually costs.
         g.bench_with_input(BenchmarkId::new("drag_10_back", name), &s, |b, s| {
