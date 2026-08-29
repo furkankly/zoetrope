@@ -21,7 +21,7 @@ cd web/wasm && cargo clippy   # its .cargo/config.toml defaults to wasm32
 
 ## Commits
 
-[Conventional Commits](https://www.conventionalcommits.org/), lowercase imperative subject. Scope is a module, not a file: `transcript`, `state`, `graph`, `timeline`, `tailer`, `ui`, `panel`, `cli`, `wasm`, `web`, `docs`.
+[Conventional Commits](https://www.conventionalcommits.org/), lowercase imperative subject. Scope is a module, not a file: `transcript`, `index`, `sessions`, `monitor`, `state`, `graph`, `timeline`, `rail`, `tailer`, `ui`, `panel`, `cli`, `wasm`, `web`, `docs`.
 
 ```
 feat(timeline): index the playhead by event instead of wall-clock

@@ -22,9 +22,13 @@ zoe <dir>                # follow another project's live session
 zoe <file> --follow      # ride a file's live edge instead of replaying it
 zoe <file> --speed 8     # playback speed (default 8.0)
 zoe inspect <file.jsonl> # no TUI: print session info + parsed tree (smoke-test)
+zoe sessions             # no TUI: list every session active in a window, with sweep timings
+zoe sessions --since 120 --root DIR
 ```
 
-Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { file }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
+Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { file } | Sessions { window, root }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
+
+`ZOE_PROJECTS_ROOT` overrides `~/.claude/projects` for both discovery and `project_dir`. It exists because the multi-session rail is otherwise only exercisable by running several real Claude Code sessions at once; with it, a fixture workspace is a directory. `zoe sessions --root` does the same for the headless sweep.
 
 ## Workspace layout
 
@@ -48,6 +52,11 @@ web/wasm/           # the zoetrope-web crate: Cargo.toml, index.html (trunk entr
 
 ```toml
 # Portable core (native + wasm): model, timeline, graph, UI rendering, parsing.
+# imbl — persistent collections. SessionModel is built from them so cloning it is
+#   O(1) and can be used as a snapshot (see Timeline / ARCHITECTURE.md §6.1).
+#   Arc-backed by default, so the model stays Send for the tokio tasks.
+# memchr, memmap2 — native-only, behind the `native` feature: the skeleton index's
+#   SIMD probes and its no-copy re-scan of already-indexed files.
 ratatui       = { version = "0.30", default-features = false, features = ["underline-color"] }
 rataflow  = { path = "../rataflow", default-features = false, features = ["sugiyama"] }
 serde         = { version = "1", features = ["derive"] }
@@ -90,11 +99,15 @@ src/
 ├── handler.rs     # input routing: app-level keys → App, the rest → the flow; scrubber clicks; process_flow_events
 ├── autopilot.rs   # native-only: the scripted pointer/keystroke pilot behind ZOETROPE_DEMO=1 (see DEMO-ASSETS.md)
 ├── transcript.rs  # serde model for JSONL entries + meta.json sidecars + project-dir discovery/sanitization
+├── index.rs       # native-only: skeleton index — 32 bytes/line of facts, no body parsing; append-incremental, cached
+├── sessions.rs    # native-only: multi-session discovery (stat sweep) + Summary folded from index records
+├── monitor.rs     # native-only: the monitor fleet — one tailer per live unfocused session; publishes rail rows
 ├── state/
 │   ├── mod.rs     # App: owns the Flow + SessionModel + Timeline + SessionInfo + UI state; handle_ui_event, seek, camera
 │   ├── session.rs # SessionModel: the pure domain model (agents, statuses, tool calls) derived from parsed updates
 │   ├── timeline.rs# Timeline: the ts-ordered item list + playhead (time-travel); pacing, gap-compression, seek, floor
-│   ├── graph.rs   # incremental SessionModel → Flow projection (never rebuilds except backward seek; Sugiyama on `r`)
+│   ├── graph.rs   # incremental SessionModel → Flow projection; session-scoped node ids; shelf-packs session trees
+│   ├── rail.rs    # portable session-rail state: rows, focus derivation, visibility (fed by native discovery)
 │   └── info.rs    # SessionInfo: untimed session metadata, folded off the timeline (i overlay + inspect header)
 ├── tailer/        # background FEEDER (pure: no pacing/seeking — the App owns the playhead)
 │   ├── mod.rs     # task entry + shared wire types (TailRequest / UiEvent / Update / Source)
@@ -107,8 +120,70 @@ src/
     ├── nodes.rs   # AgentNode: the agent-card NodeContent (semantic zoom: Card vs Cell)
     ├── edges.rs   # AgentEdge: parent→agent EdgeContent (animated while target Running)
     ├── chips.rs   # ephemeral tool-call chips — one reconcile pass, anchored to agent nodes (see ARCHITECTURE.md §5)
+    ├── rail.rs    # the session rail pane: one row per discovered session, themed from the flow palette
     └── panel.rs   # detail panel for the selected agent
 ```
+
+## Multi-session
+
+The canvas shows **every live session**, each as a root card with its agents
+beneath it. Only one session is *focused*; the rail picks which.
+
+```text
+discovery (2s sweep, blocking pool)
+  sessions::discover   stat every ~/.claude/projects/*/<uuid>.jsonl + its sidecars
+  sessions::Summary    fold index records → counts, first/last activity, cwd
+      │
+      ├── UiEvent::Sessions(Vec<RailRow>) ──────────────► App.rail        (the rail pane)
+      └── monitor::supervise: one tailer per live UNFOCUSED session
+             └── UiEvent::MonitorBatch / MonitorReset ──► App.others      (model only, no timeline)
+
+focus tailer (unchanged)
+      └── UiEvent::Batch / SessionReset ────────────────► App.session     (model + Timeline)
+```
+
+- **`App.session` vs `App.others`.** The focused session owns a `Timeline` and can
+  be scrubbed; monitored ones are folded straight off their live edge and only
+  render. One collection holding both would either give every session a timeline
+  it never uses, or pretend the focused one is not special when every seek path
+  says it is.
+- **Node ids are session-scoped** (`<session>/<agent>`, `graph::node_id`). Every
+  `SessionModel` names its root `"main"`, so a shared flow needs the session in
+  the id or the roots collide — silently merging two sessions into one tree.
+- **Focus is derived, never stored twice.** The rail marks whichever row matches
+  `App.current_session_id`, which `SessionReset` updates when a switch actually
+  lands. A parallel focus field could point at a session the tailer is not
+  watching.
+- **Only *running* sessions get a monitor** (activity within `RAIL_IDLE_SECS`),
+  capped at `monitor::MAX_MONITORED`. The rail lists everything from the last day;
+  the canvas is for what is happening now.
+
+## Skeleton index (index.rs)
+
+A second reader of the same format, deliberately: the timeline needs a few dozen
+bytes per line (when, what kind, whose agent, how much tool activity) out of a
+line that is mostly payload.
+
+- One fixed **32-byte `Rec` per line** — offset, length, timestamp, kind, agent
+  hash, tool/spawn/failure counts, flags. Bodies stay on disk.
+- **Envelope fields are read from the TOP LEVEL only.** Claude Code does not emit
+  envelope keys first, and nested objects reuse the names — an `attachment` entry
+  serializes `"attachment":{"type":…}` *before* its own `"type"`. Taking the first
+  match in the line reads the payload's type as the entry's kind.
+- **Activity counts come from real `message.content` blocks**, scoped by entry kind
+  the way the parser scopes them. A `user` line quoting output that mentions
+  `"name":"Agent"` is not a spawn.
+- **It never guesses.** Where the format is genuinely ambiguous (a legacy `user`
+  line with no `origin`) the record says so via `flags::AMBIGUOUS_PROMPT` and the
+  caller parses that one line properly.
+- **Append-only ⇒ extendable.** A grown file is scanned from `scanned_len`; the
+  result is cached under `$XDG_CACHE_HOME/zoetrope/idx/`, guarded by a head hash
+  so rotation is detected rather than misread. Bump `MAGIC` when any probe's
+  meaning changes.
+- `index::tests::skeleton_agrees_with_parser_on_a_real_corpus` (opt-in, via
+  `ZOE_DIFF_CORPUS`) asserts record-for-record agreement with `transcript::parse_line`.
+  That test is the only thing keeping two readers of one format honest — both
+  format-drift bugs above were found by it, not by review.
 
 ## Transcript format (verified against real data, Claude Code 2.1.153–2.1.165)
 
@@ -227,6 +302,7 @@ pub struct Timeline {
     pub follow_head: bool,        // pinned to the edge (playing/following) vs parked (scrubbed)
     pub speed: f64,
     pub compress_gaps: bool,      // skip idle dead air (default on); `g` toggles faithful pacing
+    pub generation: u64,          // bumped whenever an item INDEX changes meaning (re-sort / bulk load)
     // + cached head, gap-pacing anchor/elapsed, `undated_agents` (Pending-item join set), ended latch
 }
 ```
@@ -235,7 +311,9 @@ pub struct Timeline {
 - **`replay`** is the one surviving "mode" bit — the **launch intent**: are you replaying a recording, or following a live session? Set from the launch `Mode`, and **not runtime-derivable** (a quiet live session is byte-identical to a finished recording, so the flag can't be eliminated). It is NOT a claim the file is complete — a replay can grow and go live (the feeder always tails; nothing is assumed finished), which is why it's named for the intent, not a "bounded/complete" property. It does NOT gate pacing (the edge does); it gates only the `now` reference and the end-settle latch.
 - **Pacing** (`advance`, per 16ms frame): paces the cursor toward the next event, **compressing dead air** — but not with a flat cap. `compress_gap` is a **log-compression** curve (`GAP_FAITHFUL_KNEE`=0.8s, `GAP_COMPRESS_SCALE`=0.6): real-time below the knee, then `knee + scale·ln(1 + (t−knee)/knee)` above it — *graded*, so a 5-minute wait still reads longer than a 5-second one (an hour of dead air crosses in <10s). The `g` key sets `compress_gaps = false` for faithful real-time pacing. The App folds the prefix `items[0..fold_target()]` (`App::fold_to`); the live append and replay paths share it.
 - **`now` reference** = wall clock only at a *live* edge (`!replay && follow_head && at_edge`), the cursor otherwise (incl. live catch-up) — so a replay always judges liveness as-of-the-playhead (its timestamps are a past recording, unrelated to wall time). See Status rules.
-- **Seek / scrub** (`App::seek`, `seek_to_fraction`, `seek_prompt`, `go_live`): forward → fold in place (cheap); backward → `App::rebuild_to` re-folds the prefix into a fresh `SessionModel` and re-syncs, carrying view across by id (`graph::restore_positions` + `select_node`). A seek is discontinuous → ephemerals reset (chips re-baseline via `adopt_baseline`, then the per-frame `reconcile` reconstructs in-flight runs from state; glide cancels — see [`ARCHITECTURE.md`](ARCHITECTURE.md) §5). `space` is a unified play/pause that resumes from the current cursor; `End`/`go_live` re-pins to the edge.
+- **Seek / scrub** (`App::seek`, `seek_to_fraction`, `seek_prompt`, `go_live`): forward → fold in place (cheap); backward → `App::rebuild_to` restores the nearest **snapshot ladder** rung and folds forward from it, re-syncing and carrying view across by id (`graph::restore_positions` + `select_node`).
+- **The snapshot ladder** (`App::snapshots`, `SNAPSHOT_STRIDE`): a rung every N folded items, taken *inside* the fold loop — a jump to the live edge folds the whole timeline in one call, so a ladder recording only where each fold *ended* would hold one useless rung at the edge. Restoring a rung is `SessionModel::clone`, which is O(1) because the model is built from persistent (`imbl`) collections. A rung stores **fold state only**; liveness and workflow rollups are playhead-dependent projections and are re-run by `resync` after every restore.
+- **`generation` guards the ladder.** Item indices are NOT stable: `append_live` re-sorts the whole list whenever a batch carries untimed items or dates a previously-`Pending` one, and undated items sort ahead of dated ones — so a resolving item jumps right and shifts every index in between. A rung keyed to `items[0..N]` would then describe a different prefix. Rungs record the generation they were taken under and are discarded wholesale when it moves. `SessionReset` clears them outright, since a fresh `Timeline` restarts the counter and they could not be told apart by it. A seek is discontinuous → ephemerals reset (chips re-baseline via `adopt_baseline`, then the per-frame `reconcile` reconstructs in-flight runs from state; glide cancels — see [`ARCHITECTURE.md`](ARCHITECTURE.md) §5). `space` is a unified play/pause that resumes from the current cursor; `End`/`go_live` re-pins to the edge.
 - **Scrubber position is event-indexed, not time-linear** — real sessions cluster work then sit idle (the rwy sample: ~11 min across 10.65 h), so a time-linear bar would bury all action in a sliver. `progress` / `fold_at_fraction` map the bar over `[floor, len]` where `floor` is the unavoidable start clump (same-timestamp ties + dated metadata that can only fold atomically), so the leftmost click reaches position 0. `gap_markers` (≥`GAP_MARKER_SECS`=60s) place the fast-forward `»` markers on the marker strip. Because the axis is event-indexed, a raw event-count would be flat — so the track is a **tool-activity sparkline** (per-column sum of `Entry::tool_use_count` over its item range) which peaks where the work happened; see UI.
 - **Emergent transport** (`App::transport` → Live / Playing / Paused / History / Idle): "Live" = following the edge **and** a fresh append (`last_batch_at` within ~10s), so a resumed *replay* reads Live and an old followed session reads Idle. Drives the status badge + scrubber tag — never a hardcoded mode.
 
@@ -270,7 +348,9 @@ The crossterm input channel is **unbounded** (input must never block); the **cap
 
 ## Graph sync (state/graph.rs — rwy's incremental pattern)
 
-- **Never rebuild — except a backward seek.** Forward (live/replay playback): `flow.node_content_mut(id)` → mutate in place; else `flow.add_node(...)` + `flow.add_edge(...)` (duplicate-id `Err` is an idempotent no-op; add nodes before edges). The ONE exception is scrubbing into the past: folding is forward-only, so `App::rebuild_to` builds a fresh `SessionModel` + `Flow` from the prefix and `graph::restore_positions` carries node positions across by id (selection too) so the layout doesn't jump.
+- **Never rebuild — except a backward seek.** Forward (live/replay playback): `flow.node_content_mut(id)` → mutate in place; else `flow.add_node(...)` + `flow.add_edge(...)` (duplicate-id `Err` is an idempotent no-op; add nodes before edges). The ONE exception is scrubbing into the past: folding is forward-only, so `App::rebuild_to` restores a ladder rung and rebuilds the `Flow` from the prefix, with `graph::restore_positions` carrying node positions across by id (selection too) so the layout doesn't jump.
+- **Node ids are `<session>/<agent>`** (`graph::node_id` / `split_node_id`, separator `graph::ID_SEP`). One flow holds every watched session and every `SessionModel` calls its root `"main"`, so the session has to be in the id. `sync` is the only place the model's session-local ids and the flow's ids meet.
+- **Session trees are shelf-packed** (`graph::pack_sessions`): rataflow applies each connected component's Sugiyama coordinates verbatim — its layout loop discards exactly the per-component offsets that would separate them — so without a packing pass every session's tree stacks at the origin. Rows rather than one endless line, with the row count chosen for the best **screen** aspect (world units are cells, and a cell is ~2× taller than wide, so `CELL_ASPECT` converts before comparing). Packing moves whole sessions only; positions *within* a session are untouched, which is what lets `repack_if_overlapping` run on every structural change — a session that grows into its neighbour is separated, while a session the user dragged somewhere clear is left alone.
 - Node: `Node::new(id, (0.0, 0.0), (W, H), AgentNode{…})` — fixed dims ~`(30.0, 7.0)` main/workflow, ~`(26.0, 6.0)` subagents (explicit dims; no DOM-style measuring). Handles: `Handle::source(HandlePosition::Bottom).with_hidden(true)`, `Handle::target(HandlePosition::Top).with_hidden(true)` (clean look, rwy does this).
 - **Layout (strictly user-driven):** `sync` never auto-relayouts (it retains a `relayout` param, but every caller passes `false`). A Sugiyama pass on every new node reflowed the whole graph and read as "jumpy" as a session grew (confirmed by toggling it off), so newcomers always get local placement (below parent, fanned past siblings) and nothing existing ever moves on its own. The ONLY relayout trigger is `r` (`App::relayout_now` → `flow.apply_layout(Sugiyama::vertical())` + reframe for the current camera). Layout is orthogonal to the camera: `o`/`f` move the viewport only and never rearrange nodes. `layout_dirty` (set on structural growth, cleared by `r`) drives a subtle status-bar hint so pending growth is discoverable. (Earlier designs auto-relayouted, then auto-relayouted except in Manual, then applied debt on `o`/`f`; all superseded — layout is now always explicit.)
 - **Camera** (supersedes the original "fit only on first populate" — a one-shot fit goes stale as the graph grows): three mutually exclusive modes on `App.camera`. **Overview** (default) re-requests fit-view on every structural change — the camera pulls back as the swarm grows. **Follow** holds readable zoom (≥ `FOLLOW_ZOOM`) and centers on the most recently active agent (`SessionModel::last_active_agent_id`, latest `last_ts`, spawn-order tie-break). **Manual**: a uniform rule in `process_flow_events`, not per-event — every `FlowEvent` there is a user gesture (programmatic `select_node`/`center_on`/`set_offset` are quiet and never surface), so **Follow yields to ANY interaction**: click, spatial nav (`SelectionChanged`), pan/zoom (`ViewportChanged`), or node drag (`NodeDragged`). **Overview** yields only to a viewport change — selecting/dragging while auto-framing is fine to leave in Overview. Dropping Follow on selection is deliberate: the user is inspecting a node, and spatial nav already pans to keep it visible (rataflow's `ensure_selected_node_visible`, 1-cell margin) — staying in Follow would fight that and glide back over the selection. Keys name destinations: `o` → Overview, `f` → Follow — the only exits from Manual. Session reset → Overview. Follow auto-narrates the panel (quiet `select_node`, no event); a user selection ends that by dropping to Manual. Status bar shows `⌖ overview` / `⌖ follow` / nothing. Camera moves in Follow are eased (`CameraGlide`), cancelled the instant the user takes over.

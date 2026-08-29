@@ -11,7 +11,9 @@ The whole program solves one hard problem:
 > agent session from an **undocumented, append-only, partially-timestamped,
 > multi-file** transcript — in which **completion is frequently unknowable**.
 
-Almost every design decision below is downstream of that one sentence.
+Almost every design decision below is downstream of that one sentence. Watching
+*every* live session at once (§8) adds a second: the same reconstruction, N times
+over, cheaply enough that the sessions nobody is looking at cost almost nothing.
 
 ---
 
@@ -243,9 +245,87 @@ Detailed in [`DESIGN.md`](DESIGN.md#timeline); the architectural essence:
 - **Transport is emergent** (`Live`/`Playing`/`Paused`/`History`/`Idle`), read from
   edge-following + append freshness — never a hardcoded mode.
 
+### 6.1 Seeking backward without re-folding (the snapshot ladder)
+
+Folding is forward-only, so moving the playhead back means rebuilding the model
+from a prefix. Doing that from item zero costs O(k) in the distance travelled —
+visibly janky on a large session.
+
+- **A snapshot is a clone.** `SessionModel` is built from persistent (`imbl`)
+  collections, so cloning it is O(1) and shares structure rather than copying.
+  A ladder of rungs every `SNAPSHOT_STRIDE` items therefore costs little, and a
+  backward seek restores the nearest rung and folds forward from there.
+- **This only works if the *values* are persistent too.** `imbl` copy-on-writes
+  the value at a touched node, so an `AgentInfo` owning a plain `Vec` of tool
+  calls would deep-copy that agent's whole history on every append — O(n²), the
+  exact quadratic `tool_index` was added to remove. Every growing collection in
+  the model is persistent, not just the outer map.
+- **Rungs hold fold state, never projections.** Liveness and workflow rollups are
+  functions of the playhead (§4), not of the fact set, so baking them into a rung
+  would restore yesterday's answer. `resync` re-runs them after every restore.
+  This is the fold/projection split (§2) becoming load-bearing rather than
+  descriptive.
+- **Item indices are not stable, so rungs expire.** A late batch that dates a
+  previously-pending item re-sorts the list around it (undated items sort ahead
+  of dated ones), shifting every index in between. A rung keyed to `items[0..N]`
+  then silently describes a different prefix — wrong, not slow. `Timeline::generation`
+  moves on every re-sort and stale rungs are discarded.
+
+The remaining cost of a backward seek is no longer the fold: `rebuild_to` still
+discards the whole `Flow` and re-projects it. That is the next thing to fix, and
+why `agents` is an `OrdMap` (which has a structural `diff`) rather than the
+faster `HashMap` (which does not).
+
 ---
 
-## 7. Known soft spots
+## 7. Watching every live session
+
+The canvas shows every session that is currently running, each as a root card
+with its agents beneath it. The rail indexes them — including the idle ones the
+canvas leaves out — and picks which one is *focused*.
+
+- **Only the focused session gets a playhead.** It owns the `Timeline` and can be
+  scrubbed; the rest are folded straight off their live edge and only render.
+  The asymmetry is the domain shape, not an accident: one collection holding both
+  would either hand every session a timeline it never uses, or pretend the focused
+  one is not special when every seek path says it is.
+- **A monitored session costs a model, not a timeline.** Its batches fold and are
+  dropped, so N sessions cost `1× items + N× models` — and a model is small next
+  to the parsed item list.
+- **Discovery over-includes, then the bytes decide.** The stat sweep filters on
+  mtime, which can only ever *over*-include (appending always advances it), so no
+  live session can be filtered out. The index then reports ground truth. Activity
+  is the newest mtime across the main transcript **and its sidecars**: a session
+  blocked on a subagent writes nothing to its own file, and filtering on that file
+  alone drops exactly the sessions most worth watching.
+- **Focus is derived, never stored twice.** The rail marks whichever row matches
+  the session actually being watched, which the tailer confirms via `SessionReset`.
+  A parallel focus field would eventually point at a session nobody is tailing —
+  a marker that lies.
+- **Node ids carry their session.** Every `SessionModel` names its root `"main"`,
+  so a shared flow needs the session in the id or the second root is a duplicate
+  no-op and its agents hang off the first session's tree. Wrong picture, no error.
+
+### 7.1 A second reader of the same format
+
+The skeleton index parses none of the payload — it probes for the handful of
+facts the timeline needs and leaves the body on disk. Two readers of one
+undocumented format is normally a mistake; here it is the point, and the thing
+that makes it legitimate is that **the fast path is never allowed to guess**:
+
+- where the format is ambiguous, the record says so and the caller parses that
+  line properly;
+- a differential test asserts record-for-record agreement with the real parser
+  over a whole corpus.
+
+That test is not a formality. Both format-drift bugs it found — envelope keys
+that are not emitted first, and activity counts that must come from real content
+blocks rather than from text that merely contains the literal — were invisible to
+review and to every synthetic fixture.
+
+---
+
+## 8. Known soft spots
 
 Honest ledger of what's derived-but-imperfect, for whoever touches this next:
 
@@ -259,6 +339,19 @@ Honest ledger of what's derived-but-imperfect, for whoever touches this next:
 - **Aggregate chip error-coloring.** A settled run shows a single aggregate
   ✓/✗; a run of N where only one call failed still reads as an error run. Cosmetic
   over-alarm, noted for a future pass.
+- **Selecting a monitored session's node does nothing.** The canvas lets you click
+  any card, but the detail panel reads the focused model, so a card in another
+  session highlights and shows nothing — with no affordance saying why. Either
+  selecting it should focus that session, or the panel should render a read-only
+  summary from the monitored model.
+- **`MonitorBatch`/`MonitorReset` encode a routing decision the App already makes.**
+  "Is this the focused session" is exactly `is_current(session_id)`; carrying it in
+  the wire protocol as parallel variants means every future per-session event faces
+  the same fork. It already bit once: a monitor's `Error` is dropped, because there
+  is no `MonitorError`. The deeper fix is one tailer owning every session, which
+  also removes a poll loop and two relay tasks per monitored session.
+- **The monitor fleet is capped silently.** Past `MAX_MONITORED` a live session is
+  simply not drawn, and nothing on screen says so.
 
 ---
 
@@ -275,3 +368,9 @@ Honest ledger of what's derived-but-imperfect, for whoever touches this next:
 7. A heuristic is legitimate only when it is a **reversible function of current
    facts filling a real gap** — never when it overrides ground truth already in the
    model.
+8. A **fast path may be faster, never different** — where it cannot know, it says
+   so, and a differential test keeps it honest.
+9. **Cache the fold, never the projection.** Anything derived from the playhead is
+   re-run after a restore, not stored with it.
+10. **An index into a list that can re-sort is not an identity.** Anything keyed by
+    position carries the generation it was taken under.
