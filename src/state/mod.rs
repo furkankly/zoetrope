@@ -369,15 +369,72 @@ impl App {
     /// there is nowhere to move.
     pub fn focus_session(&mut self, delta: isize) {
         if let Some(path) = self.rail.step_focus(&self.current_session_id, delta) {
-            self.pending_watch = Some(path);
+            self.watch_session(path);
         }
     }
 
     /// Ask to watch the rail row at `index` (a click).
     pub fn focus_session_index(&mut self, index: usize) {
         if let Some(path) = self.rail.focus_index(&self.current_session_id, index) {
-            self.pending_watch = Some(path);
+            self.watch_session(path);
         }
+    }
+
+    /// Switch the focused session to the one at `path`.
+    ///
+    /// The switch happens HERE, not when the tailer reports back. The tailer no
+    /// longer announces which session it attached to — it watches what it is
+    /// told and stamps events with that id — so the App is the only thing that
+    /// knows a switch happened, and the only thing that can reset the timeline
+    /// for it. Doing it here also means the id is right before the first batch
+    /// of the new session arrives, so nothing is dropped or misrouted.
+    fn watch_session(&mut self, path: std::path::PathBuf) {
+        let session_id = crate::transcript::session_id_from_path(&path);
+        if session_id.is_empty() || self.is_current(&session_id) {
+            return;
+        }
+        // The session being left keeps its place on the canvas only if
+        // something still feeds it; the supervisor decides that on its next
+        // sweep. Drop its focused model either way — a monitor will rebuild it.
+        graph::remove_session(&mut self.flow, &self.current_session_id);
+        // The session being entered may already be on the canvas as a monitored
+        // one; the focused model replaces it, and two models projecting the
+        // same node ids would fight over every card's content.
+        self.others.remove(&session_id);
+
+        self.current_session_id = session_id.clone();
+        self.session = SessionModel::new(session_id);
+        self.timeline = Timeline::new();
+        self.snapshots.clear();
+        self.chips.clear();
+        self.camera = Camera::Overview;
+        self.camera_glide = None;
+        self.detail_scroll = 0;
+        self.detail_follow = true;
+        self.layout_dirty = false;
+        self.pending_watch = Some(path);
+    }
+
+    /// Focus the session a just-selected node belongs to, if it is not already
+    /// the focused one.
+    ///
+    /// The switch is queued like any other (`pending_watch`), so the model and
+    /// timeline arrive a frame or two later; the selection itself survives
+    /// because node ids are session-qualified and stable across the switch.
+    fn focus_selected_session(&mut self, node_id: &str) {
+        let Some((session, _)) = graph::split_node_id(node_id) else {
+            return;
+        };
+        if session == self.current_session_id {
+            return;
+        }
+        // Only sessions discovery knows about can be watched — it is the rail
+        // row that carries the transcript path.
+        let Some(row) = self.rail.rows.iter().find(|r| r.session_id == session) else {
+            return;
+        };
+        let path = row.main_path.clone();
+        self.watch_session(path);
     }
 
     /// The rail row for the session being watched, if the rail lists it.
@@ -408,7 +465,12 @@ impl App {
                 session_id,
                 updates,
             } => {
+                // Not the focused session: it is one of the others sharing the
+                // canvas. Same event, routed by id — the App is the only thing
+                // that knows which session is focused, so it is the only thing
+                // that should be deciding this.
                 if !self.is_current(&session_id) {
+                    self.fold_other(&session_id, updates);
                     return;
                 }
                 // Route untimed session-level metadata to the info store; only
@@ -476,35 +538,33 @@ impl App {
                 self.fold_to(target);
             }
             UiEvent::SessionReset { session_id } => {
-                // Truncation/rotation/switch: adopt the new id and rebuild
-                // from scratch so stale nodes don't linger. The tailer's
-                // initial ANNOUNCE arrives as a same-id reset on a still-empty
-                // graph — there is nothing to wipe, and resetting view state
-                // there would clobber a camera/pin choice the user made while
-                // waiting for the session to appear.
+                // A monitored session truncated or rotated: drop it and let its
+                // own tailer re-attach. Never touches the focused session.
+                if !self.is_current(&session_id) {
+                    self.forget_session(&session_id);
+                    return;
+                }
+
+                // The focused session truncated or rotated. Rebuild it from
+                // scratch so stale nodes cannot linger — but take only ITS
+                // subtree off the canvas; the rest belongs to other sessions
+                // that are still being fed.
                 let had_nodes = self
                     .flow
                     .nodes()
                     .any(|n| graph::split_node_id(&n.id).is_some_and(|(s, _)| s == session_id));
-                let genuine = !self.is_current(&session_id) || had_nodes;
-                // Take only the OLD focused session off the canvas — a whole
-                // flow rebuild would drop every OTHER session's nodes too.
-                graph::remove_session(&mut self.flow, &self.current_session_id);
-                // Switching to a session that was being monitored: the focused
-                // model replaces its monitored one, which would otherwise
-                // render the same agents twice.
-                self.others.remove(&session_id);
-                self.current_session_id = session_id.clone();
+                graph::remove_session(&mut self.flow, &session_id);
                 self.session = SessionModel::new(session_id);
-                // A different session (or a truncated one) shares nothing with
-                // the rungs we hold, and a fresh `Timeline` restarts the
-                // generation counter — so they cannot be told apart by it.
+                // The rungs describe a file that no longer exists, and a fresh
+                // `Timeline` restarts the generation counter — so they could not
+                // be told apart by it either.
                 self.snapshots.clear();
-                // A reset is a fresh live timeline (only live emits resets — the
-                // initial announce, truncation, or auto-switch). Replay arrives
-                // via ReplayLoaded, never a reset.
+                // A reset is a fresh live timeline (only live emits resets).
+                // Replay arrives via `ReplayLoaded`, never a reset.
                 self.timeline = Timeline::new();
-                if genuine {
+                // An empty graph means nothing was showing yet, so resetting the
+                // view would clobber a camera choice made while waiting.
+                if had_nodes {
                     self.camera = Camera::Overview;
                     self.detail_scroll = 0;
                     self.detail_follow = true;
@@ -513,20 +573,19 @@ impl App {
                     self.camera_glide = None;
                 }
             }
-            UiEvent::MonitorBatch {
-                session_id,
-                updates,
-            } => {
-                // `fold_other` projects just this session — see its docs.
-                self.fold_other(&session_id, updates);
-            }
-            UiEvent::MonitorReset { session_id } => {
-                self.forget_session(&session_id);
-            }
             UiEvent::Sessions(rows) => {
                 // Not gated on `is_current`: a sweep describes the whole
                 // workspace, not one session, so it is never stale for the
                 // watched one.
+                // Launched on a project with no session yet: adopt the first
+                // one discovery names, so the tailer gets a concrete file and
+                // the canvas has something to show.
+                if self.current_session_id.is_empty()
+                    && let Some(first) = rows.first()
+                {
+                    let path = first.main_path.clone();
+                    self.watch_session(path);
+                }
                 self.apply_session_labels(&rows);
                 self.rail.adopt(rows);
             }
@@ -1174,7 +1233,7 @@ mod tests {
         });
 
         // A monitored session, folded straight off its live edge.
-        app.handle_ui_event(UiEvent::MonitorBatch {
+        app.handle_ui_event(UiEvent::Batch {
             session_id: "other".into(),
             updates: vec![meta_update("sub-b")],
         });
@@ -1203,7 +1262,7 @@ mod tests {
 
         // When it stops being live, it leaves the canvas without disturbing
         // the focused session.
-        app.handle_ui_event(UiEvent::MonitorReset {
+        app.handle_ui_event(UiEvent::SessionReset {
             session_id: "other".into(),
         });
         assert!(!has(&app, "other", "main"));
@@ -1257,11 +1316,16 @@ mod tests {
         let mut app = App::new("s".into(), Mode::Live);
         assert_eq!(app.camera, Camera::Overview);
 
+        // Something is showing, then the session is truncated…
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "s".into(),
+            updates: vec![meta_update("sub")],
+        });
         app.camera = Camera::Manual; // user took the camera…
         app.handle_ui_event(UiEvent::SessionReset {
-            session_id: "s2".into(),
+            session_id: "s".into(),
         });
-        // …but a fresh session re-engages the default.
+        // …and a session rebuilt from nothing re-engages the default.
         assert_eq!(app.camera, Camera::Overview);
     }
 
@@ -1472,7 +1536,7 @@ mod tests {
 
         // A second session shares the canvas, and must be untouched by a seek
         // in the focused one.
-        app.handle_ui_event(UiEvent::MonitorBatch {
+        app.handle_ui_event(UiEvent::Batch {
             session_id: "other".into(),
             updates: vec![meta_update("watched")],
         });

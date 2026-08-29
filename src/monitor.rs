@@ -9,15 +9,14 @@
 //!
 //! A monitored session is folded straight off its live edge into a model that
 //! only ever renders — no [`Timeline`](crate::state::timeline::Timeline), no
-//! playhead, no seeking. Its events are therefore relabelled
-//! ([`UiEvent::MonitorBatch`] / [`UiEvent::MonitorReset`]) before reaching the
-//! App, because the focus tailer's `Batch` for an unfamiliar session id means
-//! "I switched sessions" — a meaning a monitor must never accidentally speak.
+//! playhead, no seeking. That is the ONLY difference between it and the focused
+//! session, and it is the App's decision, not the tailer's: every tailer here
+//! emits the same `Batch`/`SessionReset` events stamped with a `session_id`, and
+//! the App routes on that.
 //!
-//! Each monitor watches a concrete `<uuid>.jsonl`, which the tailer treats as
-//! pinned (`live.rs`: a file target disables the newer-session auto-switch). A
-//! monitor following a project's newest session out from under the supervisor
-//! would leave the fleet's bookkeeping describing sessions nobody is tailing.
+//! Each tailer is pinned to the file it was given and never follows a different
+//! one, so the fleet's bookkeeping always describes the sessions actually being
+//! tailed.
 
 use std::collections::HashMap;
 
@@ -39,23 +38,24 @@ pub const MAX_MONITORED: usize = 8;
 /// Request-channel capacity for a monitor's tailer. One `Watch` is ever sent.
 const REQ_CAP: usize = 1;
 
-/// Event-channel capacity between a monitor's tailer and its relabeller.
-const EVENT_CAP: usize = 32;
-
 /// A running monitor. Dropping it closes the request channel, which is how
 /// [`tailer::run`] is told to shut down.
 struct Monitor {
     _req_tx: mpsc::Sender<TailRequest>,
 }
 
-/// Start a tailer for one session and relabel its events for the App.
+/// Start a tailer pinned to one session's transcript.
+///
+/// Its events go straight to the UI channel: they carry a `session_id`, and the
+/// App routes on that alone. There is no relabelling step and no second channel
+/// — a monitored session and the focused one differ only in which one the App
+/// has decided to focus, which the tailer neither knows nor needs to.
 fn spawn_monitor(row: &RailRow, ui_tx: mpsc::Sender<UiEvent>) -> Monitor {
     let (req_tx, req_rx) = mpsc::channel(REQ_CAP);
-    let (mon_tx, mut mon_rx) = mpsc::channel(EVENT_CAP);
 
-    // The tailer itself, live (never replay — a monitor follows an edge).
+    // Live, never replay — a monitor follows an edge.
     tokio::spawn(async move {
-        let _ = tailer::run(req_rx, mon_tx, false, 1.0).await;
+        let _ = tailer::run(req_rx, ui_tx, false, 1.0).await;
     });
 
     // Pin it to this session's file. The channel has room for exactly this.
@@ -63,28 +63,6 @@ fn spawn_monitor(row: &RailRow, ui_tx: mpsc::Sender<UiEvent>) -> Monitor {
     let req = req_tx.clone();
     tokio::spawn(async move {
         let _ = req.send(TailRequest::Watch(path)).await;
-    });
-
-    // Relabel. `ReplayLoaded` cannot occur (live mode) and an `Error` from a
-    // monitor is dropped rather than surfaced: it belongs to a session the user
-    // is not looking at, and the status bar speaks for the focused one.
-    tokio::spawn(async move {
-        while let Some(event) = mon_rx.recv().await {
-            let relabelled = match event {
-                UiEvent::Batch {
-                    session_id,
-                    updates,
-                } => UiEvent::MonitorBatch {
-                    session_id,
-                    updates,
-                },
-                UiEvent::SessionReset { session_id } => UiEvent::MonitorReset { session_id },
-                _ => continue,
-            };
-            if ui_tx.send(relabelled).await.is_err() {
-                return;
-            }
-        }
     });
 
     Monitor { _req_tx: req_tx }
@@ -113,12 +91,32 @@ fn wanted(rows: &[RailRow], focus: &str, now: chrono::DateTime<chrono::Utc>) -> 
 /// Runs until the UI channel closes. Subsumes the plain discovery sweep — the
 /// rows it publishes and the fleet it manages come from the same scan, so they
 /// can never describe different workspaces.
-pub async fn supervise(ui_tx: mpsc::Sender<UiEvent>, focused: watch::Receiver<String>) {
+pub async fn supervise(ui_tx: mpsc::Sender<UiEvent>, mut focused: watch::Receiver<String>) {
     let mut monitors: HashMap<String, Monitor> = HashMap::new();
     let mut ticker = tokio::time::interval(sessions::SWEEP_INTERVAL);
 
     loop {
-        ticker.tick().await;
+        // React to a focus change immediately, not on the next sweep. The App
+        // switches focus the moment the user asks; until this fleet notices,
+        // the newly focused session still has a monitor on it, and BOTH tailers
+        // feed the App events for it — which the App can no longer tell apart,
+        // because telling them apart is exactly the distinction this design
+        // removed. Waking on the change keeps that window to nothing.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            changed = focused.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let focus = focused.borrow().clone();
+                if monitors.remove(&focus).is_some() {
+                    // Its model is the focused one's now; the App replaced it
+                    // when it switched, so nothing to tell it here.
+                    continue;
+                }
+                continue;
+            }
+        }
 
         // Discovery is blocking and touches every project directory, so it goes
         // on the blocking pool rather than occupying a runtime worker.
@@ -148,7 +146,7 @@ pub async fn supervise(ui_tx: mpsc::Sender<UiEvent>, focused: watch::Receiver<St
         for id in stale {
             monitors.remove(&id);
             if ui_tx
-                .send(UiEvent::MonitorReset { session_id: id })
+                .send(UiEvent::SessionReset { session_id: id })
                 .await
                 .is_err()
             {

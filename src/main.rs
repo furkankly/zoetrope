@@ -507,15 +507,21 @@ async fn run_tui(cli: Cli) -> Result<()> {
             };
             let proj = transcript::project_dir(&cwd)
                 .ok_or_else(|| anyhow!("no Claude projects directory for {}", cwd.display()))?;
-            // Best-effort latest session id so stale events filter; the tailer
-            // re-discovers and may switch.
-            let session_id = transcript::latest_session_file(&proj)
-                .as_deref()
-                .and_then(Path::file_stem)
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            (session_id, proj, Mode::Live, false, DEFAULT_REPLAY_SPEED)
+            // Resolve the project's newest session HERE, and watch that file
+            // rather than the directory. The tailer no longer announces which
+            // session it picked — it watches what it is told — so the App must
+            // be the one that chose, or its id and the tailer's would disagree
+            // and every batch would be routed as some other session's.
+            //
+            // No session yet is fine: the directory is watched until one
+            // appears, and discovery names it within a sweep.
+            match transcript::latest_session_file(&proj) {
+                Some(main) => {
+                    let session_id = transcript::session_id_from_path(&main);
+                    (session_id, main, Mode::Live, false, DEFAULT_REPLAY_SPEED)
+                }
+                None => (String::new(), proj, Mode::Live, false, DEFAULT_REPLAY_SPEED),
+            }
         }
     };
 

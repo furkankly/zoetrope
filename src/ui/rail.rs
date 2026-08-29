@@ -307,24 +307,29 @@ mod tests {
         let mut app = app_with_two_sessions();
         rendered_ui(&mut app, 100, 24);
 
-        // `n` steps to the next session and queues it for the tailer; the
-        // marker does NOT move yet, because the app is still watching sess-a
-        // until the tailer confirms the switch.
+        // `n` switches focus and queues the new transcript for the tailer. The
+        // switch is the App's own decision now, so the marker moves at once
+        // rather than waiting for a tailer to confirm it.
         crate::handler::handle_event(
             &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
             &mut app,
         );
         assert_eq!(app.pending_watch, Some(PathBuf::from("/p/sess-b.jsonl")));
-        assert_eq!(app.rail.focused_index(&app.current_session_id), Some(0));
+        assert_eq!(app.current_session_id, "sess-b");
+        assert_eq!(app.rail.focused_index(&app.current_session_id), Some(1));
 
-        // With two rows, `p` wraps to the same other session as `n` does.
+        // `p` steps back to the session we came from.
         app.pending_watch = None;
         crate::handler::handle_event(
             &Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
             &mut app,
         );
-        assert_eq!(app.pending_watch, Some(PathBuf::from("/p/sess-b.jsonl")));
+        assert_eq!(app.pending_watch, Some(PathBuf::from("/p/sess-a.jsonl")));
+        assert_eq!(app.current_session_id, "sess-a");
 
+        // The rail must still be drawn to map clicks; the switch cleared the
+        // recorded rect along with everything else about the old session.
+        rendered_ui(&mut app, 100, 24);
         let area = app.rail_area.expect("rail drawn");
         let click = |app: &mut App, row: u16| {
             crate::handler::handle_event(

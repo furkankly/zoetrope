@@ -77,25 +77,19 @@ pub enum UiEvent {
         speed: f64,
         info: crate::state::SessionInfo,
     },
-    /// File truncation/rotation detected — the UI should reset its model.
+    /// File truncation/rotation detected for `session_id` — the UI should drop
+    /// what it has of that session.
+    ///
+    /// Always about the named session and nothing else. It used to be able to
+    /// mean "the focused session is now a different one" (the tailer followed a
+    /// newer file on its own), which made an unfamiliar id ambiguous and forced
+    /// a parallel set of monitor-only events. Which session is focused is now
+    /// the App's decision, so routing on `session_id` alone is unambiguous.
     SessionReset { session_id: String },
     /// A completed multi-session discovery sweep. Carries finished rail rows
     /// (see [`crate::sessions::sweep`]), never raw paths: discovery is native
     /// and blocking, the App is neither, and the rail is portable state.
     Sessions(Vec<crate::state::rail::RailRow>),
-    /// Appends from a **monitored** session — one on the canvas but not
-    /// focused. A distinct variant rather than a [`Batch`](UiEvent::Batch) with
-    /// a different id, because the two mean different things: a `Batch` for an
-    /// unfamiliar id is the focus tailer telling the App it switched sessions,
-    /// while this is another session simply making progress. Conflating them
-    /// made an auto-switch look like monitor traffic and vice versa.
-    MonitorBatch {
-        session_id: String,
-        updates: Vec<Update>,
-    },
-    /// A monitored session was truncated or rotated — drop what we have of it.
-    /// Never a focus change; see [`MonitorBatch`](UiEvent::MonitorBatch).
-    MonitorReset { session_id: String },
     /// A non-fatal error string for display.
     Error(String),
 }

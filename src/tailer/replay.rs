@@ -69,15 +69,14 @@ pub(crate) async fn run_replay(
     // for this file) by clearing project_dir. Tail offsets are seeded from the
     // byte positions the bulk parse actually consumed — NOT the current EOF —
     // so lines appended while the bulk parse ran are emitted, not skipped.
-    let Some((project_dir, main_path)) = resolve_live_target(path) else {
+    let Some((_, main_path)) = resolve_live_target(path) else {
         // Unreadable target: nothing to tail, just wait for a switch/exit.
         return match req_rx.recv().await {
             Some(TailRequest::Watch(p)) => Flow::Switch(p),
             None => Flow::Exit,
         };
     };
-    let mut session = LiveSession::new(project_dir, main_path);
-    session.project_dir = None; // replay pins one file — no auto-switch
+    let mut session = LiveSession::new(main_path);
     session.seed(seed);
 
     tail_loop(session, session_id, ui_tx, req_rx).await
