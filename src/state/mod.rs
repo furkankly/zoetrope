@@ -1015,12 +1015,6 @@ impl App {
         }
     }
 
-    /// Every watched session id, focused first.
-    pub fn watched_sessions(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.current_session_id.as_str())
-            .chain(self.others.keys().map(String::as_str))
-    }
-
     /// Tidy the graph on demand (`r`): run Sugiyama now and reframe for the
     /// current camera. Layout is never automatic (see `resync`),
     /// so this is the user's explicit "rearrange". Forces a pass even when not
@@ -1323,7 +1317,11 @@ mod tests {
         // session's model is untouched by it.
         assert!(app.others.contains_key("other"));
         assert!(app.session.agent("sub-b").is_none());
-        assert_eq!(app.watched_sessions().count(), 2);
+        assert_eq!(
+            1 + app.others.len(),
+            2,
+            "the focused session plus one other"
+        );
 
         // Selecting a monitored node reports no agent in the FOCUSED model —
         // the detail panel reads that model, and would otherwise render blank
