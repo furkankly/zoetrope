@@ -85,6 +85,32 @@ fn wanted(rows: &[RailRow], focus: &str, now: chrono::DateTime<chrono::Utc>) -> 
         .collect()
 }
 
+/// Which monitors to stop, and whether each one's session should also be taken
+/// off the canvas (`true`).
+///
+/// The distinction is the whole point. A monitor stops for two unrelated
+/// reasons, and only one of them is a retirement:
+///
+/// * the session went quiet or vanished — retire it, or its subtree lingers on
+///   the canvas forever with nothing feeding it;
+/// * the user focused it — do NOT retire it. The App reads a `SessionReset` for
+///   the focused session as a truncation and rebuilds it from nothing, dropping
+///   the model, the `Timeline` and the snapshot ladder that the focus tailer has
+///   just backfilled. Focus can win this race: [`supervise`] wakes on the focus
+///   change, but a sweep tick that is ready at the same instant is chosen at
+///   random, and it sees the new focus in `wanted` either way.
+fn retired(
+    monitors: &HashMap<String, Monitor>,
+    wanted: &[RailRow],
+    focus: &str,
+) -> Vec<(String, bool)> {
+    monitors
+        .keys()
+        .filter(|id| !wanted.iter().any(|r| &&r.session_id == id))
+        .map(|id| (id.clone(), id != focus))
+        .collect()
+}
+
 /// Sweep discovery on an interval, publish the rail rows, and keep the monitor
 /// fleet matching what is live.
 ///
@@ -138,13 +164,11 @@ pub async fn supervise(ui_tx: mpsc::Sender<UiEvent>, mut focused: watch::Receive
         // Stop monitors for sessions that went quiet, vanished, or became the
         // focused one — and tell the App to take each off the canvas, or its
         // subtree would linger forever with nothing feeding it.
-        let stale: Vec<String> = monitors
-            .keys()
-            .filter(|id| !wanted.iter().any(|r| &&r.session_id == id))
-            .cloned()
-            .collect();
-        for id in stale {
+        for (id, retire) in retired(&monitors, &wanted, &focus) {
             monitors.remove(&id);
+            if !retire {
+                continue;
+            }
             if ui_tx
                 .send(UiEvent::SessionReset { session_id: id })
                 .await
@@ -197,6 +221,33 @@ mod tests {
             .map(|r| r.session_id)
             .collect();
         assert_eq!(ids, vec!["live".to_string()]);
+    }
+
+    /// A monitor for a session the user just focused must stop WITHOUT a
+    /// `SessionReset` — the App reads that as a truncation of the focused
+    /// session and throws away the model, timeline and ladder the focus tailer
+    /// has just backfilled.
+    #[test]
+    fn focusing_a_monitored_session_stops_it_without_retiring_it() {
+        let n = now();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut monitors: HashMap<String, Monitor> = HashMap::new();
+        monitors.insert(
+            "focused".to_string(),
+            Monitor {
+                _req_tx: tx.clone(),
+            },
+        );
+        monitors.insert("gone".to_string(), Monitor { _req_tx: tx });
+
+        // Neither is wanted: one because it is the focus, one because it died.
+        let wanted = wanted(&[row("other", 1, n)], "focused", n);
+        let mut out = retired(&monitors, &wanted, "focused");
+        out.sort();
+        assert_eq!(
+            out,
+            vec![("focused".to_string(), false), ("gone".to_string(), true)]
+        );
     }
 
     #[test]
