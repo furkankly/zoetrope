@@ -100,23 +100,36 @@ fn sidecars(main_path: &Path) -> Option<Sidecars> {
     if !subs.is_dir() {
         return None;
     }
+    sidecars_in(scan_sidecar_paths(&subs))
+}
 
-    let mut paths: Vec<PathBuf> = transcript::scan_subagent_files(&subs, None)
+/// Walk `subs` for the files that belong to a session.
+///
+/// Which files count is [`transcript::scan_subagent_files`]'s rule — the
+/// `agent-<id>.jsonl` pairs plus each workflow's journal — not "every `.jsonl`
+/// here", so the stats describe exactly the files that get indexed.
+fn scan_sidecar_paths(subs: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = transcript::scan_subagent_files(subs, None)
         .into_iter()
         .map(|f| f.transcript)
         .collect();
-    for wf_id in transcript::scan_workflow_ids(&subs) {
-        let dir = transcript::workflow_dir(&subs, &wf_id);
+    for wf_id in transcript::scan_workflow_ids(subs) {
+        let dir = transcript::workflow_dir(subs, &wf_id);
         paths.extend(
             transcript::scan_subagent_files(&dir, Some(&wf_id))
                 .into_iter()
                 .map(|f| f.transcript),
         );
-        let journal = transcript::workflow_journal(&subs, &wf_id);
+        let journal = transcript::workflow_journal(subs, &wf_id);
         if journal.is_file() {
             paths.push(journal);
         }
     }
+    paths
+}
+
+/// Stat a known set of sidecar paths into the aggregate the sweep needs.
+fn sidecars_in(paths: Vec<PathBuf>) -> Option<Sidecars> {
     if paths.is_empty() {
         return None;
     }
@@ -140,8 +153,18 @@ fn sidecars(main_path: &Path) -> Option<Sidecars> {
     })
 }
 
-/// Stat one main transcript into a [`SessionRef`].
+/// Stat one main transcript into a [`SessionRef`], walking its sidecars.
 fn session_ref(project_dir: &Path, main_path: PathBuf) -> Option<SessionRef> {
+    let found = sidecars(&main_path);
+    session_ref_with(project_dir, main_path, found)
+}
+
+/// [`session_ref`] with the sidecar stats already in hand.
+fn session_ref_with(
+    project_dir: &Path,
+    main_path: PathBuf,
+    found: Option<Sidecars>,
+) -> Option<SessionRef> {
     let meta = std::fs::metadata(&main_path).ok()?;
     if !meta.is_file() {
         return None;
@@ -152,7 +175,7 @@ fn session_ref(project_dir: &Path, main_path: PathBuf) -> Option<SessionRef> {
     let mut sidecar_paths = Vec::new();
     let mut touched_by_sidecar = false;
 
-    if let Some(found) = sidecars(&main_path) {
+    if let Some(found) = found {
         bytes += found.bytes;
         sidecar_paths = found.paths;
         if found.newest > last_touched {
@@ -195,10 +218,11 @@ pub fn discover(root: &Path, since: SystemTime) -> Vec<SessionRef> {
             if !transcript::is_session_file(&path) {
                 continue;
             }
-            // Stat the main file first and skip the sidecar sweep for anything
-            // far outside the window — but only when the main file itself is
-            // old AND has no sidecar directory to check, which `session_ref`
-            // resolves. The cheap rejection is the extension/uuid filter above.
+            // Every session is stat-walked, in-window or not: a session's
+            // activity can be entirely in a sidecar (see the module docs), and
+            // that is invisible without statting them. The cheap rejection is
+            // the extension/uuid filter above; [`Sweeper`] is what stops a
+            // repeating sweep from re-walking the tree it already knows.
             if let Some(s) = session_ref(&dir, path)
                 && s.last_touched >= since
             {
@@ -373,11 +397,157 @@ pub fn rail_row(session: &SessionRef, summary: &Summary) -> RailRow {
 }
 
 /// Discover and summarize every session touched within `window`, as rail rows.
+///
+/// One-shot: every sweep pays the full walk and the full index fold. The
+/// supervisor repeats this every [`SWEEP_INTERVAL`] and should hold a
+/// [`Sweeper`] instead, which reuses what has not changed.
 pub fn sweep(window: std::time::Duration) -> Vec<RailRow> {
-    discover_recent(window)
-        .iter()
-        .map(|s| rail_row(s, &Summary::of(s)))
-        .collect()
+    Sweeper::default().rows(window)
+}
+
+/// What the previous sweep learned about one session.
+struct Cached {
+    /// Sidecar paths, and the subagents-dir mtime they were scanned under.
+    /// Re-walking the tree is only needed when that mtime moves; the files
+    /// themselves are re-stated every sweep, since an append shows up nowhere
+    /// else.
+    dir_mtime: Option<SystemTime>,
+    sidecars: Vec<PathBuf>,
+    /// The `(last_touched, bytes)` the summary was folded under. Any append to
+    /// any file of the session moves at least one of the two.
+    folded: (SystemTime, u64),
+    summary: Summary,
+}
+
+/// A repeating discovery sweep that remembers the last one.
+///
+/// The sweep runs every [`SWEEP_INTERVAL`] for as long as the program is up,
+/// over every session touched in the last [`SWEEP_WINDOW`], while almost
+/// nothing changes between two ticks. Recomputing everything each time meant
+/// re-walking every session's sidecar tree and re-folding every session's
+/// skeleton index — decoding, and on any growth rewriting, the whole on-disk
+/// cache — a few times a minute, for sessions that had not been written to in
+/// hours.
+///
+/// So each tick keeps what it can prove is unchanged:
+///
+/// * the sidecar file LIST, while the subagents directory's mtime is unmoved;
+/// * the folded [`Summary`], while the session's newest mtime and total size
+///   are both unmoved.
+///
+/// What is never skipped is the stat of each file — freshness is exactly what
+/// a sweep exists to learn, and an append to a sidecar changes nothing else.
+#[derive(Default)]
+pub struct Sweeper {
+    seen: std::collections::HashMap<PathBuf, Cached>,
+}
+
+impl Sweeper {
+    /// Discover and summarize every session touched within `window`, reusing
+    /// whatever the previous sweep established is still current.
+    pub fn rows(&mut self, window: std::time::Duration) -> Vec<RailRow> {
+        let Some(root) = transcript::claude_projects_root() else {
+            return Vec::new();
+        };
+        let since = SystemTime::now()
+            .checked_sub(window)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        self.rows_in(&root, since)
+    }
+
+    /// [`rows`](Self::rows) against an explicit root and cutoff.
+    fn rows_in(&mut self, root: &Path, since: SystemTime) -> Vec<RailRow> {
+        let found = self.discover(root, since);
+        let mut rows = Vec::with_capacity(found.len());
+        let mut live: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::with_capacity(found.len());
+
+        for session in &found {
+            let key = (session.last_touched, session.bytes);
+            let entry = self.seen.get(&session.main_path);
+            let summary = match entry {
+                Some(c) if c.folded == key => c.summary.clone(),
+                _ => Summary::of(session),
+            };
+            rows.push(rail_row(session, &summary));
+            if let Some(c) = self.seen.get_mut(&session.main_path) {
+                c.folded = key;
+                c.summary = summary;
+            }
+            live.insert(session.main_path.clone());
+        }
+
+        // Sessions that fell out of the window keep no state — the cache
+        // tracks the sweep, not the history.
+        self.seen.retain(|path, _| live.contains(path));
+        rows
+    }
+
+    /// [`discover`], but taking each session's sidecar list from the last sweep
+    /// while the subagents directory is unchanged.
+    fn discover(&mut self, root: &Path, since: SystemTime) -> Vec<SessionRef> {
+        let Ok(projects) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for project in projects.flatten() {
+            let dir = project.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !transcript::is_session_file(&path) {
+                    continue;
+                }
+                if let Some(s) = self.session_ref(&dir, path)
+                    && s.last_touched >= since
+                {
+                    out.push(s);
+                }
+            }
+        }
+        out.sort_by_key(|s| std::cmp::Reverse(s.last_touched));
+        out
+    }
+
+    fn session_ref(&mut self, project_dir: &Path, main_path: PathBuf) -> Option<SessionRef> {
+        let subs = transcript::subagents_dir(&main_path);
+        let dir_mtime = subs
+            .as_ref()
+            .and_then(|d| std::fs::metadata(d).ok())
+            .filter(|m| m.is_dir())
+            .and_then(|m| m.modified().ok());
+
+        let cached = self.seen.get(&main_path);
+        let found = match (&subs, cached) {
+            // The directory has not gained or lost a file since the last
+            // sweep, so its list still describes it — stat those paths.
+            (Some(_), Some(c)) if c.dir_mtime == dir_mtime && dir_mtime.is_some() => {
+                sidecars_in(c.sidecars.clone())
+            }
+            _ => sidecars(&main_path),
+        };
+        let session = session_ref_with(project_dir, main_path, found)?;
+
+        let entry = self
+            .seen
+            .entry(session.main_path.clone())
+            .or_insert(Cached {
+                dir_mtime,
+                sidecars: Vec::new(),
+                folded: (SystemTime::UNIX_EPOCH, u64::MAX),
+                summary: Summary::default(),
+            });
+        entry.dir_mtime = dir_mtime;
+        if entry.sidecars != session.sidecars {
+            entry.sidecars = session.sidecars.clone();
+        }
+        Some(session)
+    }
 }
 
 /// How far back the rail looks. A day: long enough that "what was I running
@@ -385,10 +555,11 @@ pub fn sweep(window: std::time::Duration) -> Vec<RailRow> {
 /// over a handful of candidates rather than the whole history.
 pub const SWEEP_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// How often the rail re-sweeps. Matches the tailer's newer-session scan
-/// cadence (`SWITCH_SCAN_EVERY`, ~2 s): the rail and the auto-switch are
-/// answering the same question about the same directories, so they should not
-/// disagree for longer than one of them takes to notice.
+/// How often the rail re-sweeps. Discovery is the ONLY thing that notices a
+/// session appearing or going quiet — the tailer never re-targets itself — so
+/// this interval is the whole latency between a session starting and the user
+/// seeing it. Two seconds keeps that imperceptible; [`Sweeper`] is what keeps
+/// repeating it cheap.
 pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
@@ -540,6 +711,54 @@ mod tests {
             );
             assert!(s.touched_by_sidecar);
         }
+    }
+
+    /// The sweep repeats every couple of seconds forever, so it caches — and a
+    /// cache that misses new activity would be worse than the cost it saves.
+    /// Growth must still show up on the very next tick, whether it lands in the
+    /// main transcript or in a sidecar that did not exist before.
+    #[test]
+    fn a_repeated_sweep_still_sees_new_activity() {
+        let f = Fixture::new("sweeper");
+        let main = f.session(
+            "proj",
+            "abcdabcd-1111-2222-3333-444444444444",
+            &user_line("u1", "2026-06-01T09:00:00.000Z", None),
+        );
+
+        let mut sweeper = Sweeper::default();
+        let first = sweeper.rows_in(&f.root, SystemTime::UNIX_EPOCH);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].agents, 1, "main only");
+
+        // A repeat tick over an untouched tree reports the same thing.
+        let again = sweeper.rows_in(&f.root, SystemTime::UNIX_EPOCH);
+        assert_eq!(again[0].agents, 1);
+        assert_eq!(again[0].last_activity, first[0].last_activity);
+
+        // A brand-new sidecar: the file list itself is out of date.
+        f.sidecar(
+            &main,
+            "a1000000000000001",
+            &user_line("s1", "2026-06-01T09:05:00.000Z", Some("a1000000000000001")),
+        );
+        let grown = sweeper.rows_in(&f.root, SystemTime::UNIX_EPOCH);
+        assert_eq!(grown[0].agents, 2, "a new sidecar must be picked up");
+        assert!(
+            grown[0].last_activity > first[0].last_activity,
+            "the sidecar's newer activity must reach the row"
+        );
+
+        // An append to a file that already existed moves neither the session's
+        // file list nor its directory mtimes — only the file's own.
+        let mut lines = std::fs::read_to_string(&main).unwrap();
+        lines.push_str(&user_line("u2", "2026-06-01T10:00:00.000Z", None));
+        std::fs::write(&main, lines).unwrap();
+        let appended = sweeper.rows_in(&f.root, SystemTime::UNIX_EPOCH);
+        assert!(
+            appended[0].last_activity > grown[0].last_activity,
+            "an append to an existing file must not be cached away"
+        );
     }
 
     #[test]

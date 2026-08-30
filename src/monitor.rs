@@ -120,6 +120,7 @@ fn retired(
 pub async fn supervise(ui_tx: mpsc::Sender<UiEvent>, mut focused: watch::Receiver<String>) {
     let mut monitors: HashMap<String, Monitor> = HashMap::new();
     let mut ticker = tokio::time::interval(sessions::SWEEP_INTERVAL);
+    let mut sweeper = sessions::Sweeper::default();
 
     loop {
         // React to a focus change immediately, not on the next sweep. The App
@@ -145,14 +146,23 @@ pub async fn supervise(ui_tx: mpsc::Sender<UiEvent>, mut focused: watch::Receive
         }
 
         // Discovery is blocking and touches every project directory, so it goes
-        // on the blocking pool rather than occupying a runtime worker.
-        let Ok(rows) =
-            tokio::task::spawn_blocking(|| sessions::sweep(sessions::SWEEP_WINDOW)).await
+        // on the blocking pool rather than occupying a runtime worker. The
+        // sweeper rides along so each tick can skip what it can prove has not
+        // changed since the last one.
+        let mut owned = sweeper;
+        let Ok((returned, rows)) = tokio::task::spawn_blocking(move || {
+            let rows = owned.rows(sessions::SWEEP_WINDOW);
+            (owned, rows)
+        })
+        .await
         else {
             // The scan panicked; try again next tick rather than killing the
-            // rail and the canvas for the rest of the run.
+            // rail and the canvas for the rest of the run. Its cache went with
+            // it, so start a cold one.
+            sweeper = sessions::Sweeper::default();
             continue;
         };
+        sweeper = returned;
 
         if ui_tx.send(UiEvent::Sessions(rows.clone())).await.is_err() {
             return;
