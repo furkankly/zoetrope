@@ -744,7 +744,13 @@ impl Index {
         let head_hash = u64_at(16);
         let head_len = u64_at(24);
         let count = u64_at(32) as usize;
-        if bytes.len() < HEADER_SIZE + count * REC_SIZE {
+        // A corrupt header can name any count at all. Computing the size it
+        // implies must not wrap — a wrapped total compares small, passes the
+        // guard, and the decode below then reads past the end.
+        let needed = count
+            .checked_mul(REC_SIZE)
+            .and_then(|n| n.checked_add(HEADER_SIZE))?;
+        if bytes.len() < needed {
             return None;
         }
         let recs = (0..count)
