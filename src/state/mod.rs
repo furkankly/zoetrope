@@ -1635,6 +1635,8 @@ mod tests {
         );
     }
 
+    // Drives `handler::process_flow_events`, which is native-only.
+    #[cfg(feature = "native")]
     #[test]
     fn user_pan_cancels_glide() {
         let mut app = App::new("s".into(), Mode::Live);

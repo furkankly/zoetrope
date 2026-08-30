@@ -123,3 +123,5 @@ harness = false
 [[bench]]
 name = "index"
 harness = false
+# Benches the native-only skeleton index and discovery sweep.
+required-features = ["native"]

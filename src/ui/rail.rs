@@ -297,6 +297,8 @@ mod tests {
         assert!(app.rail_area.is_none());
     }
 
+    // Drives the key/mouse handler, which is native-only.
+    #[cfg(feature = "native")]
     #[test]
     fn keys_and_clicks_queue_a_session_switch() {
         use crossterm::event::{
