@@ -640,6 +640,13 @@ impl App {
                 generation,
                 model: self.session.clone(),
             });
+            // This rung folds the prefix as it stands NOW, so every re-sort
+            // recorded so far is already baked into it — including the ones
+            // that predate the whole ladder (a replay load moves every index).
+            // Leaving them pending would make the next prune apply them to
+            // rungs they cannot possibly invalidate, and the ladder would
+            // collapse to a single rung on the first out-of-order batch.
+            self.timeline.take_disturbance();
         }
     }
 
@@ -654,16 +661,27 @@ impl App {
         self.maybe_snapshot(self.timeline.folded, generation);
     }
 
-    /// Discard every rung if the item list has been re-sorted or replaced since
-    /// they were taken. Generation is monotonic, so one stale rung means all of
-    /// them are stale.
+    /// Reconcile the ladder with a re-sorted or replaced item list.
+    ///
+    /// A rung describes `items[0..folded]`, so it survives exactly as long as
+    /// that prefix does. The timeline reports how much of it the re-sorts left
+    /// alone ([`Timeline::take_disturbance`]); rungs below that line are still
+    /// accurate and are re-stamped to the new generation instead of thrown
+    /// away. This is what keeps the ladder alive in a live multi-agent session,
+    /// where a sidecar entry arriving a moment out of order re-sorts the tail
+    /// on most batches — voiding the whole ladder there left every backward
+    /// seek folding from item zero, which is the case it exists for.
     fn drop_stale_rungs(&mut self, generation: u64) {
         if self
             .snapshots
             .last()
             .is_some_and(|s| s.generation != generation)
         {
-            self.snapshots.clear();
+            let stable = self.timeline.take_disturbance();
+            self.snapshots.retain(|s| s.folded <= stable);
+            for rung in &mut self.snapshots {
+                rung.generation = generation;
+            }
         }
     }
 
@@ -1729,15 +1747,13 @@ mod tests {
         );
     }
 
-    /// A re-sort moves existing items, so every rung taken before it describes
-    /// a prefix that no longer exists. They must be discarded, not restored.
-    #[test]
-    fn a_generation_bump_voids_the_ladder() {
+    /// Seed a live App with `n` dated items one second apart, folded to the
+    /// edge so the ladder has rungs.
+    fn app_with_rungs(n: usize, t0: chrono::DateTime<chrono::Utc>) -> App {
         let mut app = App::new("s".to_string(), Mode::Live);
-        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
         app.handle_ui_event(UiEvent::ReplayLoaded {
             session_id: "s".into(),
-            items: (0..SNAPSHOT_STRIDE * 2)
+            items: (0..n)
                 .map(|i| {
                     crate::tailer::ReplayItem::at(
                         Some(t0 + chrono::Duration::seconds(i as i64)),
@@ -1750,16 +1766,86 @@ mod tests {
         });
         app.go_live();
         assert!(!app.snapshots.is_empty(), "rungs were taken");
+        app
+    }
 
-        // Simulate the re-sort that `append_live` performs when a late batch
-        // dates a previously-pending item.
-        app.timeline.generation = app.timeline.generation.wrapping_add(1);
-        app.seek_to_fraction(0.25);
+    /// An undated item sorts to the HEAD, so one arriving shifts every index
+    /// after it: no rung describes its prefix any more, and all must go.
+    #[test]
+    fn an_undated_arrival_voids_the_whole_ladder() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let mut app = app_with_rungs(SNAPSHOT_STRIDE * 2, t0);
+
+        // A meta with no timestamp of its own — the `needs_dating` path.
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "s".into(),
+            updates: vec![meta_update("late")],
+        });
+        // Only a rung taken at the new edge remains; every rung describing the
+        // old prefix is gone.
+        assert!(
+            app.snapshots
+                .iter()
+                .all(|s| s.folded == app.timeline.folded),
+            "a rung describing the pre-sort prefix survived: {:?}",
+            app.snapshots.iter().map(|s| s.folded).collect::<Vec<_>>()
+        );
+    }
+
+    /// The case the ladder exists for: a live session whose sidecars land a
+    /// moment out of order. The re-sort touches only the tail, so the rungs
+    /// below it still describe their prefix exactly — voiding them wholesale
+    /// sent every backward seek back to folding from item zero.
+    #[test]
+    fn an_out_of_order_batch_keeps_the_rungs_below_it() {
+        let count = SNAPSHOT_STRIDE * 3;
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let mut app = app_with_rungs(count, t0);
+        let before = app.snapshots.len();
+        assert!(before >= 2, "expected several rungs, got {before}");
+
+        // A sidecar entry timestamped just before the edge: out of order, but
+        // it cannot disturb anything earlier than itself.
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "s".into(),
+            updates: vec![crate::tailer::Update::Entry {
+                source: crate::tailer::Source::Sub("late".into()),
+                entry: crate::transcript::parse_line(&format!(
+                    r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#,
+                    (t0 + chrono::Duration::seconds(count as i64 - 2)).to_rfc3339()
+                ))
+                .unwrap(),
+            }],
+        });
+
+        assert!(
+            app.snapshots.len() >= before - 1,
+            "the untouched prefix lost its rungs: {} -> {}",
+            before,
+            app.snapshots.len()
+        );
         assert!(
             app.snapshots
                 .iter()
                 .all(|s| s.generation == app.timeline.generation),
-            "a stale-generation rung survived the seek"
+            "a surviving rung kept a stale generation stamp"
+        );
+
+        // And a rung is only worth keeping if restoring it is still correct.
+        let target = SNAPSHOT_STRIDE + 5;
+        let total = app.timeline.items.len();
+        app.seek_to_fraction(target as f64 / total as f64);
+        let laddered = app.session.clone();
+        let landed = app.timeline.folded;
+
+        app.snapshots.clear();
+        app.seek_to_fraction(1.0);
+        app.snapshots.clear();
+        app.seek_to_fraction(target as f64 / total as f64);
+        assert_eq!(landed, app.timeline.folded, "both paths land on one item");
+        assert!(
+            laddered == app.session,
+            "a surviving rung diverged from a full rebuild"
         );
     }
 
