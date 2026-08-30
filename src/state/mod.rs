@@ -112,11 +112,10 @@ impl CameraGlide {
 /// shares structure with its neighbours instead of copying the model.
 ///
 /// Measured on the pathological bench scale (~31k items, 293 agents), halving
-/// this to 512 bought no measurable seek time but cost ~9 MB of retained
-/// rungs. That is because the fold is no longer what a backward seek spends
-/// its time on: `rebuild_to` still discards the whole `Flow` and re-projects
-/// every node, which dominates whatever the fold costs. Shrink this only once
-/// that is fixed — until then it would buy memory for nothing.
+/// this to 512 bought no measurable seek time but cost several MB of retained
+/// rungs — the fold between two rungs is not what a backward seek spends its
+/// time on. Shrink it only against a measurement that says the fold has become
+/// the cost; until then it would buy memory for nothing.
 const SNAPSHOT_STRIDE: usize = 1024;
 
 /// A folded model captured at a known point on the timeline.

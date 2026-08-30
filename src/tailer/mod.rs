@@ -158,7 +158,8 @@ pub async fn run(
 /// What to do after a live/replay session loop returns.
 #[cfg(feature = "native")]
 pub(crate) enum Flow {
-    /// Switch to a new file (live auto-switch or a `Watch` request).
+    /// Switch to a new file: a `Watch` request, or a re-attach after the
+    /// watched file was truncated or rotated.
     Switch(PathBuf),
     /// The request channel closed — shut down.
     Exit,

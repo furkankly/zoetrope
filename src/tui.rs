@@ -32,8 +32,8 @@ const STATUS_TICK: Duration = Duration::from_secs(1);
 pub async fn run(
     mut app: App,
     // Kept open for the whole run: the tailer treats a closed channel as
-    // "exit". Also carries session switches from the rail — the tailer's own
-    // auto-switch remains internal to it.
+    // "exit". Also carries session switches — every one of them, since the App
+    // is the only thing that decides which session is watched.
     tail_tx: mpsc::Sender<TailRequest>,
     mut ui_rx: mpsc::Receiver<UiEvent>,
     // Publishes which session is focused, so the monitor supervisor does not
@@ -145,9 +145,9 @@ pub async fn run(
             app.pending_watch = Some(path);
         }
 
-        // The focus can change without any input — the tailer's own
-        // auto-switch moves it — so publish from the loop rather than from the
-        // key handler.
+        // The focus can change without any input — discovery naming the first
+        // session of an empty project, for one — so publish from the loop
+        // rather than from the key handler.
         if *focus_tx.borrow() != app.current_session_id {
             let _ = focus_tx.send(app.current_session_id.clone());
         }

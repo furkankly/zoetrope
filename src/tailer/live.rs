@@ -173,10 +173,10 @@ pub(crate) async fn run_live(
 
 /// The shared poll loop: every [`POLL_INTERVAL`] read appended bytes and emit a
 /// [`UiEvent::Batch`], staying responsive to switch/exit requests. Both feeders
-/// end here — live tailing after the announce, replay after the bulk hand-off —
-/// so EVERY session keeps tailing and can pick up new appends ("go live"). Auto-
-/// switch to a newer session fires only when `session.project_dir` is set (live
-/// directory targets), not for a pinned replay file.
+/// end here — live tailing after the target is resolved, replay after the bulk
+/// hand-off — so EVERY session keeps tailing and can pick up new appends ("go
+/// live"). The file is never re-targeted here; only a `Watch` request or a
+/// truncation switches it.
 pub(crate) async fn tail_loop(
     mut session: LiveSession,
     session_id: String,

@@ -155,7 +155,7 @@ fn handle_key(key: &KeyEvent, app: &mut App) -> bool {
             return false;
         }
 
-        // Session rail: show/hide, move the focus, switch layout.
+        // Session rail: show/hide, move the focus.
         KeyCode::Char('w') | KeyCode::Char('W') => {
             app.rail.toggle_visible();
             return false;

@@ -355,7 +355,7 @@ mod tests {
         click(&mut app, 1);
         assert_eq!(app.pending_watch, Some(PathBuf::from("/p/sess-b.jsonl")));
 
-        // `w` hides the rail even with two sessions; `v` cycles the layout.
+        // `w` hides the rail even with two sessions.
         let press = |app: &mut App, c: char| {
             crate::handler::handle_event(
                 &Event::Key(KeyEvent {

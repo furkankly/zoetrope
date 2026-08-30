@@ -339,17 +339,6 @@ Honest ledger of what's derived-but-imperfect, for whoever touches this next:
 - **Aggregate chip error-coloring.** A settled run shows a single aggregate
   ✓/✗; a run of N where only one call failed still reads as an error run. Cosmetic
   over-alarm, noted for a future pass.
-- **Selecting a monitored session's node does nothing.** The canvas lets you click
-  any card, but the detail panel reads the focused model, so a card in another
-  session highlights and shows nothing — with no affordance saying why. Either
-  selecting it should focus that session, or the panel should render a read-only
-  summary from the monitored model.
-- **`MonitorBatch`/`MonitorReset` encode a routing decision the App already makes.**
-  "Is this the focused session" is exactly `is_current(session_id)`; carrying it in
-  the wire protocol as parallel variants means every future per-session event faces
-  the same fork. It already bit once: a monitor's `Error` is dropped, because there
-  is no `MonitorError`. The deeper fix is one tailer owning every session, which
-  also removes a poll loop and two relay tasks per monitored session.
 - **The monitor fleet is capped silently.** Past `MAX_MONITORED` a live session is
   simply not drawn, and nothing on screen says so.
 

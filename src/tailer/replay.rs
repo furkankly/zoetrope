@@ -64,11 +64,10 @@ pub(crate) async fn run_replay(
         return Flow::Exit;
     }
 
-    // Keep tailing the SAME file for appends. Resolve to (dir, file); a replay
-    // target is a concrete file, so disable newer-session auto-switch (you asked
-    // for this file) by clearing project_dir. Tail offsets are seeded from the
-    // byte positions the bulk parse actually consumed — NOT the current EOF —
-    // so lines appended while the bulk parse ran are emitted, not skipped.
+    // Keep tailing the SAME file for appends — a tailer only ever watches the
+    // file it was given. Tail offsets are seeded from the byte positions the
+    // bulk parse actually consumed — NOT the current EOF — so lines appended
+    // while the bulk parse ran are emitted, not skipped.
     let Some((_, main_path)) = resolve_live_target(path) else {
         // Unreadable target: nothing to tail, just wait for a switch/exit.
         return match req_rx.recv().await {

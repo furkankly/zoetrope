@@ -62,11 +62,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // the detail panel splits what remains — the rail is workspace-level
     // furniture, the panel is about the selected agent inside one session.
     let now = chrono::Utc::now();
-    // NOT gated on `rail.layout()`: the forest renderer does not exist yet, so
-    // letting the layout choice hide the rail meant three concurrent sessions
-    // silently removed it — and `w` then looked broken, because the auto-switch
-    // was overriding it. The rail hides only when the user says so or the
-    // terminal is too narrow to hold it and a usable canvas.
+    // The rail hides only when the user says so, or the terminal is too narrow
+    // to hold it and a usable canvas. Nothing else may take it away: an earlier
+    // version let a layout mode hide it, and `w` then looked broken because
+    // something invisible kept overriding the user's choice.
     let show_rail = app.rail.should_show() && canvas_area.width > rail::RAIL_WIDTH * 2;
     let canvas_area = if show_rail {
         let [rail_area, rest] =
