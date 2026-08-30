@@ -1026,6 +1026,23 @@ impl App {
             // layout stays user-driven (no auto-relayout — see `resync`).
             graph::sync(&mut self.flow, &self.session, false);
         }
+
+        // The monitored sessions share the canvas and their liveness is just as
+        // time-derived, but nothing else ticks them: a quiet one produces no
+        // batches, and `fold_other` only runs when one arrives. Without this
+        // their cards stay green until the supervisor drops the monitor and the
+        // whole subtree vanishes, instead of settling to done.
+        let App { others, flow, .. } = self;
+        let live = chrono::Utc::now();
+        let mut structural = false;
+        for model in others.values_mut() {
+            structural |= Self::project(flow, model, live);
+        }
+        if structural {
+            self.layout_dirty = true;
+            graph::repack_if_overlapping(&mut self.flow);
+        }
+
         if self.camera == Camera::Follow {
             self.track_activity();
         }
@@ -1744,6 +1761,42 @@ mod tests {
         assert!(
             laddered.session == plain.session,
             "ladder restore diverged from a full rebuild"
+        );
+    }
+
+    /// Monitored sessions share the canvas, and their liveness is time-derived
+    /// like the focused one's — but they produce no batches once quiet, so the
+    /// periodic tick is the only thing that can settle them.
+    #[test]
+    fn the_status_tick_settles_monitored_sessions_too() {
+        use crate::state::session::{AgentStatus, MAIN_ID};
+
+        let mut app = App::new("focused".to_string(), Mode::Live);
+
+        // A session whose last entry is long past the idle threshold, but whose
+        // main agent is still marked running — the state a session lands in when
+        // it goes quiet between two monitor batches.
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let mut model = SessionModel::new("other".to_string());
+        model.apply_update(&Update::Entry {
+            source: crate::tailer::Source::Main,
+            entry: crate::transcript::parse_line(&format!(
+                r#"{{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                stale.to_rfc3339()
+            ))
+            .unwrap(),
+        });
+        model.agents.get_mut(MAIN_ID).unwrap().status = AgentStatus::Running;
+        app.others.insert("other".to_string(), model);
+
+        let running =
+            |app: &App| app.others["other"].agent(MAIN_ID).unwrap().status == AgentStatus::Running;
+        assert!(running(&app));
+
+        app.status_tick();
+        assert!(
+            !running(&app),
+            "a quiet monitored session must settle on the tick, not linger green"
         );
     }
 
