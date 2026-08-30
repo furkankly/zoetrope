@@ -33,7 +33,7 @@ use rataflow::Palette;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Modifier, Style};
 
-use crate::state::graph::AgentFlow;
+use crate::state::graph::{self, AgentFlow};
 use crate::state::session::{SessionModel, ToolState};
 
 /// How long a successful chip stays visible AFTER completion. Pending chips
@@ -363,7 +363,10 @@ pub fn render(
         if chip.afterglow.is_some() && age >= ttl(state) {
             continue;
         }
-        let Some((left, _, right, bottom)) = flow.node_terminal_rect(&chip.agent_id) else {
+        // Canvas node ids are session-scoped; a chip carries the model-local
+        // agent id, so qualify it before anchoring.
+        let nid = graph::node_id(&model.session_id, &chip.agent_id);
+        let Some((left, _, right, bottom)) = flow.node_terminal_rect(&nid) else {
             continue;
         };
         // Zoomed far out, a full-size chip dwarfs its card — skip rather than
@@ -443,6 +446,63 @@ mod tests {
     use super::*;
     use crate::state::session::SessionModel;
     use crate::transcript::SubagentMeta;
+
+    /// The overlay anchors on the CANVAS, whose node ids are session-scoped
+    /// (`<session>/<agent>`), while a chip carries the model-local agent id.
+    /// Bridging the two is load-bearing: when it was missing, every anchor
+    /// missed and the entire chip overlay silently stopped rendering — with
+    /// the rest of the suite still green, because nothing drove a chip through
+    /// a real flow.
+    #[test]
+    fn a_chip_reaches_the_screen_over_its_agents_card() {
+        use crate::state::{App, Mode};
+        use crate::tailer::{Source, UiEvent, Update};
+
+        let mut app = App::new("s1".to_string(), Mode::Live);
+        // The first live batch is backfill and seeds silently, so the chip has
+        // to arrive on a later one to animate at all.
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "s1".to_string(),
+            updates: vec![Update::Entry {
+                source: Source::Main,
+                entry: crate::transcript::parse_line(
+                    r#"{"type":"user","uuid":"u0","parentUuid":null,"timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"go"}}"#,
+                )
+                .unwrap(),
+            }],
+        });
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "s1".to_string(),
+            updates: vec![Update::Entry {
+                source: Source::Main,
+                entry: crate::transcript::parse_line(
+                    r#"{"type":"assistant","uuid":"u1","parentUuid":"u0","timestamp":"2026-06-05T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{}}]}}"#,
+                )
+                .unwrap(),
+            }],
+        });
+        // Chips animate on the frame tick, not on the batch.
+        app.tick_timeline(std::time::Duration::from_millis(16));
+        assert!(!app.chips.chips.is_empty(), "fixture produced no chip");
+
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The chip body, not the card's own "\u{2692} N tools" row.
+        assert!(
+            out.contains("\u{2692} Bash"),
+            "chip overlay never anchored: {out:?}"
+        );
+    }
 
     /// A model with one subagent carrying `n` tool calls.
     fn model_with_tools(n: usize) -> SessionModel {
