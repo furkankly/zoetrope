@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn the_fallback_label_is_lossy_by_construction() {
-        assert_eq!(project_label("-home-elwardi-repo-zoetrope"), "zoetrope");
+        assert_eq!(project_label("-home-u-repo-zoetrope"), "zoetrope");
         // Documented loss: the sanitizer flattened `parametric_pump`, and no
         // rule recovers it from the string. This is why `cwd` is preferred.
         assert_eq!(project_label("-home-u-repo-parametric-pump"), "pump");
