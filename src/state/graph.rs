@@ -9,7 +9,7 @@
 use rataflow::{Edge, Flow, Handle, HandlePosition, Node, Reconnectable, Sugiyama, Theme};
 use ratatui::style::Color;
 
-use super::session::{AgentInfo, AgentKind, AgentStatus, SessionModel};
+use super::session::{AgentInfo, AgentKind, AgentStatus, MAIN_ID, SessionModel};
 use crate::ui::edges::AgentEdge;
 use crate::ui::nodes::{AgentNode, MAIN_NODE_DIMS, SUB_NODE_DIMS};
 
@@ -186,22 +186,29 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
             // Local placement: below the parent, fanned past prior siblings.
             // Overwritten by Sugiyama when `relayout` runs; kept verbatim in
             // Manual so existing nodes never move underneath the user.
-            let pos = info
+            // Only `main` is a session root. An agent whose `parent` is still
+            // unset is an ORPHAN — its transcript folded before its meta — so
+            // it hangs off its own session's root instead. Parking it at
+            // `next_root_x` like a root would strand it past everything on the
+            // canvas, and `session_boxes` would then stretch its session's box
+            // across the whole width and shove every other tree aside.
+            let anchor = info
                 .parent
                 .as_deref()
+                .or_else(|| (id != MAIN_ID).then_some(MAIN_ID))
                 .map(|p| node_id(&model.session_id, p))
-                .and_then(|p| flow.node(&p))
+                .and_then(|p| flow.node(&p));
+            let pos = anchor
                 .map(|parent| {
                     (
                         parent.position.x + siblings as f64 * (w + LOCAL_H_GAP),
                         parent.position.y + parent.height + LOCAL_V_GAP,
                     )
                 })
-                // A parentless node is a session root. Layout is never
-                // automatic here (see `resync`), so a root cannot wait for a
-                // Sugiyama pass to be placed — at the origin it would land on
-                // top of the first session's root until the user pressed `r`.
-                // Park it clear of everything already on the canvas instead.
+                // A real root. Layout is never automatic here (see `resync`),
+                // so it cannot wait for a Sugiyama pass to be placed — at the
+                // origin it would land on top of the first session's root
+                // until the user pressed `r`. Park it clear of the canvas.
                 .unwrap_or_else(|| (next_root_x(flow), 0.0));
             // Read-only monitor: nodes are selectable (detail panel) and
             // draggable (manual arrangement) — but never deletable and never
@@ -571,6 +578,43 @@ mod tests {
         let mut m = SessionModel::new(S.into());
         m.apply_meta("abc123", None, &meta());
         m
+    }
+
+    /// An agent whose meta hasn't folded yet has no `parent`, but it is NOT a
+    /// session root: parked like one it lands past every other session's tree,
+    /// and its own session's box then spans the canvas and displaces the rest.
+    #[test]
+    fn a_parentless_subagent_hangs_off_its_session_root() {
+        let mut flow = new_flow();
+        sync(&mut flow, &SessionModel::new(S.into()), false);
+        // A second session claims the space to the right.
+        sync(&mut flow, &SessionModel::new("s2".into()), false);
+        let s2_right = {
+            let n = flow.node(&node_id("s2", "main")).unwrap();
+            n.position.x + n.width
+        };
+
+        let mut m = SessionModel::new(S.into());
+        m.agents
+            .insert("orph".to_string(), AgentInfo::new(AgentKind::Subagent));
+        m.spawn_order.push_back("orph".to_string());
+        sync(&mut flow, &m, false);
+
+        let root = flow.node(&n("main")).unwrap();
+        let (root_x, root_bottom) = (root.position.x, root.position.y + root.height);
+        let orphan = flow.node(&n("orph")).unwrap();
+        assert_eq!(
+            orphan.position.x, root_x,
+            "orphan left its session's column"
+        );
+        assert!(
+            orphan.position.y >= root_bottom,
+            "orphan must sit below the root"
+        );
+        assert!(
+            orphan.position.x < s2_right,
+            "orphan was parked past another session's tree"
+        );
     }
 
     /// A labelled root names its project instead of saying "claude", and the
