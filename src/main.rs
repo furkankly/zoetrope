@@ -481,6 +481,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
         unreachable!("inspect handled in main");
     };
 
+    // Set only when the project has no session yet (see the `None` arm below).
+    let mut awaiting_project: Option<std::path::PathBuf> = None;
     let (session_id, watch_target, mode, replay, speed) = match target {
         // A concrete file → bulk-load + tail. Paced from the start unless
         // `--follow` asks to ride the (possibly still-growing) edge.
@@ -520,7 +522,10 @@ async fn run_tui(cli: Cli) -> Result<()> {
                     let session_id = transcript::session_id_from_path(&main);
                     (session_id, main, Mode::Live, false, DEFAULT_REPLAY_SPEED)
                 }
-                None => (String::new(), proj, Mode::Live, false, DEFAULT_REPLAY_SPEED),
+                None => {
+                    awaiting_project = Some(proj.clone());
+                    (String::new(), proj, Mode::Live, false, DEFAULT_REPLAY_SPEED)
+                }
             }
         }
     };
@@ -550,7 +555,12 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     });
 
-    let app = App::new(session_id, mode);
+    let mut app = App::new(session_id, mode);
+    // Nothing recorded in this project yet: wait for one of ITS sessions rather
+    // than adopting the first the workspace-wide sweep happens to report.
+    if let Some(project) = awaiting_project {
+        app.await_project(project);
+    }
     tui::run(app, tail_tx, ui_rx, focus_tx).await
 }
 

@@ -238,6 +238,16 @@ pub struct App {
     /// [`pending_seek`](Self::pending_seek) and
     /// [`pending_center`](Self::pending_center).
     pub pending_watch: Option<std::path::PathBuf>,
+    /// The project directory this App was launched against, while it has no
+    /// session of its own yet.
+    ///
+    /// Launching in a project that has never been recorded leaves
+    /// [`current_session_id`](Self::current_session_id) empty until discovery
+    /// names a session. Discovery describes the WHOLE workspace, newest first,
+    /// so the first row it reports usually belongs to some other project —
+    /// adopting it would silently show the user a session they did not ask for.
+    /// Cleared as soon as a session is adopted.
+    awaiting_project: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -273,6 +283,7 @@ impl App {
             rail: Default::default(),
             snapshots: Vec::new(),
             pending_watch: None,
+            awaiting_project: None,
         }
     }
 
@@ -413,6 +424,14 @@ impl App {
         self.detail_follow = true;
         self.layout_dirty = false;
         self.pending_watch = Some(path);
+    }
+
+    /// Wait for a session to appear in `project` rather than adopting whatever
+    /// discovery reports first. Only meaningful before any session is watched.
+    pub fn await_project(&mut self, project: std::path::PathBuf) {
+        if self.current_session_id.is_empty() {
+            self.awaiting_project = Some(project);
+        }
     }
 
     /// Focus the session a just-selected node belongs to, if it is not already
@@ -577,13 +596,19 @@ impl App {
                 // Not gated on `is_current`: a sweep describes the whole
                 // workspace, not one session, so it is never stale for the
                 // watched one.
-                // Launched on a project with no session yet: adopt the first
-                // one discovery names, so the tailer gets a concrete file and
-                // the canvas has something to show.
+                // Launched on a project with no session yet: adopt the newest
+                // session OF THAT PROJECT once one appears, so the tailer gets
+                // a concrete file and the canvas has something to show. Rows
+                // are workspace-wide and newest-first, so without the project
+                // filter this adopts an unrelated project's session.
                 if self.current_session_id.is_empty()
-                    && let Some(first) = rows.first()
+                    && let Some(project) = self.awaiting_project.clone()
+                    && let Some(row) = rows
+                        .iter()
+                        .find(|r| r.main_path.parent() == Some(project.as_path()))
                 {
-                    let path = first.main_path.clone();
+                    let path = row.main_path.clone();
+                    self.awaiting_project = None;
                     self.watch_session(path);
                 }
                 self.apply_session_labels(&rows);
@@ -1816,6 +1841,43 @@ mod tests {
 
         app.seek_to_fraction(0.25);
         assert_eq!(app.session.label.as_deref(), Some("zoetrope"));
+    }
+
+    /// Launching in a project with nothing recorded must not adopt another
+    /// project's session — discovery is workspace-wide and newest-first, so the
+    /// first row it reports is usually somebody else's work.
+    #[test]
+    fn an_empty_project_waits_for_its_own_session() {
+        use crate::state::rail::RailRow;
+        let n = chrono::Utc::now();
+        let row = |project: &str, id: &str| RailRow {
+            session_id: id.to_string(),
+            project: project.to_string(),
+            main_path: std::path::PathBuf::from(format!("/projects/{project}/{id}.jsonl")),
+            agents: 1,
+            failures: 0,
+            last_activity: Some(n),
+            sidecar_active: false,
+        };
+
+        let mut app = App::new(String::new(), Mode::Live);
+        app.await_project(std::path::PathBuf::from("/projects/mine"));
+
+        // A sweep that only knows about another project changes nothing.
+        app.handle_ui_event(UiEvent::Sessions(vec![row("theirs", "other")]));
+        assert_eq!(app.current_session_id, "");
+        assert_eq!(app.pending_watch, None);
+
+        // Once one of ours appears — still not the newest row — we take it.
+        app.handle_ui_event(UiEvent::Sessions(vec![
+            row("theirs", "other"),
+            row("mine", "ours"),
+        ]));
+        assert_eq!(app.current_session_id, "ours");
+        assert_eq!(
+            app.pending_watch,
+            Some(std::path::PathBuf::from("/projects/mine/ours.jsonl"))
+        );
     }
 
     /// Seed a live App with `n` dated items one second apart, folded to the
