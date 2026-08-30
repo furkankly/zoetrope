@@ -827,6 +827,11 @@ impl App {
 
         // Keep the model we are replacing, to work out what left the canvas.
         let previous = std::mem::replace(&mut self.session, model);
+        // The label comes from the discovery sweep, not from folding, so a rung
+        // taken before the sweep carries a stale one. Restoring it would rename
+        // the root card back to "claude" on every backward seek until the next
+        // sweep happened to notice.
+        self.session.label = previous.label.clone();
         // Re-folding also rebuilds the ladder above `start`, so a scrub that
         // walks backward repeatedly keeps finding rungs near where it lands.
         self.fold_range(start, target);
@@ -1798,6 +1803,19 @@ mod tests {
             !running(&app),
             "a quiet monitored session must settle on the tick, not linger green"
         );
+    }
+
+    /// The project label is sweep-supplied, not folded, so a rung taken before
+    /// the sweep must not carry an old one back onto the root card.
+    #[test]
+    fn a_backward_seek_keeps_the_session_label() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let mut app = app_with_rungs(SNAPSHOT_STRIDE * 2, t0);
+        // The sweep names the project only after the rungs were taken.
+        app.session.label = Some("zoetrope".to_string());
+
+        app.seek_to_fraction(0.25);
+        assert_eq!(app.session.label.as_deref(), Some("zoetrope"));
     }
 
     /// Seed a live App with `n` dated items one second apart, folded to the
