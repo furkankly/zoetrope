@@ -27,14 +27,16 @@ pub type AgentFlow = Flow<AgentNode, AgentEdge>;
 pub const ID_SEP: char = '/';
 
 /// The `Flow` node id for `agent` within `session`.
+///
+/// Only the session half has to avoid [`ID_SEP`] — [`split_node_id`] splits at
+/// the FIRST one, so an agent id containing it still round-trips. That matters
+/// because agent ids are read out of transcripts the tool does not own, and
+/// asserting on their content would turn a hostile file into a debug-build
+/// panic. A session id is a file stem, which cannot contain a path separator.
 pub fn node_id(session: &str, agent: &str) -> String {
-    // The round trip through `split_node_id` relies on neither half containing
-    // the separator. That holds for every id the format produces, but it was
-    // only ever stated in a comment — a differently-sourced id would corrupt
-    // the parse silently rather than fail here.
     debug_assert!(
-        !session.contains(ID_SEP) && !agent.contains(ID_SEP),
-        "node id parts must not contain {ID_SEP:?}: {session} / {agent}"
+        !session.contains(ID_SEP),
+        "session id must not contain {ID_SEP:?}: {session}"
     );
     format!("{session}{ID_SEP}{agent}")
 }
@@ -615,6 +617,14 @@ mod tests {
             orphan.position.x < s2_right,
             "orphan was parked past another session's tree"
         );
+    }
+
+    /// Agent ids come out of transcripts the tool does not own, so one holding
+    /// the separator must round-trip rather than panic a debug build.
+    #[test]
+    fn an_agent_id_containing_the_separator_still_round_trips() {
+        let id = node_id(S, "a/b");
+        assert_eq!(split_node_id(&id), Some((S, "a/b")));
     }
 
     /// A labelled root names its project instead of saying "claude", and the
