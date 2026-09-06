@@ -11,8 +11,6 @@
 //! deliberately spread so a result can be read as a trend rather than a point —
 //! see `Spec::SMALL/MEDIUM/LARGE`.
 
-#![allow(dead_code)]
-
 use serde_json::json;
 
 /// Filler text of exactly `n` bytes — JSON-safe ASCII, no escapes, so a line's
@@ -134,6 +132,9 @@ impl Session {
     }
 
     /// Total lines across every file.
+    // Each bench is its own crate and uses a different part of this module;
+    // only `memory.rs` reports line counts.
+    #[allow(dead_code)]
     pub fn lines(&self) -> usize {
         self.main.lines().count()
             + self
@@ -461,41 +462,4 @@ fn subagent_transcript(aid: &str, start: u64, spec: Spec) -> String {
         prev = r_id;
     }
     s
-}
-
-/// Write a generated session to disk in the real on-disk layout, under
-/// `project_dir`: `<uuid>.jsonl` plus `<uuid>/subagents/agent-<id>.jsonl` and
-/// `<uuid>/subagents/workflows/<wf>/…`. Returns the main transcript's path.
-///
-/// The index and discovery benches measure the filesystem path (mmap, cache
-/// sidecars, directory sweeps), so they need real files rather than strings.
-pub fn write_to_disk(s: &Session, project_dir: &std::path::Path, uuid: &str) -> std::path::PathBuf {
-    std::fs::create_dir_all(project_dir).unwrap();
-    let main = project_dir.join(format!("{uuid}.jsonl"));
-    std::fs::write(&main, &s.main).unwrap();
-
-    let subs = project_dir.join(uuid).join("subagents");
-    std::fs::create_dir_all(&subs).unwrap();
-    for sc in &s.sidecars {
-        let dir = match &sc.workflow {
-            Some(wf) => subs.join("workflows").join(wf),
-            None => subs.clone(),
-        };
-        std::fs::create_dir_all(&dir).unwrap();
-        if sc.journal {
-            std::fs::write(dir.join("journal.jsonl"), &sc.transcript).unwrap();
-            continue;
-        }
-        std::fs::write(
-            dir.join(format!("agent-{}.jsonl", sc.agent_id)),
-            &sc.transcript,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join(format!("agent-{}.meta.json", sc.agent_id)),
-            &sc.meta,
-        )
-        .unwrap();
-    }
-    main
 }
