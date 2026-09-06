@@ -96,14 +96,16 @@ fn group_state(
     count: usize,
 ) -> Option<ToolState> {
     let tool_calls = &model.agent(agent_id)?.tool_calls;
-    // `tool_calls` is a persistent `Vector`, which has no slicing by shared
-    // reference (its `slice` splits the vector in place), so walk the window
-    // instead. Out-of-range is still `None`, matching the previous
-    // `get(range)?` — a truncated run means the model was rebuilt underneath us.
+    // Out-of-range is `None`, matching the previous `get(range)?` — a truncated
+    // run means the model was rebuilt underneath us.
     if count == 0 || start + count > tool_calls.len() {
         return None;
     }
-    let calls = || tool_calls.iter().skip(start).take(count);
+    // `Vector::slice` splits in place and needs ownership, and `skip(start)` on
+    // the iterator walks every element it discards — O(start) per chip, per
+    // frame. A focus seeks the range in O(log n) instead.
+    let focus = tool_calls.focus();
+    let calls = || focus.clone().narrow(start..start + count).into_iter();
     if calls().any(|c| c.state == ToolState::Pending) {
         Some(ToolState::Pending)
     } else if calls().any(|c| c.state == ToolState::Err) {
@@ -230,12 +232,12 @@ impl ChipTray {
                     i += 1;
                 }
                 let count = i - start;
-                // Window-walk rather than slice: `calls` is a persistent
-                // `Vector` and cannot be sliced through a shared reference.
+                // Ranged, not `skip(start)`: the latter walks every element
+                // it discards, once per run, on every frame.
                 let settled = !calls
-                    .iter()
-                    .skip(start)
-                    .take(count)
+                    .focus()
+                    .narrow(start..start + count)
+                    .into_iter()
                     .any(|c| c.state == ToolState::Pending);
                 let prev = prior.get(&(id.clone(), start)).copied();
 
