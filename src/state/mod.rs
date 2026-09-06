@@ -374,16 +374,36 @@ impl App {
                 // moves the cursor.
                 let following = self.timeline.following();
                 if following {
-                    // The model is order-independent, so apply the new updates
-                    // DIRECTLY (their position in the now-ts-sorted `items` is
-                    // irrelevant) — out-of-order live arrivals never force a
-                    // rebuild. Then mark the whole stream folded.
-                    let mut structural = false;
-                    for update in &activity {
-                        structural |= self.session.apply_update(update);
-                    }
-                    self.timeline.append_live(activity);
-                    self.timeline.folded = self.timeline.items.len();
+                    // Attach: nothing is folded yet, so the whole backfill
+                    // arrives as one batch. Fold it BY INDEX, which walks the
+                    // sorted prefix and leaves a rung every stride — the direct
+                    // apply below jumps `folded` straight to the edge, so the
+                    // only rung it can ever take sits at the edge, and the very
+                    // first backward seek would fold from item zero.
+                    //
+                    // Safe only here: an incremental batch can re-sort an item
+                    // in BELOW `folded`, which an index fold from `folded` would
+                    // skip. At zero there is no prefix to skip.
+                    let structural = if self.timeline.folded == 0 {
+                        self.timeline.append_live(activity);
+                        let to = self.timeline.items.len();
+                        let structural = self.fold_range(0, to);
+                        self.timeline.folded = to;
+                        structural
+                    } else {
+                        // The model is order-independent, so apply the new
+                        // updates DIRECTLY (their position in the now-ts-sorted
+                        // `items` is irrelevant) — out-of-order live arrivals
+                        // never force a rebuild. Then mark the whole stream
+                        // folded.
+                        let mut structural = false;
+                        for update in &activity {
+                            structural |= self.session.apply_update(update);
+                        }
+                        self.timeline.append_live(activity);
+                        self.timeline.folded = self.timeline.items.len();
+                        structural
+                    };
                     self.note_fold();
                     self.commit_fold(structural);
                 } else {
@@ -499,17 +519,27 @@ impl App {
         self.maybe_snapshot(self.timeline.folded, generation);
     }
 
-    /// Push a rung if `folded` is a full stride past the last one.
+    /// Push a rung if `folded` is a full stride past the nearest rung below it.
     ///
     /// Shared by both fold paths so the cadence cannot drift between them.
+    ///
+    /// Measured against the nearest rung at or below `folded`, not the last one
+    /// in the vec: with a rung already at the live edge, comparing against the
+    /// last would refuse every rung beneath it, so a fold that walks the early
+    /// timeline could never leave a ladder behind and each backward seek would
+    /// re-fold from zero.
     fn maybe_snapshot(&mut self, folded: usize, generation: u64) {
-        let last = self.snapshots.last().map_or(0, |s| s.folded);
-        if folded >= last + SNAPSHOT_STRIDE {
-            self.snapshots.push(Snapshot {
-                folded,
-                generation,
-                model: self.session.clone(),
-            });
+        let at = self.snapshots.partition_point(|s| s.folded <= folded);
+        let below = at.checked_sub(1).map_or(0, |i| self.snapshots[i].folded);
+        if folded >= below + SNAPSHOT_STRIDE {
+            self.snapshots.insert(
+                at,
+                Snapshot {
+                    folded,
+                    generation,
+                    model: self.session.clone(),
+                },
+            );
             // This rung folds the prefix as it stands NOW, so every re-sort
             // recorded so far is already baked into it — including the ones
             // that predate the whole ladder (a replay load moves every index).
@@ -1174,6 +1204,40 @@ mod tests {
         );
         assert_eq!(app.camera, Camera::Manual);
         assert!(app.camera_glide.is_none(), "user pan must cancel the glide");
+    }
+
+    /// A live attach ships the whole backfill as ONE batch, which is the case
+    /// the ladder is least able to help with and most needs to: the live path
+    /// applies updates directly and jumps `folded` to the edge, so the only
+    /// rung ever taken sits AT the edge — and a backward seek finds nothing at
+    /// or before its target and folds from item zero, exactly as if there were
+    /// no ladder at all.
+    #[test]
+    fn a_live_attach_leaves_a_usable_ladder() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let n = SNAPSHOT_STRIDE * 3;
+        let mut app = App::new("s".to_string(), Mode::Live);
+        app.handle_ui_event(UiEvent::Batch {
+            session_id: "s".into(),
+            updates: (0..n)
+                .map(|i| {
+                    crate::tailer::Update::Entry {
+                        source: crate::tailer::Source::Main,
+                        entry: crate::transcript::parse_line(&format!(
+                            r#"{{"type":"user","uuid":"u{i}","parentUuid":null,"timestamp":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                            (t0 + chrono::Duration::seconds(i as i64)).to_rfc3339()
+                        ))
+                        .unwrap(),
+                    }
+                })
+                .collect(),
+        });
+        assert_eq!(app.timeline.folded, n, "the backfill folded to the edge");
+        assert!(
+            app.snapshots.iter().any(|s| s.folded <= n / 2),
+            "no rung at or before mid-timeline: {:?}",
+            app.snapshots.iter().map(|s| s.folded).collect::<Vec<_>>()
+        );
     }
 
     /// The ladder is only allowed to be FASTER. Restoring a rung and folding
