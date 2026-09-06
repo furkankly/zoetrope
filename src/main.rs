@@ -270,7 +270,7 @@ fn read_session_info(main_path: &Path) -> zoetrope::state::SessionInfo {
 
 /// Recursively print agents whose `parent` equals `parent`, in spawn order.
 fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
-    for id in &model.spawn_order {
+    for id in model.spawn_order() {
         let Some(agent) = model.agent(id) else {
             continue;
         };
@@ -298,7 +298,7 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
         let mut ok = 0u32;
         let mut err = 0u32;
         let mut pending = 0u32;
-        for t in &agent.tool_calls {
+        for t in agent.tool_calls() {
             match t.state {
                 ToolState::Ok => ok += 1,
                 ToolState::Err => err += 1,
@@ -317,7 +317,7 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
         }
         println!(
             "{indent}    tools: {} ({ok}✓ {err}✗ {pending}⏳)   tokens: {}",
-            agent.tool_calls.len(),
+            agent.tool_calls().len(),
             agent.output_tokens
         );
 

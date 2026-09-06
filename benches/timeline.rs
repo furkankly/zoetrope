@@ -104,7 +104,7 @@ fn bench_load(c: &mut Criterion) {
                     for it in &items {
                         m.apply_update(&it.update);
                     }
-                    black_box(m.agents.len())
+                    black_box(m.agent_count())
                 },
                 BatchSize::LargeInput,
             )

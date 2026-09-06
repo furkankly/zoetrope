@@ -33,9 +33,9 @@ const INTERACTIVE_IDLE_SECS: i64 = 120;
 pub struct SessionModel {
     pub session_id: String,
     /// Agents keyed by stable node id (`"main"`, `agentId`, or `wf-id`).
-    pub agents: OrdMap<String, AgentInfo>,
+    pub(crate) agents: OrdMap<String, AgentInfo>,
     /// Stable spawn order of node ids (insertion order). Drives layout/nav.
-    pub spawn_order: Vector<String>,
+    pub(crate) spawn_order: Vector<String>,
     /// Most recent activity timestamp seen across all files.
     pub last_activity: Option<DateTime<Utc>>,
     /// `runId → (workflowName, summary)` from main-transcript workflow launches,
@@ -69,7 +69,7 @@ pub struct SessionModel {
     /// Every plain user prompt in the main transcript, in order — the
     /// session's spine. Tool calls and spawns attribute to a prompt era via
     /// [`Self::prompt_for_ts`] (timestamp-derived, order-independent).
-    pub prompts: Vector<PromptInfo>,
+    pub(crate) prompts: Vector<PromptInfo>,
     /// Excerpt of the most recent assistant text in the main transcript.
     /// One logical turn spans several JSONL lines, so the reasoning for a
     /// spawn usually lives on an EARLIER line than the tool_use — this is the
@@ -250,7 +250,7 @@ pub struct AgentInfo {
     pub(crate) terminal: bool,
     pub model: Option<String>,
     /// Tool calls in observed order.
-    pub tool_calls: Vector<ToolCallInfo>,
+    pub(crate) tool_calls: Vector<ToolCallInfo>,
     /// tool_use id → index into `tool_calls`, so the per-entry dedup check and
     /// per-result completion are O(1) instead of scanning every prior call
     /// (which made folding a tool-heavy agent quadratic).
@@ -269,6 +269,12 @@ pub struct AgentInfo {
 }
 
 impl AgentInfo {
+    /// This agent's tool calls, oldest first. See
+    /// [`SessionModel::spawn_order`] for why this is an iterator.
+    pub fn tool_calls(&self) -> impl ExactSizeIterator<Item = &ToolCallInfo> {
+        self.tool_calls.iter()
+    }
+
     /// A fresh agent record of the given kind, defaulting to
     /// [`AgentStatus::Running`] with no activity yet.
     pub(crate) fn new(kind: AgentKind) -> Self {
@@ -981,6 +987,15 @@ impl SessionModel {
     /// Total tool calls across all agents.
     pub fn tool_count(&self) -> usize {
         self.agents.values().map(|a| a.tool_calls.len()).sum()
+    }
+
+    /// Agent ids in spawn order.
+    ///
+    /// An iterator rather than the collection itself: the backing store is an
+    /// `imbl` persistent type, which is an implementation detail of the fold
+    /// rather than something the published API should pin down.
+    pub fn spawn_order(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.spawn_order.iter().map(String::as_str)
     }
 
     /// Borrow an agent by node id.

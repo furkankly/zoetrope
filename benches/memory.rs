@@ -66,7 +66,7 @@ fn measure(name: &str, spec: Spec) {
         delta(after_gen, after_items),
         delta(after_items, after_app),
         delta(base, after_app),
-        app.session.agents.len(),
+        app.session.agent_count(),
         app.flow.nodes().count(),
     );
 
