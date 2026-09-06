@@ -230,23 +230,26 @@ fn edge_id(child: &str) -> String {
     format!("e-{child}")
 }
 
+/// Remove several agents from the canvas in ONE pass.
+///
+/// Bulk, not a loop of single removals: `Flow::remove_node` costs O(nodes plus
+/// edges) every time — it shifts every lookup index and rebuilds the edge
+/// lookup per call — so removing k of them is quadratic. `retain_nodes` makes a
+/// single pass over each vec and drops the connected edges itself.
+pub fn remove_agents(flow: &mut AgentFlow, agents: &[String]) {
+    if agents.is_empty() {
+        return;
+    }
+    let doomed: std::collections::HashSet<&str> = agents.iter().map(String::as_str).collect();
+    flow.retain_nodes(|n| !doomed.contains(n.id.as_str()));
+}
+
 /// Apply the Sugiyama vertical layout to `flow`.
 ///
 /// Split out so it can be called explicitly and unit-tested independently of
 /// the per-agent diffing in [`sync`].
 pub fn relayout(flow: &mut AgentFlow) {
     flow.apply_layout(Sugiyama::vertical());
-}
-
-/// Restore saved positions onto whichever nodes still exist (used after a
-/// backward-seek rebuild to carry the user's manual arrangement across — and to
-/// avoid a layout jump, since a rebuilt subset would otherwise re-place from
-/// scratch). Nodes absent from `positions` keep their fresh local placement.
-pub fn restore_positions(
-    flow: &mut AgentFlow,
-    positions: &std::collections::HashMap<String, (f64, f64)>,
-) {
-    flow.set_node_positions(positions.iter().map(|(id, &pos)| (id, pos)));
 }
 
 #[cfg(test)]

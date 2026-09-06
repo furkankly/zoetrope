@@ -95,16 +95,20 @@ fn group_state(
     start: usize,
     count: usize,
 ) -> Option<ToolState> {
-    let calls = model
-        .agent(agent_id)?
-        .tool_calls
-        .get(start..start + count)?;
-    if calls.is_empty() {
+    let tool_calls = &model.agent(agent_id)?.tool_calls;
+    // Out-of-range is `None`, matching the previous `get(range)?` — a truncated
+    // run means the model was rebuilt underneath us.
+    if count == 0 || start + count > tool_calls.len() {
         return None;
     }
-    if calls.iter().any(|c| c.state == ToolState::Pending) {
+    // `Vector::slice` splits in place and needs ownership, and `skip(start)` on
+    // the iterator walks every element it discards — O(start) per chip, per
+    // frame. A focus seeks the range in O(log n) instead.
+    let focus = tool_calls.focus();
+    let calls = || focus.clone().narrow(start..start + count).into_iter();
+    if calls().any(|c| c.state == ToolState::Pending) {
         Some(ToolState::Pending)
-    } else if calls.iter().any(|c| c.state == ToolState::Err) {
+    } else if calls().any(|c| c.state == ToolState::Err) {
         Some(ToolState::Err)
     } else {
         Some(ToolState::Ok)
@@ -228,8 +232,12 @@ impl ChipTray {
                     i += 1;
                 }
                 let count = i - start;
-                let settled = !calls[start..i]
-                    .iter()
+                // Ranged, not `skip(start)`: the latter walks every element
+                // it discards, once per run, on every frame.
+                let settled = !calls
+                    .focus()
+                    .narrow(start..start + count)
+                    .into_iter()
                     .any(|c| c.state == ToolState::Pending);
                 let prev = prior.get(&(id.clone(), start)).copied();
 
@@ -450,14 +458,16 @@ mod tests {
         m.apply_meta("sub1", None, &meta);
         let agent = m.agents.get_mut("sub1").unwrap();
         for i in 0..n {
-            agent.tool_calls.push(crate::state::session::ToolCallInfo {
-                id: format!("toolu_{i}"),
-                name: "Bash".into(),
-                summary: None,
-                ts: None,
-                end_ts: None,
-                state: ToolState::Pending,
-            });
+            agent
+                .tool_calls
+                .push_back(crate::state::session::ToolCallInfo {
+                    id: format!("toolu_{i}"),
+                    name: "Bash".into(),
+                    summary: None,
+                    ts: None,
+                    end_ts: None,
+                    state: ToolState::Pending,
+                });
         }
         m
     }
@@ -475,14 +485,16 @@ mod tests {
         m.apply_meta("sub1", None, &meta);
         let agent = m.agents.get_mut("sub1").unwrap();
         for (i, name) in names.iter().enumerate() {
-            agent.tool_calls.push(crate::state::session::ToolCallInfo {
-                id: format!("toolu_{i}"),
-                name: (*name).into(),
-                summary: None,
-                ts: None,
-                end_ts: None,
-                state: ToolState::Pending,
-            });
+            agent
+                .tool_calls
+                .push_back(crate::state::session::ToolCallInfo {
+                    id: format!("toolu_{i}"),
+                    name: (*name).into(),
+                    summary: None,
+                    ts: None,
+                    end_ts: None,
+                    state: ToolState::Pending,
+                });
         }
         m
     }

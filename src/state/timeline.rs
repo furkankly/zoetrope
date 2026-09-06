@@ -76,6 +76,28 @@ pub struct Timeline {
     /// must re-run dating. Lets `append_live` skip the full date-and-sort for
     /// the common in-order, fully-timed batch.
     undated_agents: HashSet<String>,
+    /// Bumped whenever an item's INDEX may have changed meaning: a bulk
+    /// replay load, or a re-sort that moved already-present items.
+    ///
+    /// Anything that caches a result keyed by item index — the snapshot ladder
+    /// in particular — records the generation it was built under and must
+    /// discard itself when this moves. Without it a snapshot of `items[0..N]`
+    /// silently describes a different prefix after a late batch dates a
+    /// previously-pending item and the whole list re-sorts around it.
+    pub generation: u64,
+    /// How many leading items every generation bump since the last
+    /// [`take_disturbance`](Self::take_disturbance) is known to have left
+    /// alone.
+    ///
+    /// A re-sort is rarely a reshuffle: a late subagent entry inserts among the
+    /// newest items and leaves the long prefix before it exactly where it was.
+    /// `generation` alone cannot say that, so a cache keyed by index would have
+    /// to discard itself wholesale on every out-of-order batch — which, once a
+    /// subagent is writing, is most batches. This is the part that is provably
+    /// still valid; it accumulates as a MINIMUM so a consumer that misses a bump
+    /// (the App only reconciles while following the edge) still sees the worst
+    /// case rather than the last one.
+    stable_prefix: usize,
     /// Skip inactivity: compress dead-air gaps during paced playback (see
     /// `compress_gap`). On by default (review-friendly); toggle off for
     /// faithful real-time pacing. Presentation-only — never affects content.
@@ -137,6 +159,8 @@ impl Timeline {
             gap_progress: 0.0,
             undated_agents: HashSet::new(),
             compress_gaps: true,
+            generation: 0,
+            stable_prefix: usize::MAX,
         }
     }
 
@@ -155,6 +179,9 @@ impl Timeline {
         self.ended = false;
         self.gap_anchor = start;
         self.gap_progress = 0.0;
+        self.generation = self.generation.wrapping_add(1);
+        // Every index means something new — nothing is stable.
+        self.stable_prefix = 0;
         self.rescan_undated();
     }
 
@@ -187,11 +214,15 @@ impl Timeline {
         let mut tail_ts = self.items.last().and_then(|i| i.ts());
         let mut in_order = true;
         let mut needs_dating = false;
+        // Earliest timestamp in this batch: where a re-sort can start moving
+        // things, and so where the untouched prefix ends.
+        let mut earliest_new: Option<DateTime<Utc>> = None;
         for update in updates {
             let item = ReplayItem::live(update);
             match item.ts() {
                 Some(ts) => {
                     self.head = Some(self.head.map_or(ts, |h| h.max(ts)));
+                    earliest_new = Some(earliest_new.map_or(ts, |e: DateTime<Utc>| e.min(ts)));
                     if tail_ts.is_some_and(|t| ts < t) {
                         in_order = false;
                     }
@@ -211,8 +242,26 @@ impl Timeline {
             self.items.push(item);
         }
         if needs_dating || !in_order {
+            // Existing items can move: an item that was `Pending` sorts ahead
+            // of every dated one and jumps into place once its date resolves,
+            // shifting every index in between. Index-keyed caches are void
+            // from `stable_prefix` on.
+            let stable = if needs_dating {
+                // Undated items sort to the head, so one arriving (or leaving,
+                // once it dates) shifts every index after it — i.e. all of them.
+                0
+            } else {
+                // Purely an out-of-order batch: the new items are all dated and
+                // land at or after the first item they undercut. Everything
+                // before that is untouched. `<` rather than `<=` keeps this
+                // conservative against the sort's equal-timestamp tie-break.
+                let earliest = earliest_new.expect("an out-of-order batch is dated");
+                self.items[..before].partition_point(|i| i.ts().is_none_or(|t| t < earliest))
+            };
+            self.stable_prefix = self.stable_prefix.min(stable);
             crate::tailer::date_and_sort_live(&mut self.items);
             self.rescan_undated();
+            self.generation = self.generation.wrapping_add(1);
         }
         if self.items.len() != before {
             self.ended = false;
@@ -220,6 +269,13 @@ impl Timeline {
         if self.follow_head && was_at_edge {
             self.cursor = self.head;
         }
+    }
+
+    /// How many leading items are still known-good since the last call, then
+    /// reset. Consumers of `generation` pair the two: a bump says *some* index
+    /// changed meaning, this says from where.
+    pub fn take_disturbance(&mut self) -> usize {
+        std::mem::replace(&mut self.stable_prefix, usize::MAX)
     }
 
     /// Recompute which undated items are waiting on future data (the metas /

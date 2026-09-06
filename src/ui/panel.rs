@@ -565,7 +565,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            agent.tool_calls.push(ToolCallInfo {
+            agent.tool_calls.push_back(ToolCallInfo {
                 id: format!("t{i}"),
                 name: "Bash".into(),
                 summary: None,
