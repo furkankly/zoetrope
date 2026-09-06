@@ -33,14 +33,39 @@ Why this is non-negotiable — three independent consumers demand it:
 - **Multi-file merge.** Main transcript, `subagents/*.jsonl`, and workflow
   `journal.jsonl` are tailed separately and interleave by timestamp; a subagent's
   result can be read before its spawn.
-- **Backward seek.** Folding is forward-only, so seeking into the past *rebuilds*
-  the model from `items[0..target]` from scratch. That rebuild must land on
-  exactly the state that playing there would have.
+- **Backward seek.** Folding is forward-only, so seeking into the past re-folds
+  the model from `items[0..target]` from a **snapshot ladder** rung when one is
+  available, from item zero when it is not. Either way it must land on exactly
+  the state that playing there would have.
 - **Live vs replay.** The same items arrive as a bulk sorted `Vec` (replay) or as
   arrival-order appends (live). Both must converge.
 
 Guarded by a **shuffle-invariance property test**: fold a real stream in bulk
 order and in many shuffled orders; the final model must be identical.
+
+### The snapshot ladder
+
+A rung every `SNAPSHOT_STRIDE` folded items, so a backward seek re-folds at most
+a stride instead of the whole prefix. Cloning a rung is O(1): `SessionModel` is
+built from persistent (`imbl`) collections, so a rung shares structure with its
+neighbours rather than copying the model. Invariants:
+
+- **A rung holds fold state only.** Liveness and workflow rollups are
+  projections *of the playhead*, not facts about the prefix, and are meaningless
+  at a different one. Every restore re-derives them through `resync`. This is
+  the fold/projection split above, applied to snapshots.
+- **Every fold path goes through `drop_stale_rungs`.** Item indices are not
+  stable: a late batch that dates a previously-`Pending` item re-sorts the list
+  and shifts every index around it, which would silently repoint a rung at a
+  different prefix. `Timeline::generation` marks that a re-sort happened and
+  `take_disturbance` reports how much of the prefix it provably left alone, so
+  rungs below that line are re-stamped and the rest discarded.
+- **A backward seek patches the canvas, it does not rebuild it.** Seeking back
+  can only *remove* agents: a fold never un-spawns one the earlier prefix
+  already had, and `sync` adds and updates but never removes. So `OrdMap::diff`
+  names the departed agents and only those nodes come off. Node positions, the
+  viewport and the selection are never disturbed, which is why nothing has to be
+  captured and restored around the seek.
 
 **Corollary — derived state is never monotonic.** A rollup that concluded "done"
 must *revert* when a contradicting fact (a late child, resumed activity) arrives.

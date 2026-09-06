@@ -110,12 +110,15 @@ impl CameraGlide {
 /// cheap because [`SessionModel`] is built from persistent collections — a rung
 /// shares structure with its neighbours instead of copying the model.
 ///
-/// Measured on the pathological bench scale (~31k items, 293 agents), halving
-/// this to 512 bought no measurable seek time but cost ~9 MB of retained
-/// rungs. That is because the fold is no longer what a backward seek spends
-/// its time on: `rebuild_to` still discards the whole `Flow` and re-projects
-/// every node, which dominates whatever the fold costs. Shrink this only once
-/// that is fixed — until then it would buy memory for nothing.
+/// Read the stride off `drag_10_back`, not off a single seek: it keeps improving
+/// as the stride shrinks, while `back_to_50pct` and `back_one_hop` appear to
+/// plateau only because one fixed target sits an arbitrary distance from its
+/// rung. The drag averages over positions.
+///
+/// 1024 keeps a hop under a millisecond even on the pathological bench scale
+/// (~31k items, 293 agents), where what is left is `resync` rather than the
+/// fold, so shrinking further spends memory against a cost the fold no longer
+/// dominates.
 const SNAPSHOT_STRIDE: usize = 1024;
 
 /// A folded model captured at a known point on the timeline.
