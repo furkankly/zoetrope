@@ -1,6 +1,6 @@
 ---
 title: Install
-description: Install the zoetrope terminal app with Homebrew, cargo or a prebuilt binary (or build it from source), or skip the install and run it in your browser.
+description: Install zoetrope, the Claude Code and Codex session visualizer, with Homebrew, cargo or a prebuilt binary (or build it from source), or skip the install and run it in your browser.
 ---
 
 zoetrope runs two ways: a terminal app you install, or the same portable core

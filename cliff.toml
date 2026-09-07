@@ -9,7 +9,7 @@ repo = "zoetrope"
 header = """
 <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" width="300" />
 
-[**zoetrope**](https://zoetrope.furkankly.dev): Watch a Claude Code session as a live flow graph, in your terminal — or your browser.\n
+[**zoetrope**](https://zoetrope.furkankly.dev): Watch a Claude Code or Codex session as a live flow graph, in your terminal — or your browser.\n
 """
 # template for the changelog body
 # https://keats.github.io/tera/docs/#introduction

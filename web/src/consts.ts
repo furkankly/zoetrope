@@ -10,4 +10,4 @@ export const REPO_RAW = `${REPO_URL}/blob/main`;
 
 export const SITE_TITLE = 'zoetrope';
 export const SITE_TAGLINE =
-  'A terminal UI that visualizes Claude Code agent sessions as a live flow graph.';
+  'A terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph.';

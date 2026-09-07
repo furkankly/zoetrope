@@ -18,13 +18,13 @@ edition = "2024"
 # Inherited from ratatui 0.30, which is the floor: nothing in this crate's own
 # source needs anything newer. Verified by the `msrv` job in CI.
 rust-version = "1.88"
-description = "Terminal UI that visualizes Claude Code agent sessions as a live flow graph."
+description = "Terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/furkankly/zoetrope"
 homepage = "https://zoetrope.furkankly.dev"
 documentation = "https://zoetrope.furkankly.dev"
-keywords = ["claude-code", "tui", "ratatui", "agents", "visualization"]
+keywords = ["claude-code", "codex", "tui", "agents", "visualization"]
 categories = ["command-line-utilities", "development-tools", "visualization"]
 # An allow-list, not a deny-list: state what the crate ships and everything else
 # stays out by default. The inverse leaks — anything added to the repo later
@@ -40,8 +40,9 @@ default = ["native"]
 # The native frontend: terminal (crossterm backend), async runtime (tokio), and
 # filesystem tailing. Code gated `#[cfg(feature = "native")]`. Turn it OFF
 # (`default-features = false`) for the portable core alone — the model, the
-# timeline, the graph projection, the UI rendering and the parser, with no IO
-# and no runtime. That is what the browser frontend (`zoetrope-web`) depends on.
+# timeline, the graph projection, the UI rendering and the providers, with
+# no runtime and no IO of its own (discovery touches the disk only when a
+# feeder asks it to). That is what the browser frontend (`zoetrope-web`) depends on.
 native = [
   "dep:tokio",
   "dep:crossterm",

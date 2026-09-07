@@ -1,6 +1,6 @@
 # zoetrope
 
-Terminal UI that visualizes Claude Code agent sessions as a live flow graph. The same core also runs in the browser, compiled to wasm. Read-only, zero network.
+Terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph. The same core also runs in the browser, compiled to wasm. Read-only, zero network.
 
 Transcript formats enter through one boundary: `src/provider/` turns records into the facts in `src/fact.rs`, and nothing past it knows the format. See `docs/ARCHITECTURE.md` §0 before adding to either side.
 
