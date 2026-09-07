@@ -60,6 +60,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
@@ -70,3 +71,36 @@ jobs:
           # The same applies to the release cut by the job above, which has to
           # trigger cd.yml.
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      # The browser frontend is excluded from the workspace, so release-plz
+      # never sees its lockfile — which still records the path dependency on
+      # `zoetrope` at the previous version. CI's `cargo check --locked` refuses
+      # a stale lockfile, so every release PR would fail its wasm check. Bring
+      # the lockfile up to date on the release branch instead. release-plz
+      # rewrites that branch on every push to main, which is fine: this step
+      # runs again right after it does.
+      - name: Sync the wasm frontend lockfile with the bumped version
+        env:
+          PR: ${{ steps.release-plz.outputs.pr }}
+          # The same PAT: a push with the default token would not trigger CI on
+          # the release PR either.
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch=$(jq -r '.head_branch // empty' <<<"${PR:-}")
+          if [[ -z "$branch" ]]; then
+            echo "no release PR this run; nothing to sync"
+            exit 0
+          fi
+          git fetch origin "$branch"
+          git checkout -B "$branch" FETCH_HEAD
+          # Re-resolves only the path dependency; every registry entry stays
+          # pinned exactly as it was.
+          (cd web/wasm && cargo update -p zoetrope)
+          if git diff --quiet -- web/wasm/Cargo.lock; then
+            echo "wasm lockfile already matches; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(web): sync the wasm lockfile with the release version" -- web/wasm/Cargo.lock
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${branch}"
