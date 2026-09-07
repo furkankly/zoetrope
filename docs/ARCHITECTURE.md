@@ -7,8 +7,8 @@ reasoning that governs how those pieces are allowed to behave.
 
 The whole program solves one hard problem:
 
-> Reconstruct a faithful, navigable, live-or-replayed picture of a Claude Code
-> agent session from an **undocumented, append-only, partially-timestamped,
+> Reconstruct a faithful, navigable, live-or-replayed picture of a coding-agent
+> session (Claude Code, Codex) from an **undocumented, append-only, partially-timestamped,
 > multi-file** transcript — in which **completion is frequently unknowable**.
 
 Almost every design decision below is downstream of that one sentence.
@@ -54,8 +54,21 @@ Four consequences worth knowing before touching either side:
   beside the fixture, the folded model and the dated timeline, which double as
   the readable record of what that provider extracts.
 
+The same rule holds one level up, for finding files rather than reading them
+([DISCOVERY.md](DISCOVERY.md)):
+
+> **A provider states what a file is. The core decides what a session is.**
+
+A provider answers questions about single paths in its own layout (`all_paths`,
+`session_file`, `related_paths`, `project_key`, `stream_for`, `sidecar`), and
+the core assembles sessions, resolves ids, diffs rescans and tails, once. Two
+consequences: the provider is read off a file's content, never its path or
+extension; and any file of a session opens the session, since every format
+seen names the root from every file of it.
+
 Adding a provider is one directory and no decisions: `src/provider/mod.rs`
-spells out the three files, where fixtures go, and the one test to pass.
+spells out the three files, the primitives, where fixtures go, and the one
+test to pass.
 
 ---
 
@@ -96,7 +109,7 @@ a stride instead of the whole prefix. Cloning a rung is O(1): `SessionModel` is
 built from persistent (`imbl`) collections, so a rung shares structure with its
 neighbours rather than copying the model. Invariants:
 
-- **A rung holds fold state only.** Liveness and workflow rollups are
+- **A rung holds fold state only.** Liveness and group rollups are
   projections *of the playhead*, not facts about the prefix, and are meaningless
   at a different one. Every restore re-derives them through `resync`. This is
   the fold/projection split above, applied to snapshots.
@@ -248,8 +261,8 @@ For each agent with a `last_ts`, "active" means **within `INTERACTIVE_IDLE_SECS`
   resumes (or the moment a tool goes pending).
 
 A **replay** that reaches its end fires `end_of_stream` once, settling interactive
-agents to `Idle` (the recording is over; activity is provably absent). A live
-stream never fires it.
+agents to `Idle` and still-running spawned agents to `Done` (the recording is
+over; activity is provably absent). A live stream never fires it.
 
 ---
 
@@ -309,7 +322,7 @@ Detailed in [`DESIGN.md`](DESIGN.md#timeline); the architectural essence:
   toward the present.
 - **Pin-vs-pace is decided by the edge, not the mode.** Behind the edge the cursor
   paces forward, compressing dead air by a graded log curve (`compress_gap`, not a
-  flat cap — a 5-min wait still reads longer than a 5-sec one; `g` toggles faithful
+  flat cap — a 5-min wait still reads longer than a 5-sec one; `s` toggles faithful
   pacing); at the edge it pins. So `space` resumes from the playhead in both modes,
   and a scrubbed-back live session catches up then follows.
 - **The scrubber is event-indexed, not time-linear** — real sessions cluster work
