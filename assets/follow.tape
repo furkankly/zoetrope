@@ -28,7 +28,7 @@ Hide
 Type "clear"
 Enter
 Sleep 1s
-Type "./target/release/zoe assets/demo.jsonl --speed 14"
+Type "./target/release/zoe assets/claude/demo.jsonl --speed 14"
 Enter
 Show
 

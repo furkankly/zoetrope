@@ -36,7 +36,7 @@ Hide
 Type "clear"
 Enter
 Sleep 1s
-Type "ZOETROPE_DEMO=1 ./target/release/zoe assets/demo.jsonl --speed 60"
+Type "ZOETROPE_DEMO=1 ./target/release/zoe assets/claude/demo.jsonl --speed 60"
 Enter
 Sleep 5s
 Show

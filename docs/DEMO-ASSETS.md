@@ -98,7 +98,7 @@ replaced by a real screen capture here.
 
 ### What the tape records
 
-It replays the bundled fixture (`assets/demo.jsonl` + `assets/demo/subagents/`)
+It replays the bundled fixture (`assets/claude/demo.jsonl` + `assets/claude/demo/subagents/`)
 — the *same session* the browser frontend at `/app` boots into, so the GIF and the
 browser demo show the same thing. `--speed 14` compresses the fixture's ~200s of
 content into ~15s, then the keystrokes demonstrate:
@@ -197,7 +197,7 @@ one genuinely mouse-exclusive interaction — not because the rest is unshowable
 
 ## Why the fixture is synthetic
 
-`assets/demo.jsonl` is a hand-authored session, not a real transcript. That is a
+`assets/claude/demo.jsonl` is a hand-authored session, not a real transcript. That is a
 choice, not a shortcut:
 
 - **Reproducible** — anyone can regenerate the GIF byte-comparably. A real
@@ -206,8 +206,11 @@ choice, not a shortcut:
   published.
 - **Curated** — one clean fan-out to four visibly distinct agent types plus a
   workflow group. Real sessions are lopsided and demo worse.
-- **It is also a test** — `zoe inspect assets/demo.jsonl` is the headless
-  end-to-end check (see `docs/DESIGN.md`). It is what caught the
+- **It is also a test** — `demo_session_conforms` (`src/provider/claude/mod.rs`)
+  discovers it the way a live session is discovered and checks order invariance
+  plus the two goldens beside it, `demo.model.txt` and `demo.timeline.txt`
+  (regenerate with `UPDATE_GOLDEN=1`). `zoe inspect assets/claude/demo.jsonl`
+  prints the same model view by hand. It is what caught the
   `assets/subagents/` path bug and the wasm workflow gap.
 
 It deliberately exercises the features that were otherwise dark: a failed tool
