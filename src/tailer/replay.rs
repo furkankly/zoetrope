@@ -8,14 +8,14 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
-use crate::transcript::{self, SubagentMeta};
+use crate::provider::claude::{discovery, wire::SubagentMeta};
 
-use super::item::{ReplayItem, date_and_sort, entry_timestamp};
+use super::item::{ReplayItem, date_and_sort};
 use super::live::{LiveSession, SnapshotSeed, resolve_live_target, tail_loop};
-use super::{Flow, Source, TailRequest, UiEvent, Update};
+use super::{Flow, TailRequest, UiEvent};
+use crate::provider::claude::{self, Source};
 
 /// Replay feeder: parse everything on disk, merge by timestamp, hand the whole
 /// (sorted) stream to the App in one [`UiEvent::ReplayLoaded`] — then KEEP TAILING
@@ -30,7 +30,7 @@ pub(crate) async fn run_replay(
     req_rx: &mut mpsc::Receiver<TailRequest>,
     speed: f64,
 ) -> Flow {
-    let session_id = transcript::session_id_from_path(path);
+    let session_id = discovery::session_id_from_path(path);
 
     // The up-front full parse reads every session file synchronously (the 2MB
     // transcript takes ~0.3s). Run it on a blocking thread so it never stalls a
@@ -109,9 +109,9 @@ pub(crate) fn build_replay(
 
     // All non-main files via the shared transcript layout API (same discovery
     // the live tailer and `inspect` use).
-    if let Some(subagents) = transcript::subagents_dir(main_path) {
+    if let Some(subagents) = discovery::subagents_dir(main_path) {
         // Direct subagents.
-        for f in transcript::scan_subagent_files(&subagents, None) {
+        for f in discovery::scan_subagent_files(&subagents, None) {
             if f.meta.is_file()
                 && push_meta_item(&f.meta, f.agent_id.clone(), f.workflow, &mut items)
             {
@@ -125,18 +125,18 @@ pub(crate) fn build_replay(
             );
         }
         // Workflow journals + their subagents.
-        for wf_id in transcript::scan_workflow_ids(&subagents) {
-            let journal = transcript::workflow_journal(&subagents, &wf_id);
+        for wf_id in discovery::scan_workflow_ids(&subagents) {
+            let journal = discovery::workflow_journal(&subagents, &wf_id);
             if journal.is_file() {
                 parse(
                     &journal,
-                    Source::Journal(wf_id.clone()),
+                    Source::Ledger(wf_id.clone()),
                     &mut items,
                     &mut seed,
                 );
             }
-            let wf_dir = transcript::workflow_dir(&subagents, &wf_id);
-            for f in transcript::scan_subagent_files(&wf_dir, Some(&wf_id)) {
+            let wf_dir = discovery::workflow_dir(&subagents, &wf_id);
+            for f in discovery::scan_subagent_files(&wf_dir, Some(&wf_id)) {
                 if f.meta.is_file()
                     && push_meta_item(&f.meta, f.agent_id.clone(), f.workflow, &mut items)
                 {
@@ -157,12 +157,13 @@ pub(crate) fn build_replay(
     // from the timeline — it isn't activity, and being untimed it would clump at
     // the front. Done here, in file (chronological) order, so latest-wins holds.
     let mut info = crate::state::SessionInfo::default();
-    items.retain(|item| match &item.update {
-        Update::Entry { entry, .. } if entry.is_timeline_noise() => {
-            info.apply(entry);
+    items.retain(|item| {
+        if item.facts.iter().all(crate::fact::Fact::is_session_meta) {
+            item.facts.iter().for_each(|f| info.apply(f));
             false
+        } else {
+            true
         }
-        _ => true,
     });
 
     // Date the untimed items (metas/journal/ai-title) and stably sort by ts.
@@ -187,26 +188,12 @@ fn parse_file_into(path: &Path, source: Source, items: &mut Vec<ReplayItem>) -> 
         .map(|i| i + 1)
         .unwrap_or(0);
     let text = String::from_utf8_lossy(&bytes[..consumed]);
-    let mut last_ts: Option<DateTime<Utc>> = None;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some(entry) = transcript::parse_line(line) else {
-            continue;
-        };
-        let ts = entry_timestamp(&entry).or(last_ts);
-        if ts.is_some() {
-            last_ts = ts;
-        }
-        items.push(ReplayItem::at(
-            ts,
-            Update::Entry {
-                source: source.clone(),
-                entry,
-            },
-        ));
-    }
+    let mut stream = claude::Stream::new(source);
+    items.extend(
+        text.lines()
+            .filter_map(|l| stream.push(l))
+            .map(ReplayItem::new),
+    );
     consumed as u64
 }
 
@@ -225,20 +212,19 @@ fn push_meta_item(
     let Ok(meta) = serde_json::from_slice::<SubagentMeta>(&bytes) else {
         return false;
     };
-    items.push(ReplayItem::at(
-        None,
-        Update::SubagentMeta {
-            agent_id,
-            workflow,
-            meta,
-        },
-    ));
+    items.push(ReplayItem::new(claude::Stream::meta(
+        &agent_id,
+        workflow.as_deref(),
+        &meta,
+    )));
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fact::FactKind;
+    use crate::state::session::MAIN_ID;
 
     #[test]
     fn replay_dates_metas_to_first_subagent_entry() {
@@ -282,25 +268,13 @@ mod tests {
         let (items, _info, _seed) = build_replay(&main);
         let pos = |pred: &dyn Fn(&ReplayItem) -> bool| items.iter().position(pred);
 
-        let meta_pos = pos(&|i| matches!(&i.update, Update::SubagentMeta { .. })).unwrap();
-        let first_main = pos(&|i| {
-            matches!(
-                &i.update,
-                Update::Entry {
-                    source: Source::Main,
-                    ..
-                }
-            )
-        })
-        .unwrap();
+        let meta_pos = pos(&|i| i.any(|f| matches!(f.kind, FactKind::Agent { .. }))).unwrap();
+        let first_main = pos(&|i| i.any(|f| f.agent.as_deref() == Some(MAIN_ID))).unwrap();
         let sub_entry = pos(&|i| {
-            matches!(
-                &i.update,
-                Update::Entry {
-                    source: Source::Sub(_),
-                    ..
-                }
-            )
+            i.any(|f| {
+                f.agent.as_deref() == Some("aaaaaaaaaaaaaaaaa")
+                    && !matches!(f.kind, FactKind::Agent { .. })
+            })
         })
         .unwrap();
 

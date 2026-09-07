@@ -11,7 +11,7 @@
 //! id is not current (see [`crate::state::App::is_current`]).
 //!
 //! Layout: this module holds the task entry (`run`) and the shared wire types
-//! ([`TailRequest`] / [`UiEvent`] / [`Update`] / [`Source`]); `bytes` is the
+//! ([`TailRequest`] / [`UiEvent`]); `bytes` is the
 //! pure incremental reader, `live` the live poll loop, `replay` the up-front
 //! assembly. Both feeders converge on `live::tail_loop` so every session keeps
 //! tailing.
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 #[cfg(feature = "native")]
 use tokio::sync::mpsc;
 
-use crate::transcript::{Entry, SubagentMeta};
+use crate::fact::Statement;
 
 // Portable: the timeline item + its ordering (no IO → compiles on wasm).
 mod item;
@@ -62,11 +62,11 @@ pub enum TailRequest {
 /// Events the tailer task sends to the UI.
 #[derive(Debug)]
 pub enum UiEvent {
-    /// A batch of updates produced in one live poll tick (appended to the
-    /// timeline's head as they arrive).
+    /// What one live poll tick read, one statement per record (appended to
+    /// the timeline's head as they arrive).
     Batch {
         session_id: String,
-        updates: Vec<Update>,
+        statements: Vec<Statement>,
     },
     /// The whole merged, timestamp-ordered replay stream, handed to the App
     /// once. The App owns pacing/seeking from here (the tailer does not pace).
@@ -81,31 +81,6 @@ pub enum UiEvent {
     SessionReset { session_id: String },
     /// A non-fatal error string for display.
     Error(String),
-}
-
-/// A single unit of parsed transcript activity inside a [`UiEvent::Batch`].
-#[derive(Debug)]
-pub enum Update {
-    /// A parsed transcript entry, tagged with which file it came from.
-    Entry { source: Source, entry: Entry },
-    /// A subagent `meta.json` sidecar was discovered/parsed.
-    SubagentMeta {
-        agent_id: String,
-        /// `Some(wf_id)` if this is a workflow subagent.
-        workflow: Option<String>,
-        meta: SubagentMeta,
-    },
-}
-
-/// Which file an [`Update::Entry`] originated from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Source {
-    /// The main `<session-uuid>.jsonl`.
-    Main,
-    /// A subagent file, keyed by its 17-hex-char `agentId`.
-    Sub(String),
-    /// A workflow `journal.jsonl`, keyed by its workflow id.
-    Journal(String),
 }
 
 // ---------------------------------------------------------------------------

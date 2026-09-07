@@ -28,13 +28,13 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use zoetrope::state::{App, Camera, Mode};
-use zoetrope::tailer::{
-    DemoSubagent, Source, UiEvent, Update, replay_from_jsonl, replay_from_session,
-};
-use zoetrope::transcript::{SubagentMeta, parse_line};
+use zoetrope::fact::Statement;
+use zoetrope::provider::claude::wire::SubagentMeta;
+use zoetrope::provider::claude::{Source, Stream};
+use zoetrope::tailer::{DemoSubagent, UiEvent, replay_from_jsonl, replay_from_session};
 
 /// The demo session's main transcript, compiled into the wasm binary.
-const DEMO_MAIN: &str = include_str!("../../../assets/demo.jsonl");
+const DEMO_MAIN: &str = include_str!("../../../assets/claude/demo.jsonl");
 /// Default replay speed (matches the native default).
 const DEMO_SPEED: f64 = 8.0;
 
@@ -44,12 +44,12 @@ macro_rules! demo_subagent {
         DemoSubagent {
             agent_id: $id,
             meta: include_str!(concat!(
-                "../../../assets/demo/subagents/agent-",
+                "../../../assets/claude/demo/subagents/agent-",
                 $id,
                 ".meta.json"
             )),
             transcript: include_str!(concat!(
-                "../../../assets/demo/subagents/agent-",
+                "../../../assets/claude/demo/subagents/agent-",
                 $id,
                 ".jsonl"
             )),
@@ -59,20 +59,20 @@ macro_rules! demo_subagent {
     };
 }
 
-/// Same, for a subagent under `assets/demo/subagents/workflows/<wf>/`.
+/// Same, for a subagent under `assets/claude/demo/subagents/workflows/<wf>/`.
 macro_rules! demo_workflow_subagent {
     ($wf:literal, $id:literal) => {
         DemoSubagent {
             agent_id: $id,
             meta: include_str!(concat!(
-                "../../../assets/demo/subagents/workflows/",
+                "../../../assets/claude/demo/subagents/workflows/",
                 $wf,
                 "/agent-",
                 $id,
                 ".meta.json"
             )),
             transcript: include_str!(concat!(
-                "../../../assets/demo/subagents/workflows/",
+                "../../../assets/claude/demo/subagents/workflows/",
                 $wf,
                 "/agent-",
                 $id,
@@ -84,14 +84,14 @@ macro_rules! demo_workflow_subagent {
     };
 }
 
-/// The workflow's `journal.jsonl` — no meta, folds under `Source::Journal`.
+/// The workflow's `journal.jsonl` — no meta, folds under `Source::Ledger`.
 macro_rules! demo_workflow_journal {
     ($wf:literal) => {
         DemoSubagent {
             agent_id: "",
             meta: "",
             transcript: include_str!(concat!(
-                "../../../assets/demo/subagents/workflows/",
+                "../../../assets/claude/demo/subagents/workflows/",
                 $wf,
                 "/journal.jsonl"
             )),
@@ -318,62 +318,35 @@ pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
 /// seen). Folds onto the edge when following — a no-op if nothing parses.
 #[wasm_bindgen]
 pub fn zoetrope_append(main_tail: String, subagents_json: String) {
-    let mut updates: Vec<Update> = Vec::new();
-    for line in main_tail.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(entry) = parse_line(line) {
-            updates.push(Update::Entry {
-                source: Source::Main,
-                entry,
-            });
-        }
-    }
+    let mut statements: Vec<Statement> = Vec::new();
+    let mut main = Stream::new(Source::Main);
+    statements.extend(main_tail.lines().filter_map(|l| main.push(l)));
     for sub in parse_subs(&subagents_json) {
         // A workflow journal carries no meta and folds under its own source —
-        // mirrors `Source::Journal` in the native tailer. Skip one with no
+        // mirrors `Source::Ledger` in the native tailer. Skip one with no
         // workflow id: there is nothing to attribute it to.
         if sub.journal {
             let Some(wf) = sub.workflow.clone() else {
                 continue;
             };
-            for line in sub.transcript.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(entry) = parse_line(line) {
-                    updates.push(Update::Entry {
-                        source: Source::Journal(wf.clone()),
-                        entry,
-                    });
-                }
-            }
+            let mut ledger = Stream::new(Source::Ledger(wf.clone()));
+            statements.extend(sub.transcript.lines().filter_map(|l| ledger.push(l)));
             continue;
         }
         if !sub.meta.trim().is_empty()
             && let Ok(meta) = serde_json::from_str::<SubagentMeta>(&sub.meta)
         {
-            updates.push(Update::SubagentMeta {
-                agent_id: sub.agent_id.clone(),
-                workflow: sub.workflow.clone(),
-                meta,
-            });
+            statements.push(Stream::meta(
+                &sub.agent_id,
+                sub.workflow.as_deref(),
+                &meta,
+            ));
         }
-        for line in sub.transcript.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(entry) = parse_line(line) {
-                updates.push(Update::Entry {
-                    source: Source::Sub(sub.agent_id.clone()),
-                    entry,
-                });
-            }
-        }
+        let mut agent = Stream::new(Source::Sub(sub.agent_id.clone()));
+        statements.extend(sub.transcript.lines().filter_map(|l| agent.push(l)));
     }
 
-    if updates.is_empty() {
+    if statements.is_empty() {
         return;
     }
     APP.with(|cell| {
@@ -382,7 +355,7 @@ pub fn zoetrope_append(main_tail: String, subagents_json: String) {
             let session_id = app.current_session_id.clone();
             app.handle_ui_event(UiEvent::Batch {
                 session_id,
-                updates,
+                statements,
             });
         }
     });
