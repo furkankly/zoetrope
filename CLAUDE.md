@@ -2,6 +2,8 @@
 
 Terminal UI that visualizes Claude Code agent sessions as a live flow graph. The same core also runs in the browser, compiled to wasm. Read-only, zero network.
 
+Transcript formats enter through one boundary: `src/provider/` turns records into the facts in `src/fact.rs`, and nothing past it knows the format. See `docs/ARCHITECTURE.md` §0 before adding to either side.
+
 See `docs/ARCHITECTURE.md` for the invariants and principles, `docs/DESIGN.md` for the module map and transcript format, `TODO.md` for the roadmap, and `README.md` for usage.
 
 ## Running
@@ -21,7 +23,7 @@ cd web/wasm && cargo clippy   # its .cargo/config.toml defaults to wasm32
 
 ## Commits
 
-[Conventional Commits](https://www.conventionalcommits.org/), lowercase imperative subject. Scope is a module, not a file: `transcript`, `state`, `graph`, `timeline`, `tailer`, `ui`, `panel`, `cli`, `wasm`, `web`, `docs`.
+[Conventional Commits](https://www.conventionalcommits.org/), lowercase imperative subject. Scope is a module, not a file: `fact`, `provider`, `state`, `graph`, `timeline`, `tailer`, `ui`, `panel`, `cli`, `wasm`, `web`, `docs`. A change inside one provider is `provider` (e.g. `fix(provider): inherit the timestamp across progress records`).
 
 ```
 feat(timeline): index the playhead by event instead of wall-clock
