@@ -21,7 +21,7 @@ Feeders see two operations, both in `src/provider/mod.rs`, both written once:
 
 `open` is `sweep` narrowed to one session: both feed paths through the same provider question and the same core assembly. The only difference is which paths go in (§4). `only` forces one provider (`--provider`); `None` reads it off the content.
 
-The browser build has no filesystem and uses neither. It receives every file of a session as `(path, text)` and hands them to `tailer::Bundle`, which classifies each with `Provider::classify` (the same answers as `session_file`, from the path and the first line instead of the disk), keeps one stream per tailed file for later appends, and states each sidecar once. So the page never learns a format either.
+The browser build has no filesystem and uses neither. It receives every file of a session as `(path, text)` and hands them to `tailer::Bundle`, which classifies each with `Provider::session_file_from` (the same answers as `session_file`, from the path and the first line instead of the disk), keeps one stream per tailed file for later appends, and states each sidecar once. So the page never learns a format either.
 
 ---
 
@@ -88,7 +88,7 @@ Each provider implements these in `src/provider/<name>/discovery.rs`, about its 
 | `project_key(cwd) -> String` | How does this provider name a project? | `sanitize_cwd(cwd)`, the directory name under `projects/` | the path itself, as `session_meta.cwd` records it |
 | `stream_for(file) -> Stream` | A parser for a tailed file, with whatever cross-line state the format needs | `claude::Stream` over `Source::Main`, `Sub(agent)`, or `Ledger(wf)`, derived from the path; state: the inherited timestamp, and whether the root has been stated | `codex::Stream`; state: the thread id, the root id, the ordinal below which the file is replayed parent history |
 | `sidecar(file, text) -> Option<Statement>` | What does a whole-read sidecar state, once its text parses? | `agent-<id>.meta.json`: the agent's birth, `Stream::meta` | none |
-| `classify(path, head) -> Option<SessionFile>` | `session_file` without a filesystem: the path a file came with and its first bytes | by path, as `session_file` | by the first line, as `session_file` |
+| `session_file_from(path, head) -> Option<SessionFile>` | `session_file` without a filesystem: the path a file came with and its first bytes | by path, as `session_file` | by the first line, as `session_file` |
 
 Three things these answers show:
 
@@ -142,7 +142,7 @@ What used to be five feeder sites naming `claude::` are these calls. The live ta
 
 - **Replay and follow** (`tailer/replay.rs`, `tailer/live.rs`): `open`, then one `Stream` per tailed file and one `sidecar` statement per whole-read file. Every tick: read appended bytes through each stream, `rescan` for files that appeared, state sidecars that now parse. `Flow::Switch { target, follow }` carries the working directory being followed, so a re-attach after truncation keeps following and a named file or id stays pinned.
 - **`inspect`** (`main.rs`): `open`, read every file, fold. Session-level facts go to the info header whichever record carried them (a Codex root names itself and its app on one line; `Statement::take_session_meta` splits it).
-- **The browser** (`web/wasm`): no filesystem. The page reads files (a drop, an upload, or a directory it may keep re-reading) and passes `[{path, text}]` to `zoetrope_load`; `tailer::Bundle` does the rest through `classify`, `stream_for` and `sidecar`, and `zoetrope_append` continues the same streams. The page's own job is finding files: Claude by the `<uuid>.jsonl` and `<uuid>/subagents/` layout, Codex by reading each rollout's first line, which is `session_file`'s logic written a second time in JavaScript because the page cannot call it before the files are read.
+- **The browser** (`web/wasm`): no filesystem. The page reads files (a drop, an upload, or a directory it may keep re-reading) and passes `[{path, text}]` to `zoetrope_load`; `tailer::Bundle` does the rest through `session_file_from`, `stream_for` and `sidecar`, and `zoetrope_append` continues the same streams. The page's own job is finding files: Claude by the `<uuid>.jsonl` and `<uuid>/subagents/` layout, Codex by reading each rollout's first line, which is `session_file`'s logic written a second time in JavaScript because the page cannot call it before the files are read.
 - **herdr**: hands a path or an id, gets `open`.
 
 ---

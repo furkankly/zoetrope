@@ -368,7 +368,7 @@ impl Provider {
     /// [`session_file`](Self::session_file) without a filesystem: the path a
     /// file came with and its first bytes. A Claude file is classified by its
     /// path, a Codex file by its first line. The browser's way in.
-    pub fn classify(self, path: &Path, head: &str) -> Option<SessionFile> {
+    pub fn session_file_from(self, path: &Path, head: &str) -> Option<SessionFile> {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),

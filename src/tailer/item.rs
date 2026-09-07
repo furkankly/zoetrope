@@ -194,7 +194,7 @@ fn date_and_sort_inner(items: &mut [ReplayItem], complete: bool) {
 /// A session handed over as text: the browser's feeder. JS reads the files
 /// (a drop, an upload, or a directory it is allowed to tail) and passes each
 /// one as `(path, text)`; the bundle classifies them with the same primitives
-/// the native feeders use ([`Provider::classify`]), keeps one [`Stream`] per
+/// the native feeders use ([`Provider::session_file_from`]), keeps one [`Stream`] per
 /// tailed file so later appends continue where the load stopped, and states
 /// each whole-read sidecar once.
 ///
@@ -222,7 +222,7 @@ impl Bundle {
             .filter(|(path, _)| seen_paths.insert(*path))
             .filter_map(|(path, text)| {
                 provider
-                    .classify(Path::new(path), head_of(text))
+                    .session_file_from(Path::new(path), head_of(text))
                     .map(|f| (f, *text))
             })
             .collect();
@@ -260,7 +260,10 @@ impl Bundle {
                 out.extend(text.lines().filter_map(|l| stream.push(l)));
                 continue;
             }
-            let Some(file) = self.provider.classify(Path::new(path), head_of(text)) else {
+            let Some(file) = self
+                .provider
+                .session_file_from(Path::new(path), head_of(text))
+            else {
                 continue;
             };
             if file.session != self.session || file.role == FileRole::Root {
