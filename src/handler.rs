@@ -258,17 +258,19 @@ mod tests {
 
     /// An App with a 20-column scrubber at (x=2, rows 5..8) over a 4-item replay.
     fn scrubber_app() -> App {
-        use crate::tailer::{ReplayItem, Source, UiEvent, Update};
+        use crate::provider::claude::{Record, Source};
+        use crate::tailer::{ReplayItem, UiEvent};
         let item = |uuid: &str, t: &str| {
             let line = format!(
                 r#"{{"type":"user","uuid":"{uuid}","parentUuid":null,"timestamp":"{t}","message":{{"role":"user","content":"x"}}}}"#
             );
-            ReplayItem::at(
-                Some(t.parse().unwrap()),
-                Update::Entry {
+            ReplayItem::new(
+                Record::Entry {
                     source: Source::Main,
-                    entry: crate::transcript::parse_line(&line).unwrap(),
-                },
+                    entry: crate::provider::claude::wire::parse_line(&line).unwrap(),
+                }
+                .statement()
+                .unwrap(),
             )
         };
         let mut app = App::new("s".into(), Mode::Replay);

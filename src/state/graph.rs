@@ -41,25 +41,19 @@ pub fn new_flow() -> AgentFlow {
     flow
 }
 
-/// Title line for a node, given its kind and agent type.
+/// Title line for a node: the agent type the provider recorded, else the
+/// generic label for its kind. No provider name appears here — the root
+/// agent's is seeded on the model (see [`SessionModel::new`]).
 fn node_title(info: &AgentInfo) -> String {
-    match info.kind {
-        AgentKind::Main => "claude".to_string(),
-        AgentKind::WorkflowGroup => info
-            .agent_type
-            .clone()
-            .unwrap_or_else(|| "workflow".to_string()),
-        AgentKind::Subagent => info
-            .agent_type
-            .clone()
-            .unwrap_or_else(|| "subagent".to_string()),
-    }
+    info.agent_type
+        .clone()
+        .unwrap_or_else(|| info.kind.default_label().to_string())
 }
 
 /// Fixed card dimensions for a node kind.
 fn node_dims(kind: AgentKind) -> (f64, f64) {
     match kind {
-        AgentKind::Main | AgentKind::WorkflowGroup => MAIN_NODE_DIMS,
+        AgentKind::Main | AgentKind::Group => MAIN_NODE_DIMS,
         AgentKind::Subagent => SUB_NODE_DIMS,
     }
 }
@@ -68,11 +62,11 @@ fn node_dims(kind: AgentKind) -> (f64, f64) {
 /// comparison so unchanged agents skip [`build_content`]'s String clones on
 /// every sync (the steady state for almost all agents on almost all ticks).
 fn content_matches(info: &AgentInfo, node: &AgentNode) -> bool {
-    let title_ok = match info.kind {
-        AgentKind::Main => node.title == "claude",
-        AgentKind::WorkflowGroup => node.title == info.agent_type.as_deref().unwrap_or("workflow"),
-        AgentKind::Subagent => node.title == info.agent_type.as_deref().unwrap_or("subagent"),
-    };
+    let title_ok = node.title
+        == info
+            .agent_type
+            .as_deref()
+            .unwrap_or(info.kind.default_label());
     title_ok
         && node.description.as_deref() == info.description.as_deref()
         && node.status == info.status
@@ -255,7 +249,7 @@ pub fn relayout(flow: &mut AgentFlow) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::SubagentMeta;
+    use crate::provider::claude::wire::SubagentMeta;
 
     /// A model with main + one direct subagent (running).
     fn model_with_subagent() -> SessionModel {

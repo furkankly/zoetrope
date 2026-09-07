@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::transcript::{self, SubagentMeta};
+use crate::fact::Statement;
+use crate::provider::claude::{Source, Stream, discovery, wire::SubagentMeta};
 
 use super::bytes::{ReadResult, TailState, read_appended};
-use super::{Flow, Source, TailRequest, UiEvent, Update};
+use super::{Flow, TailRequest, UiEvent};
 
 /// Poll interval for live tailing.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -40,12 +41,13 @@ pub(crate) struct LiveSession {
     main_path: PathBuf,
     /// The `<uuid>/subagents` directory (may not exist yet).
     subagents_dir: PathBuf,
-    /// Tail state for the main file.
+    /// Tail state for the main file, and the provider stream reading it.
     main_state: TailState,
+    main_stream: Stream,
     /// Tail state per discovered non-main file, keyed by absolute path, carrying
     /// the [`Source`] to stamp its entries with. One map (paths are unique) so no
     /// agent id can collide across the direct-subagent / workflow / journal trees.
-    tracked: HashMap<PathBuf, (Source, TailState)>,
+    tracked: HashMap<PathBuf, (Stream, TailState)>,
     /// meta.json files already emitted (by absolute path) — emit once.
     seen_meta: std::collections::HashSet<PathBuf>,
     /// Poll-tick counter, used to throttle the newer-session scan.
@@ -77,12 +79,13 @@ impl LiveSession {
     /// nested layout would be wrong — they are the same here, but threading the
     /// project dir explicitly keeps auto-switch correct).
     pub(crate) fn new(project_dir: PathBuf, main_path: PathBuf) -> Self {
-        let subagents_dir = transcript::subagents_dir(&main_path).unwrap_or_default();
+        let subagents_dir = discovery::subagents_dir(&main_path).unwrap_or_default();
         Self {
             project_dir: Some(project_dir),
             main_path,
             subagents_dir,
             main_state: TailState::default(),
+            main_stream: Stream::new(Source::Main),
             tracked: HashMap::new(),
             seen_meta: std::collections::HashSet::new(),
             ticks: 0,
@@ -92,7 +95,7 @@ impl LiveSession {
     }
 
     fn session_id(&self) -> String {
-        transcript::session_id_from_path(&self.main_path)
+        discovery::session_id_from_path(&self.main_path)
     }
 
     /// Adopt a replay bulk snapshot's read positions: the main offset applies
@@ -118,7 +121,7 @@ impl LiveSession {
         if let Some(off) = self.seed_offsets.remove(&path) {
             state.offset = off;
         }
-        self.tracked.insert(path, (source, state));
+        self.tracked.insert(path, (Stream::new(source), state));
     }
 }
 
@@ -130,7 +133,7 @@ impl LiveSession {
 /// file yet — the caller polls until one appears.
 pub(crate) fn resolve_live_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
     if target.is_dir() {
-        let main = transcript::latest_session_file(target)?;
+        let main = discovery::latest_session_file(target)?;
         Some((target.to_path_buf(), main))
     } else {
         let project_dir = target.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -148,7 +151,7 @@ async fn await_first_session(
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if let Some(main) = transcript::latest_session_file(project_dir) {
+        if let Some(main) = discovery::latest_session_file(project_dir) {
             return Ok(main);
         }
         tokio::select! {
@@ -248,7 +251,7 @@ async fn poll_live(
     session_id: &str,
     ui_tx: &mpsc::Sender<UiEvent>,
 ) -> Option<PathBuf> {
-    let mut updates: Vec<Update> = Vec::new();
+    let mut statements: Vec<Statement> = Vec::new();
 
     // --- main file ---
     match read_appended(&session.main_path, &mut session.main_state) {
@@ -266,22 +269,17 @@ async fn poll_live(
             // liveness.
             return Some(session.main_path.clone());
         }
-        ReadResult::Entries(entries) => {
-            for entry in entries {
-                updates.push(Update::Entry {
-                    source: Source::Main,
-                    entry,
-                });
-            }
+        ReadResult::Lines(lines) => {
+            statements.extend(lines.iter().filter_map(|l| session.main_stream.push(l)));
         }
         ReadResult::NoChange | ReadResult::Missing => {}
     }
 
     // --- discover subagent/workflow files + metas (shared transcript layout) ---
-    scan_files(session, &mut updates);
+    scan_files(session, &mut statements);
 
     // --- read each tracked non-main file ---
-    if read_tracked(&mut session.tracked, &mut updates) {
+    if read_tracked(&mut session.tracked, &mut statements) {
         // A tracked file was truncated/rotated: its already-applied content is
         // baked into the App model, so re-reading it in place would duplicate
         // items and double-count tokens. Re-attach the whole session, same as
@@ -295,12 +293,12 @@ async fn poll_live(
     }
 
     // --- emit batch + track idle stretch ---
-    let had_activity = !updates.is_empty();
+    let had_activity = !statements.is_empty();
     if had_activity {
         let _ = ui_tx
             .send(UiEvent::Batch {
                 session_id: session_id.to_string(),
-                updates,
+                statements,
             })
             .await;
     }
@@ -319,13 +317,13 @@ async fn poll_live(
     if session.ticks.is_multiple_of(SWITCH_SCAN_EVERY)
         && session.idle_ticks >= SWITCH_IDLE_TICKS
         && let Some(dir) = &session.project_dir
-        && let Some(latest) = transcript::latest_session_file(dir)
+        && let Some(latest) = discovery::latest_session_file(dir)
         && latest != session.main_path
     {
         // Stamp the reset with the NEW session id so the UI adopts the id the
         // post-switch tailer will stamp its batches with — stamping the OLD id
         // here would make the UI drop every event of the new session.
-        let new_id = transcript::session_id_from_path(&latest);
+        let new_id = discovery::session_id_from_path(&latest);
         let _ = ui_tx
             .send(UiEvent::SessionReset { session_id: new_id })
             .await;
@@ -340,19 +338,14 @@ async fn poll_live(
 /// file was truncated/rotated — the caller must re-attach the whole session
 /// (re-reading in place would re-emit already-applied content as duplicates).
 fn read_tracked(
-    tracked: &mut HashMap<PathBuf, (Source, TailState)>,
-    updates: &mut Vec<Update>,
+    tracked: &mut HashMap<PathBuf, (Stream, TailState)>,
+    statements: &mut Vec<Statement>,
 ) -> bool {
     let mut reset = false;
-    for (path, (source, state)) in tracked.iter_mut() {
+    for (path, (stream, state)) in tracked.iter_mut() {
         match read_appended(path, state) {
-            ReadResult::Entries(entries) => {
-                for entry in entries {
-                    updates.push(Update::Entry {
-                        source: source.clone(),
-                        entry,
-                    });
-                }
+            ReadResult::Lines(lines) => {
+                statements.extend(lines.iter().filter_map(|l| stream.push(l)));
             }
             ReadResult::Reset => reset = true,
             ReadResult::NoChange | ReadResult::Missing => {}
@@ -362,24 +355,24 @@ fn read_tracked(
 }
 
 /// Discover all non-main session files via the shared transcript layout API
-/// ([`transcript::scan_subagent_files`] etc.) and register them for tailing,
+/// ([`discovery::scan_subagent_files`] etc.) and register them for tailing,
 /// emitting each meta sidecar once. Direct and workflow subagents share one
 /// path-keyed map; each workflow journal is tracked too.
-fn scan_files(session: &mut LiveSession, updates: &mut Vec<Update>) {
+fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) {
     let subagents = session.subagents_dir.clone();
     // Direct subagents under `subagents/`.
-    for f in transcript::scan_subagent_files(&subagents, None) {
-        register_subagent(session, f, updates);
+    for f in discovery::scan_subagent_files(&subagents, None) {
+        register_subagent(session, f, statements);
     }
     // Workflow journals + their subagents under `subagents/workflows/<wf>/`.
-    for wf_id in transcript::scan_workflow_ids(&subagents) {
-        let journal = transcript::workflow_journal(&subagents, &wf_id);
+    for wf_id in discovery::scan_workflow_ids(&subagents) {
+        let journal = discovery::workflow_journal(&subagents, &wf_id);
         if journal.is_file() {
-            session.track(journal, Source::Journal(wf_id.clone()));
+            session.track(journal, Source::Ledger(wf_id.clone()));
         }
-        let wf_dir = transcript::workflow_dir(&subagents, &wf_id);
-        for f in transcript::scan_subagent_files(&wf_dir, Some(&wf_id)) {
-            register_subagent(session, f, updates);
+        let wf_dir = discovery::workflow_dir(&subagents, &wf_id);
+        for f in discovery::scan_subagent_files(&wf_dir, Some(&wf_id)) {
+            register_subagent(session, f, statements);
         }
     }
 }
@@ -388,8 +381,8 @@ fn scan_files(session: &mut LiveSession, updates: &mut Vec<Update>) {
 /// its transcript for tailing as a [`Source::Sub`].
 fn register_subagent(
     session: &mut LiveSession,
-    f: transcript::SubagentFile,
-    updates: &mut Vec<Update>,
+    f: discovery::SubagentFile,
+    statements: &mut Vec<Statement>,
 ) {
     if f.meta.is_file() {
         emit_meta(
@@ -397,19 +390,19 @@ fn register_subagent(
             f.agent_id.clone(),
             f.workflow,
             &mut session.seen_meta,
-            updates,
+            statements,
         );
     }
     session.track(f.transcript, Source::Sub(f.agent_id));
 }
 
-/// Parse a `meta.json` sidecar and push a [`Update::SubagentMeta`] once.
+/// Parse a `meta.json` sidecar and state its facts once.
 fn emit_meta(
     path: &Path,
     agent_id: String,
     workflow: Option<String>,
     seen: &mut std::collections::HashSet<PathBuf>,
-    updates: &mut Vec<Update>,
+    statements: &mut Vec<Statement>,
 ) {
     if seen.contains(path) {
         return;
@@ -426,11 +419,7 @@ fn emit_meta(
         return;
     };
     seen.insert(path.to_path_buf());
-    updates.push(Update::SubagentMeta {
-        agent_id,
-        workflow,
-        meta,
-    });
+    statements.push(Stream::meta(&agent_id, workflow.as_deref(), &meta));
 }
 
 #[cfg(test)]
@@ -448,15 +437,15 @@ mod tests {
             std::process::id()
         ));
         let mut seen = std::collections::HashSet::new();
-        let mut updates = Vec::new();
+        let mut statements = Vec::new();
 
         // Mid-write garbage: must NOT be marked seen (retry next tick).
         std::fs::File::create(&tmp)
             .unwrap()
             .write_all(b"{\"agentTy")
             .unwrap();
-        emit_meta(&tmp, "a1".into(), None, &mut seen, &mut updates);
-        assert!(updates.is_empty());
+        emit_meta(&tmp, "a1".into(), None, &mut seen, &mut statements);
+        assert!(statements.is_empty());
         assert!(!seen.contains(&tmp), "failed parse must be retried");
 
         // The completed write parses and emits.
@@ -464,8 +453,8 @@ mod tests {
             .unwrap()
             .write_all(br#"{"agentType":"guide"}"#)
             .unwrap();
-        emit_meta(&tmp, "a1".into(), None, &mut seen, &mut updates);
-        assert_eq!(updates.len(), 1);
+        emit_meta(&tmp, "a1".into(), None, &mut seen, &mut statements);
+        assert_eq!(statements.len(), 1);
         assert!(seen.contains(&tmp));
         let _ = std::fs::remove_file(&tmp);
     }
@@ -555,8 +544,8 @@ mod tests {
         // three (whole-file re-emission).
         let mut emitted = 0;
         while let Ok(ev) = rx.try_recv() {
-            if let UiEvent::Batch { updates, .. } = ev {
-                emitted += updates.len();
+            if let UiEvent::Batch { statements, .. } = ev {
+                emitted += statements.len();
             }
         }
         assert_eq!(emitted, 1, "only the post-snapshot append is emitted");

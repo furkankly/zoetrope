@@ -5,7 +5,7 @@
 #   vhs assets/demo.tape          # run from the repo root
 #   cp assets/zoetrope-demo.gif web/public/   # the site serves its own copy
 #
-# Records the bundled demo fixture (assets/demo.jsonl + assets/demo/subagents/),
+# Records the bundled demo fixture (assets/claude/demo.jsonl + assets/claude/demo/subagents/),
 # which is the same session the wasm app at /app boots into — so the GIF and the
 # browser demo show the same thing (including its workflow group). --speed 14
 # replays the fixture's ~200s of content in ~15s; the keys afterwards show the
@@ -30,7 +30,7 @@ Hide
 Type "clear"
 Enter
 Sleep 1s
-Type "./target/release/zoe assets/demo.jsonl --speed 14"
+Type "./target/release/zoe assets/claude/demo.jsonl --speed 14"
 Enter
 Show
 

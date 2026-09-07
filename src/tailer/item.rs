@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use super::{Source, Update};
-use crate::transcript::Entry;
+use crate::fact::{Fact, FactKind, Statement};
+use crate::provider::claude::{self, Source};
 
 /// When a timeline item happens — its single source of truth for placement.
 ///
@@ -16,31 +16,31 @@ use crate::transcript::Entry;
 /// predecessor, or a resolved cross-file join) or **undated**, split into two
 /// distinct cases:
 ///
-/// - `Pending` — an externally-dated item (a subagent `meta`, or a workflow
-///   journal `result`/`started`) whose true time lives on **another** file: the
-///   agent named by `agent`. It rides at the head until that agent's entries are
-///   discovered, then [`date_and_sort`] promotes it to `Dated`. Because `Dated`
-///   is only ever reached via a real join, the "fabricate a date then freeze it"
-///   bug is unrepresentable.
-/// - `Leader` — genuinely undated with no join target (an empty subagent file, a
-///   true stream leader). Rides at the head permanently.
+/// - `Pending` — a fact about an agent whose true time lives on **another**
+///   file (a subagent's birth from its sidecar, a workflow ledger's result).
+///   It rides at the head until that agent's dated facts are discovered, then
+///   [`date_and_sort`] promotes it to `Dated`. Because `Dated` is only ever
+///   reached via a real join, the "fabricate a date then freeze it" bug is
+///   unrepresentable.
+/// - `Leader` — genuinely undated with no join target. Rides at the head
+///   permanently.
 #[derive(Debug, Clone)]
 pub enum Timing {
     Dated(DateTime<Utc>),
-    /// Undated, waiting on `agent`'s entries to appear (cross-file join).
+    /// Undated, waiting on `agent`'s dated facts to appear (cross-file join).
     Pending(String),
     /// Undated with nothing to wait on.
     Leader,
 }
 
-/// One merged replay step: an entry/meta update with its `Timing`.
+/// One merged replay step: what one record stated, with its `Timing`.
 ///
 /// The whole `Vec<ReplayItem>` is handed to the App via `UiEvent::ReplayLoaded`;
 /// the App's `Timeline` owns it and folds a prefix up to the playhead.
 #[derive(Debug)]
 pub struct ReplayItem {
     pub(crate) timing: Timing,
-    pub update: Update,
+    pub facts: Vec<Fact>,
 }
 
 impl ReplayItem {
@@ -54,158 +54,123 @@ impl ReplayItem {
         }
     }
 
-    /// Build an item from an already-resolved timestamp: `Some` → `Dated`,
-    /// `None` → the undated case implied by `update` (a meta / agent-referencing
-    /// journal line → `Pending` on that agent; anything else → `Leader`).
-    pub(crate) fn at(ts: Option<DateTime<Utc>>, update: Update) -> Self {
+    /// Wrap a statement as a timeline item, placed where its record was
+    /// written. An undated statement about an agent is `Pending` on that
+    /// agent; one about nothing in particular leads.
+    pub fn new(statement: Statement) -> Self {
+        Self::at(statement.at, statement.facts)
+    }
+
+    /// Build an item from an explicit timestamp: `Some` → `Dated`, `None` → the
+    /// undated case implied by the facts' envelopes.
+    pub(crate) fn at(ts: Option<DateTime<Utc>>, facts: Vec<Fact>) -> Self {
         let timing = match ts {
             Some(t) => Timing::Dated(t),
-            None => undated_timing(&update),
+            None => facts
+                .iter()
+                .find_map(|f| f.agent.clone())
+                .map_or(Timing::Leader, Timing::Pending),
         };
-        ReplayItem { timing, update }
+        ReplayItem { timing, facts }
     }
 
-    /// Wrap a live update as a timeline item, taking its timestamp from the
-    /// entry envelope (metas/journals carry none → undated, they ride at the
-    /// head until dated).
-    pub fn live(update: Update) -> Self {
-        let ts = match &update {
-            Update::Entry { entry, .. } => entry_timestamp(entry),
-            Update::SubagentMeta { .. } => None,
-        };
-        Self::at(ts, update)
+    /// Whether any fact in this item is of the given shape.
+    pub fn any(&self, pred: impl Fn(&Fact) -> bool) -> bool {
+        self.facts.iter().any(pred)
     }
 }
 
-/// The undated `Timing` for an update with no resolved timestamp: `Pending` on
-/// the agent it references (a subagent meta, or a journal `result`/`started`),
-/// else `Leader`.
-fn undated_timing(update: &Update) -> Timing {
-    let agent = match update {
-        Update::SubagentMeta { agent_id, .. } => Some(agent_id.clone()),
-        Update::Entry {
-            source: Source::Journal(_),
-            entry,
-        } => match entry {
-            Entry::Result(l) => l.agent_id.clone(),
-            Entry::Started(l) => l.agent_id.clone(),
-            _ => None,
-        },
-        Update::Entry { .. } => None,
-    };
-    agent.map_or(Timing::Leader, Timing::Pending)
-}
-
-/// Date the untimed items in place — metas → their agent's first entry, journal
-/// `result`/`started` → that agent's last/first entry (else earliest) — then
-/// stably sort the whole list by timestamp. For the one-shot
-/// bulk replay assembly, where every file has already been parsed so an
-/// unmatched journal agent is genuinely an orphan.
+/// Date the untimed items in place — an agent's birth → its first dated fact,
+/// an ending → its last (else earliest) — then stably sort the whole list by
+/// timestamp. For the one-shot bulk replay assembly, where every file has
+/// already been parsed so an unmatched ending is genuinely an orphan.
 ///
-/// Ties sort metas before entries (so an agent exists before its first entry
-/// folds); remaining `None` timestamps (true leaders / empty subagent files)
-/// sort first. Idempotent: a meta with no entry yet stays `None` and is re-dated
-/// once its entries arrive on a later call.
+/// Ties sort births before other facts (so an agent exists before its first
+/// activity folds); remaining `None` timestamps (true leaders) sort first.
+/// Idempotent: a birth with no activity yet stays `None` and is re-dated once
+/// its facts arrive on a later call.
 pub(crate) fn date_and_sort(items: &mut [ReplayItem]) {
     date_and_sort_inner(items, true);
 }
 
-/// Like [`date_and_sort`], but for the growing live stream: a journal entry
-/// whose agent has no entries YET stays undated — riding at the head like a
-/// meta — so a later call re-dates it once the agent's transcript is
+/// Like [`date_and_sort`], but for the growing live stream: an ending whose
+/// agent has no dated facts YET stays undated — riding at the head like a
+/// birth — so a later call re-dates it once the agent's transcript is
 /// discovered. The bulk fallback to `earliest` would permanently stamp it with
 /// the session START (a `Dated` item is never re-guessed), pinning e.g. a
-/// workflow `result` hours before the workflow ran.
+/// workflow result hours before the workflow ran.
 pub(crate) fn date_and_sort_live(items: &mut [ReplayItem]) {
     date_and_sort_inner(items, false);
+}
+
+/// Whether a fact is the agent's own output (as opposed to a statement about
+/// it from elsewhere), and so evidence of when the agent was active.
+fn is_by_agent(fact: &Fact) -> bool {
+    !matches!(
+        fact.kind,
+        FactKind::Agent { .. } | FactKind::Label { .. } | FactKind::Ended(_)
+    )
 }
 
 fn date_and_sort_inner(items: &mut [ReplayItem], complete: bool) {
     let earliest = items.iter().filter_map(|i| i.ts()).min();
 
-    let mut first_entry_ts: HashMap<String, DateTime<Utc>> = HashMap::new();
-    let mut last_entry_ts: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let mut first_ts: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let mut last_ts: HashMap<String, DateTime<Utc>> = HashMap::new();
     for item in items.iter() {
-        if let (
-            Some(ts),
-            Update::Entry {
-                source: Source::Sub(id),
-                ..
-            },
-        ) = (item.ts(), &item.update)
-        {
-            first_entry_ts
-                .entry(id.clone())
-                .and_modify(|t| *t = (*t).min(ts))
-                .or_insert(ts);
-            last_entry_ts
-                .entry(id.clone())
-                .and_modify(|t| *t = (*t).max(ts))
-                .or_insert(ts);
+        for fact in item.facts.iter().filter(|f| is_by_agent(f)) {
+            // A fact's own time is the more precise witness (a completion
+            // record that also says when the call started); the record's
+            // time is the fallback.
+            if let (Some(ts), Some(id)) = (fact.ts.or(item.ts()), &fact.agent) {
+                first_ts
+                    .entry(id.clone())
+                    .and_modify(|t| *t = (*t).min(ts))
+                    .or_insert(ts);
+                last_ts
+                    .entry(id.clone())
+                    .and_modify(|t| *t = (*t).max(ts))
+                    .or_insert(ts);
+            }
         }
     }
     for item in items.iter_mut() {
         // A `Dated` item is settled — only undated (`Pending`/`Leader`) items
         // try to resolve, so a resolved date can never be re-guessed.
-        if matches!(item.timing, Timing::Dated(_)) {
+        let Timing::Pending(agent) = &item.timing else {
             continue;
-        }
+        };
         // The join rule (which edge of the agent's lifespan to borrow, and the
-        // bulk-only orphan fallback) is domain logic keyed on the update kind.
-        let resolved = match &item.update {
-            Update::SubagentMeta { agent_id, .. } => first_entry_ts.get(agent_id).copied(),
-            Update::Entry {
-                source: Source::Journal(_),
-                entry,
-            } => match entry {
-                Entry::Result(l) => l
-                    .agent_id
-                    .as_ref()
-                    .and_then(|id| last_entry_ts.get(id))
-                    .copied(),
-                Entry::Started(l) => l
-                    .agent_id
-                    .as_ref()
-                    .and_then(|id| first_entry_ts.get(id))
-                    .copied(),
-                _ => None,
-            }
-            // Bulk only: an orphan journal entry (no matching transcript
-            // anywhere) → earliest, so it folds with the start instead of
-            // leading as an untimed item. Live keeps it undated so it can
-            // be re-dated once the agent's file is discovered. (Metas never
-            // take this fallback — they stay `Pending` until their agent lands.)
-            .or(if complete { earliest } else { None }),
-            _ => None,
+        // bulk-only orphan fallback) is keyed on what the record says.
+        let ending = item
+            .facts
+            .iter()
+            .any(|f| matches!(f.kind, FactKind::Ended(_)));
+        let resolved = if ending {
+            // Bulk only: an orphan ending (no matching transcript anywhere)
+            // → earliest, so it folds with the start instead of leading as an
+            // untimed item. Live keeps it undated so it can be re-dated once
+            // the agent's file is discovered. (Births never take this
+            // fallback — they stay `Pending` until their agent lands.)
+            last_ts
+                .get(agent)
+                .copied()
+                .or(if complete { earliest } else { None })
+        } else {
+            first_ts.get(agent).copied()
         };
         if let Some(t) = resolved {
             item.timing = Timing::Dated(t);
         }
     }
 
-    let rank = |u: &Update| match u {
-        Update::SubagentMeta { .. } => 0u8,
-        Update::Entry { .. } => 1u8,
-    };
+    let rank = |i: &ReplayItem| u8::from(!i.any(|f| matches!(f.kind, FactKind::Agent { .. })));
     items.sort_by(|a, b| match (a.ts(), b.ts()) {
-        (Some(x), Some(y)) => x
-            .cmp(&y)
-            .then_with(|| rank(&a.update).cmp(&rank(&b.update))),
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| rank(a).cmp(&rank(b))),
         (Some(_), None) => std::cmp::Ordering::Greater,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (None, None) => std::cmp::Ordering::Equal,
     });
-}
-
-/// The envelope timestamp of an entry, if it carries one.
-pub(crate) fn entry_timestamp(entry: &Entry) -> Option<DateTime<Utc>> {
-    match entry {
-        Entry::User(e) => e.envelope.timestamp,
-        Entry::Assistant(e) => e.envelope.timestamp,
-        Entry::System(e) => e.envelope.timestamp,
-        Entry::Attachment(e) => e.envelope.timestamp,
-        _ => None,
-    }
 }
 
 /// Build a replay stream from a single transcript's text — the browser
@@ -237,7 +202,7 @@ pub struct DemoSubagent<'a> {
     /// `None` for a direct subagent. Drives the group node + parentage.
     pub workflow: Option<&'a str>,
     /// True when `transcript` is a workflow's `journal.jsonl` rather than a
-    /// subagent transcript — it folds under [`Source::Journal`] and carries no
+    /// subagent transcript — it folds under [`Source::Ledger`] and carries no
     /// meta. Requires `workflow` to be set.
     pub journal: bool,
 }
@@ -260,19 +225,18 @@ pub fn replay_from_session(
         // is nothing to attribute it to.
         if sub.journal {
             if let Some(wf) = sub.workflow {
-                push_lines(sub.transcript, &Source::Journal(wf.to_string()), &mut items);
+                push_lines(sub.transcript, &Source::Ledger(wf.to_string()), &mut items);
             }
             continue;
         }
-        if let Ok(meta) = serde_json::from_str::<crate::transcript::SubagentMeta>(sub.meta) {
-            items.push(ReplayItem::at(
-                None,
-                Update::SubagentMeta {
-                    agent_id: sub.agent_id.to_string(),
-                    workflow: sub.workflow.map(str::to_owned),
-                    meta,
-                },
-            ));
+        if let Ok(meta) =
+            serde_json::from_str::<crate::provider::claude::wire::SubagentMeta>(sub.meta)
+        {
+            items.push(ReplayItem::new(claude::Stream::meta(
+                sub.agent_id,
+                sub.workflow,
+                &meta,
+            )));
         }
         push_lines(
             sub.transcript,
@@ -284,40 +248,27 @@ pub fn replay_from_session(
 }
 
 /// Parse a transcript's complete lines into `items` under `source`, inheriting
-/// the previous in-file timestamp for entries that lack one.
+/// the previous in-file timestamp for lines that lack one.
 fn push_lines(text: &str, source: &Source, items: &mut Vec<ReplayItem>) {
-    let mut last_ts: Option<DateTime<Utc>> = None;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some(entry) = crate::transcript::parse_line(line) else {
-            continue;
-        };
-        let ts = entry_timestamp(&entry).or(last_ts);
-        if ts.is_some() {
-            last_ts = ts;
-        }
-        items.push(ReplayItem::at(
-            ts,
-            Update::Entry {
-                source: source.clone(),
-                entry,
-            },
-        ));
-    }
+    let mut stream = claude::Stream::new(source.clone());
+    items.extend(
+        text.lines()
+            .filter_map(|l| stream.push(l))
+            .map(ReplayItem::new),
+    );
 }
 
 /// Route untimed session-level metadata into the info store (dropping it from
 /// the timeline), then date + stably sort the rest.
 fn finish(mut items: Vec<ReplayItem>) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
     let mut info = crate::state::SessionInfo::default();
-    items.retain(|item| match &item.update {
-        Update::Entry { entry, .. } if entry.is_timeline_noise() => {
-            info.apply(entry);
+    items.retain(|item| {
+        if item.facts.iter().all(Fact::is_session_meta) {
+            item.facts.iter().for_each(|f| info.apply(f));
             false
+        } else {
+            true
         }
-        _ => true,
     });
     date_and_sort(&mut items);
     (items, info)
@@ -326,15 +277,20 @@ fn finish(mut items: Vec<ReplayItem>) -> (Vec<ReplayItem>, crate::state::Session
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::session::MAIN_ID;
 
     #[test]
-    fn journal_ledger_dates_to_the_agents_first_or_last_entry() {
+    fn births_date_to_first_activity_and_endings_to_last() {
         let sub = |t: &str| {
             format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{t}","message":{{"role":"user","content":"x"}}}}"#
             )
         };
         let mut items = Vec::new();
+        // The agent's birth from its sidecar: undated, pending on the agent.
+        let meta: crate::provider::claude::wire::SubagentMeta =
+            serde_json::from_str(r#"{"agentType":"guide"}"#).unwrap();
+        items.push(ReplayItem::new(claude::Stream::meta("subX", None, &meta)));
         // The subagent's own transcript: first entry at :05, last at :15.
         push_lines(
             &format!(
@@ -345,55 +301,46 @@ mod tests {
             &Source::Sub("subX".into()),
             &mut items,
         );
-        // Undated journal ledger lines for that agent — must borrow opposite ends
-        // of its lifespan: `started` → first entry, `result` → last entry.
+        // An undated ledger `result` for that agent: an ending. A `started`
+        // ledger line states nothing and yields no item at all.
         push_lines(
             r#"{"type":"started","key":"k","agentId":"subX"}"#,
-            &Source::Journal("wf".into()),
+            &Source::Ledger("wf".into()),
             &mut items,
         );
         push_lines(
             r#"{"type":"result","key":"k","agentId":"subX","result":"done"}"#,
-            &Source::Journal("wf".into()),
+            &Source::Ledger("wf".into()),
             &mut items,
+        );
+        assert_eq!(
+            items.len(),
+            4,
+            "birth + two entries + ending; `started` is nothing"
         );
 
         date_and_sort(&mut items);
 
-        let started_ts = items
+        let birth_ts = items
             .iter()
-            .find(|i| {
-                matches!(
-                    &i.update,
-                    Update::Entry {
-                        entry: Entry::Started(_),
-                        ..
-                    }
-                )
-            })
+            .find(|i| i.any(|f| matches!(f.kind, FactKind::Agent { .. })))
             .and_then(|i| i.ts());
-        let result_ts = items
+        let ending_ts = items
             .iter()
-            .find(|i| {
-                matches!(
-                    &i.update,
-                    Update::Entry {
-                        entry: Entry::Result(_),
-                        ..
-                    }
-                )
-            })
+            .find(|i| i.any(|f| matches!(f.kind, FactKind::Ended(_))))
             .and_then(|i| i.ts());
         assert_eq!(
-            started_ts,
+            birth_ts,
             Some("2026-06-05T10:00:05.000Z".parse::<DateTime<Utc>>().unwrap()),
-            "journal `started` dates to the agent's FIRST entry"
+            "a birth dates to the agent's FIRST activity"
         );
         assert_eq!(
-            result_ts,
+            ending_ts,
             Some("2026-06-05T10:00:15.000Z".parse::<DateTime<Utc>>().unwrap()),
-            "journal `result` dates to the agent's LAST entry"
+            "an ending dates to the agent's LAST activity"
         );
+        // Ties sort the birth before the activity it borrowed its date from.
+        assert!(items[0].any(|f| matches!(f.kind, FactKind::Agent { .. })));
     }
 
     #[test]
@@ -411,18 +358,16 @@ mod tests {
         // Two valid entries (blank + garbage skipped), sorted by timestamp.
         assert_eq!(items.len(), 2);
         assert!(items[0].ts().unwrap() < items[1].ts().unwrap());
-        // All from the main source.
-        assert!(items.iter().all(|i| matches!(
-            &i.update,
-            Update::Entry {
-                source: Source::Main,
-                ..
-            }
-        )));
+        // All by the root agent.
+        assert!(
+            items
+                .iter()
+                .all(|i| i.facts.iter().all(|f| f.agent.as_deref() == Some(MAIN_ID)))
+        );
     }
 
     #[test]
-    fn replay_from_session_emits_subagent_meta_and_sub_entries() {
+    fn replay_from_session_emits_subagent_birth_and_activity() {
         let main = r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"go"}}"#;
         let sub = DemoSubagent {
             agent_id: "a1000000000000001",
@@ -433,25 +378,25 @@ mod tests {
         };
         let (items, _info) = replay_from_session(main, &[sub]);
 
+        let by_sub = |f: &Fact| f.agent.as_deref() == Some("a1000000000000001");
         assert!(
             items
                 .iter()
-                .any(|i| matches!(&i.update, Update::SubagentMeta { agent_id, .. } if agent_id == "a1000000000000001")),
-            "a subagent meta is emitted"
+                .any(|i| i.any(|f| by_sub(f) && matches!(f.kind, FactKind::Agent { .. }))),
+            "the subagent's birth is stated"
         );
         assert!(
-            items.iter().any(|i| matches!(
-                &i.update,
-                Update::Entry { source: Source::Sub(id), .. } if id == "a1000000000000001"
-            )),
-            "subagent entries are tagged Source::Sub"
+            items
+                .iter()
+                .any(|i| i.any(|f| by_sub(f) && !matches!(f.kind, FactKind::Agent { .. }))),
+            "the subagent's own activity is attributed to it"
         );
     }
 
     /// Workflow parity with the native loader: a subagent under
-    /// `subagents/workflows/<id>/` must carry its workflow id (so the model
-    /// creates the group node and parents it there), and the workflow's
-    /// `journal.jsonl` must fold under `Source::Journal` — not as a subagent.
+    /// `subagents/workflows/<id>/` must carry its workflow as parent (so the
+    /// model creates the group node and parents it there), and the workflow's
+    /// `journal.jsonl` must state endings — not activity of some agent.
     /// Without this the browser silently renders workflow sessions as a flat
     /// fan-out, while the native TUI shows the group.
     #[test]
@@ -468,7 +413,7 @@ mod tests {
             DemoSubagent {
                 agent_id: "",
                 meta: "",
-                transcript: r#"{"type":"started","key":"review","agentId":"w1000000000000001"}"#,
+                transcript: r#"{"type":"result","key":"review","agentId":"w1000000000000001","result":{"ok":true}}"#,
                 workflow: Some("wf-99"),
                 journal: true,
             },
@@ -476,25 +421,24 @@ mod tests {
         let (items, _info) = replay_from_session(main, &subs);
 
         assert!(
-            items.iter().any(|i| matches!(
-                &i.update,
-                Update::SubagentMeta { agent_id, workflow: Some(wf), .. }
-                    if agent_id == "w1000000000000001" && wf == "wf-99"
-            )),
-            "a workflow subagent's meta carries its workflow id"
+            items.iter().any(|i| i.any(|f| matches!(
+                &f.kind,
+                FactKind::Agent { parent: Some(p), .. }
+                    if f.agent.as_deref() == Some("w1000000000000001") && p == "wf-99"
+            ))),
+            "a workflow subagent's birth names its workflow as parent"
         );
         assert!(
-            items.iter().any(|i| matches!(
-                &i.update,
-                Update::Entry { source: Source::Journal(wf), .. } if wf == "wf-99"
-            )),
-            "journal lines fold under Source::Journal, not Source::Sub"
+            items
+                .iter()
+                .any(|i| i.any(|f| matches!(f.kind, FactKind::Ended(_))
+                    && f.agent.as_deref() == Some("w1000000000000001"))),
+            "journal results are endings for the agent they name"
         );
         assert!(
-            !items.iter().any(|i| matches!(
-                &i.update,
-                Update::Entry { source: Source::Sub(id), .. } if id.is_empty()
-            )),
+            !items
+                .iter()
+                .any(|i| i.any(|f| f.agent.as_deref() == Some(""))),
             "the journal is not mistaken for a subagent transcript"
         );
     }

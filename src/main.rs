@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
-use zoetrope::state::session::{AgentKind, SessionModel, ToolState};
+use zoetrope::provider::claude::{self, Source, discovery, wire};
+use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
-use zoetrope::tailer::{Source, TailRequest, UiEvent, Update};
-use zoetrope::{tailer, transcript, tui};
+use zoetrope::tailer::{TailRequest, UiEvent};
+use zoetrope::{tailer, tui};
 
 /// Channel capacity for the bounded request/event channels.
 const CHANNEL_CAP: usize = 32;
@@ -133,12 +134,10 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
 fn fold_file(model: &mut SessionModel, path: &Path, source: Source) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading transcript {}", path.display()))?;
-    for line in text.lines() {
-        if let Some(entry) = transcript::parse_line(line) {
-            model.apply_update(&Update::Entry {
-                source: source.clone(),
-                entry,
-            });
+    let mut stream = claude::Stream::new(source);
+    for statement in text.lines().filter_map(|l| stream.push(l)) {
+        for fact in &statement.facts {
+            model.apply_fact(fact);
         }
     }
     Ok(())
@@ -150,8 +149,10 @@ fn fold_meta(model: &mut SessionModel, path: &Path, agent_id: &str, workflow: Op
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    if let Some(meta) = transcript::parse_meta(&text) {
-        model.apply_meta(agent_id, workflow, &meta);
+    if let Some(meta) = wire::parse_meta(&text) {
+        for fact in &claude::Stream::meta(agent_id, workflow, &meta).facts {
+            model.apply_fact(fact);
+        }
     }
 }
 
@@ -173,19 +174,19 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
     // transcript's tool_results resolve their statuses. Order is not critical —
     // the model is fold-order independent for completion — but this keeps the
     // tree well-formed.
-    if let Some(subs) = transcript::subagents_dir(main_file) {
+    if let Some(subs) = discovery::subagents_dir(main_file) {
         // Direct subagents: agent-<id>.jsonl + agent-<id>.meta.json
         collect_subagents(&mut model, &subs, None);
 
         // Workflow subagents: workflows/<wf-id>/agent-*.jsonl + journal.jsonl
-        for wf_id in transcript::scan_workflow_ids(&subs) {
-            let wf_path = transcript::workflow_dir(&subs, &wf_id);
+        for wf_id in discovery::scan_workflow_ids(&subs) {
+            let wf_path = discovery::workflow_dir(&subs, &wf_id);
             collect_subagents(&mut model, &wf_path, Some(&wf_id));
 
             // Journal ledger marks workflow-subagent completion.
-            let journal = transcript::workflow_journal(&subs, &wf_id);
+            let journal = discovery::workflow_journal(&subs, &wf_id);
             if journal.is_file() {
-                let _ = fold_file(&mut model, &journal, Source::Journal(wf_id.clone()));
+                let _ = fold_file(&mut model, &journal, Source::Ledger(wf_id.clone()));
             }
         }
     }
@@ -195,7 +196,7 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
 
     // Workflow group nodes have no direct completion signal — roll them up from
     // their children once everything is folded.
-    model.recompute_workflow_status();
+    model.recompute_group_status();
 
     // Interactive agents (main, forks) have no completion signal: derive
     // their liveness against the wall clock — `inspect` is a point-in-time
@@ -208,7 +209,7 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
 /// Discover and fold every `agent-<id>.jsonl` (+ `.meta.json`) in `dir`. Used
 /// for both direct subagents (`workflow == None`) and workflow subagents.
 fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str>) {
-    for file in transcript::scan_subagent_files(dir, workflow) {
+    for file in discovery::scan_subagent_files(dir, workflow) {
         // Fold the meta sidecar first so the node exists with type/desc.
         if file.meta.is_file() {
             fold_meta(model, &file.meta, &file.agent_id, workflow);
@@ -227,28 +228,7 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
     let model = parse_session_fully(&file)?;
     let info = read_session_info(&file);
 
-    let title = info.title.as_deref().unwrap_or("(untitled)");
-    println!("session {} — {title}", model.session_id);
-    // Session-level metadata (the `i` overlay's content, headless).
-    println!(
-        "  mode: {} · permission: {}",
-        info.mode.as_deref().unwrap_or("—"),
-        info.permission_mode.as_deref().unwrap_or("—"),
-    );
-    println!(
-        "  {} agent(s), {} tool call(s) · {} queued · {} file edit(s)",
-        model.agent_count(),
-        model.tool_count(),
-        info.queued_ops,
-        info.file_snapshots,
-    );
-    if let Some(p) = &info.last_prompt {
-        println!("  last prompt: {p:?}");
-    }
-    println!();
-
-    // Print roots first, then children indented underneath, in spawn order.
-    print_agent_tree(&model, None, 0);
+    print!("{}", zoetrope::state::render::report(&model, &info));
 
     Ok(())
 }
@@ -259,82 +239,12 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
 fn read_session_info(main_path: &Path) -> zoetrope::state::SessionInfo {
     let mut info = zoetrope::state::SessionInfo::default();
     if let Ok(text) = std::fs::read_to_string(main_path) {
-        for line in text.lines() {
-            if let Some(entry) = transcript::parse_line(line) {
-                info.apply(&entry);
-            }
+        let mut stream = claude::Stream::new(Source::Main);
+        for statement in text.lines().filter_map(|l| stream.push(l)) {
+            statement.facts.iter().for_each(|f| info.apply(f));
         }
     }
     info
-}
-
-/// Recursively print agents whose `parent` equals `parent`, in spawn order.
-fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
-    for id in model.spawn_order() {
-        let Some(agent) = model.agent(id) else {
-            continue;
-        };
-        if agent.parent.as_deref() != parent {
-            continue;
-        }
-
-        let indent = "  ".repeat(depth + 1);
-        let kind = match agent.kind {
-            AgentKind::Main => "main",
-            AgentKind::Subagent => "subagent",
-            AgentKind::WorkflowGroup => "workflow",
-        };
-        // Single source: same wording + glyph the cards/panel use.
-        let status = agent.status_word();
-        let glyph = agent.status.glyph();
-
-        let label = agent
-            .agent_type
-            .as_deref()
-            .or(agent.description.as_deref())
-            .unwrap_or(id);
-
-        // Tool tallies.
-        let mut ok = 0u32;
-        let mut err = 0u32;
-        let mut pending = 0u32;
-        for t in agent.tool_calls() {
-            match t.state {
-                ToolState::Ok => ok += 1,
-                ToolState::Err => err += 1,
-                ToolState::Pending => pending += 1,
-            }
-        }
-
-        println!("{indent}{glyph} [{kind}] {label}  ({status}) — id={id}");
-        if let Some(desc) = &agent.description
-            && agent.agent_type.is_some()
-        {
-            println!("{indent}    {desc}");
-        }
-        if let Some(model_name) = &agent.model {
-            println!("{indent}    model: {model_name}");
-        }
-        println!(
-            "{indent}    tools: {} ({ok}✓ {err}✗ {pending}⏳)   tokens: {}",
-            agent.tool_calls().len(),
-            agent.output_tokens
-        );
-
-        // Provenance: what triggered this agent (the panel's `↳ prompt`/`↳ thought`).
-        if let Some(ctx) = model.provenance(agent) {
-            if let Some(prompt) = model.provenance_prompt(ctx) {
-                println!("{indent}    ↳ prompt: {prompt}");
-            }
-            if let Some(reasoning) = &ctx.reasoning {
-                println!("{indent}    ↳ thought: {reasoning}");
-            }
-        }
-
-        // Recurse into this agent's children (workflow groups have subagent
-        // children, main has direct subagents + workflow groups).
-        print_agent_tree(model, Some(id), depth + 1);
-    }
 }
 
 /// Resolve a `View` invocation into (session id, watch target, mode, feeder,
@@ -377,11 +287,11 @@ async fn run_tui(cli: Cli) -> Result<()> {
                 Some(d) => d,
                 None => std::env::current_dir().context("resolving current directory")?,
             };
-            let proj = transcript::project_dir(&cwd)
+            let proj = discovery::project_dir(&cwd)
                 .ok_or_else(|| anyhow!("no Claude projects directory for {}", cwd.display()))?;
             // Best-effort latest session id so stale events filter; the tailer
             // re-discovers and may switch.
-            let session_id = transcript::latest_session_file(&proj)
+            let session_id = discovery::latest_session_file(&proj)
                 .as_deref()
                 .and_then(Path::file_stem)
                 .and_then(|s| s.to_str())

@@ -15,6 +15,50 @@ Almost every design decision below is downstream of that one sentence.
 
 ---
 
+## 0. The provider boundary
+
+Every transcript format enters through one seam. A **provider**
+(`src/provider/<name>/`) turns its own records into the shared vocabulary in
+`src/fact.rs`, and `SessionModel` folds `Fact`s without knowing which format
+stated them. The rule that decides what belongs on which side:
+
+> **A provider states what its records contain. The core decides what it means
+> when nothing was recorded.**
+
+So a provider never concludes. It emits `ToolEnd` only from a record that
+carries an outcome, never synthesised from silence; it emits `Ended` only when
+the format recorded the agent's end; it knows which tool names spawn agents and
+says so with a `Spawn` fact, but never says an agent is done because a tool
+result came back. Reasoning about *absence* — the ack-vs-completion join (§2.1),
+time-derived liveness (§4), group rollup — lives in the core once, and survives
+every format.
+
+Four consequences worth knowing before touching either side:
+
+- **Every fact carries the same envelope** (`agent`, `ts`). Activity tracking
+  and undated-item dating (`Timing`) read the envelope, so neither needs to know
+  a record kind. A line that states nothing else still states `Activity`.
+- **A record has a time; its facts have their own.** A provider emits one
+  `Statement` per record: where the file wrote it, plus what it said. The
+  timeline places the record; the fold reads each fact's time. So a completion
+  record that also says when its call started keeps the tool's duration right
+  without inventing a timeline position the file never had (§1.2).
+- **An agent exists once it has spoken.** Facts *by* an agent create its node;
+  facts *about* one (`Label`, `Ended`) only record until it appears. That is the
+  order-independence of §1.1 stated as a creation rule.
+- **What a format's quirks mean is the provider's to know, with a fixture to
+  prove it.** "A missing `is_error` means success" is a fact about Claude's
+  format, verified against real data; it lives in `provider/claude/`, not in
+  the model. A new provider proves itself by running its own fixture through
+  `provider::harness::conform`: order invariance (§1.1) plus two golden files
+  beside the fixture, the folded model and the dated timeline, which double as
+  the readable record of what that provider extracts.
+
+Adding a provider is one directory and no decisions: `src/provider/mod.rs`
+spells out the three files, where fixtures go, and the one test to pass.
+
+---
+
 ## 1. The two ground rules
 
 ### 1.1 Order-independence (the fold model)
@@ -22,17 +66,18 @@ Almost every design decision below is downstream of that one sentence.
 The derived `SessionModel` is a **pure function of the set of facts folded into
 it — never of their arrival order.** Every update is *idempotent* (re-applying a
 line is a no-op) and *commutative* (two updates reach the same state in either
-order). The completion/spawn joins are keyed stores (`completed_spawns`,
-`task_terminal`, `journal_done`) precisely so a fact can arrive before *or* after
-the thing it refers to and still attach; prompt/era attribution is likewise
+order). The completion/spawn joins are keyed stores (`completed_calls`,
+`ended`, `labels`) precisely so a fact can arrive before *or* after the thing it
+refers to and still attach; prompt/era attribution is likewise
 arrival-order independent — timestamp-derived (`prompt_for_ts` over the `prompts`
 list), not a join store.
 
 Why this is non-negotiable — three independent consumers demand it:
 
-- **Multi-file merge.** Main transcript, `subagents/*.jsonl`, and workflow
-  `journal.jsonl` are tailed separately and interleave by timestamp; a subagent's
-  result can be read before its spawn.
+- **Multi-file merge.** A provider may spread one session over several files
+  (Claude: main transcript, `subagents/*.jsonl`, workflow `journal.jsonl`). They
+  are tailed separately and interleave by timestamp; an agent's ending can be
+  read before its birth.
 - **Backward seek.** Folding is forward-only, so seeking into the past re-folds
   the model from `items[0..target]` from a **snapshot ladder** rung when one is
   available, from item zero when it is not. Either way it must land on exactly
@@ -40,8 +85,9 @@ Why this is non-negotiable — three independent consumers demand it:
 - **Live vs replay.** The same items arrive as a bulk sorted `Vec` (replay) or as
   arrival-order appends (live). Both must converge.
 
-Guarded by a **shuffle-invariance property test**: fold a real stream in bulk
-order and in many shuffled orders; the final model must be identical.
+Guarded by a **shuffle-invariance property test** over the fact stream: fold
+what the provider states in bulk order and in many shuffled orders; the final
+model must be identical.
 
 ### The snapshot ladder
 
@@ -134,8 +180,12 @@ an agent against time-derived revival):
   older than the agent's last activity — see the soft spot in §3).
 - A workflow **journal `result`** entry naming the agent.
 - A **`<task-notification>`** — the timestamped terminal report for a background
-  agent (`stopped` / `completed` / `failed`). Routed off the prompt spine into
-  `apply_task_notification`.
+  agent (`stopped` / `completed` / `failed`).
+
+Both of the latter reach the model as one thing: an `Ended` fact stated by the
+Claude provider, recorded in the `ended` store where it outranks the
+acknowledgement and time-derived liveness. The provider knows which records are
+endings; the model only knows an ending when it sees one.
 
 `meta.stoppedByUser` is a *static final* flag and is **not** used as a completion
 time — see §1.2.
@@ -163,10 +213,10 @@ test** for whether such a heuristic is legitimate:
 
 | Heuristic | Location | Derives | Verdict |
 |---|---|---|---|
-| **Workflow-group rollup** | `recompute_workflow_status` | Group status = all-children-terminal (`Failed` if any child failed) | ✅ **Textbook.** No workflow completion event exists; children's own terminal status *is* the ground truth; fully re-derived, reverts to `Running` when a late child appears. |
+| **Group rollup** | `recompute_group_status` | Group status = all-children-terminal (`Failed` if any child failed) | ✅ **Textbook.** No group completion event exists; children's own terminal status *is* the ground truth; fully re-derived, reverts to `Running` when a late child appears. |
 | **Time-derived liveness** | `recompute_liveness` | Agent `Running`/`Idle`/`Done` from an activity window **+ pending tool_calls** | ✅ **Legit** (as of this session). Terminal acks and pending tools — the ground truth — short-circuit it; the 120s window only fills the residual gap, reversibly. This is the one that *used* to fail the litmus. |
 | **Spawn ack classification** | `resolve_spawn_status` | Whether an ack is a completion (sync) or a handle (async still running), via `last_ts > ack_ts` | ⚠️ **Mostly legit — one soft spot.** Grounded in real timestamps, but an async agent with *no own activity yet* + a spawn ack defaults to terminal `Done`. A definitive "done" from absence of evidence — the same shape as the bug we fixed, on a much rarer path. See §7. |
-| **Undated-item dating** | `Timing` enum, `date_and_sort` (tailer) | Timestamps/order for **journal entries that carry none** in the format | ✅ **Legit.** A real gap (the data genuinely has no timestamp); dated relative to dated neighbours / a leader; guarded by an order-independence property test. |
+| **Undated-item dating** | `Timing` enum, `date_and_sort` (tailer) | Timestamps/order for **records that carry none** (Claude's sidecars and ledgers) | ✅ **Legit.** A real gap (the data genuinely has no timestamp); dated relative to dated neighbours / a leader; guarded by an order-independence property test. |
 | **Prompt / era attribution** | `prompt_for_ts`, era derivation | Which prompt-era an agent or entry belongs to | ✅ **Legit.** A pure function of recorded timestamps, cross-source-arrival-order independent. No "belongs to prompt X" field exists. |
 
 **Not this class — presentation thresholds.** `RUN_GAP` (chip grouping),

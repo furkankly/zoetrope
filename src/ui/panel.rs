@@ -186,7 +186,10 @@ fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rat
     let mut lines: Vec<Line> = Vec::new();
 
     // Title: agent type, bold.
-    let title = agent.agent_type.as_deref().unwrap_or("claude");
+    let title = agent
+        .agent_type
+        .as_deref()
+        .unwrap_or(agent.kind.default_label());
     lines.push(Line::from(Span::styled(
         title,
         bg.fg(palette.text).add_modifier(Modifier::BOLD),
@@ -539,9 +542,9 @@ mod tests {
 
     #[test]
     fn tool_list_lines_counts_era_headers() {
+        use crate::provider::claude::wire::parse_line;
+        use crate::provider::claude::{Record, Source};
         use crate::state::session::{SessionModel, ToolCallInfo, ToolState};
-        use crate::tailer::{Source, Update};
-        use crate::transcript::parse_line;
 
         let mut m = SessionModel::new("s".into());
         for (uid, ts, text) in [
@@ -551,7 +554,7 @@ mod tests {
             let line = format!(
                 r#"{{"type":"user","uuid":"{uid}","parentUuid":null,"origin":{{"kind":"human"}},"timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
             );
-            m.apply_update(&Update::Entry {
+            m.apply_update(&Record::Entry {
                 source: Source::Main,
                 entry: parse_line(&line).unwrap(),
             });

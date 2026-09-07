@@ -18,10 +18,10 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use common::{Session, Spec};
+use zoetrope::provider::claude::wire;
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{ReplayItem, UiEvent, replay_from_session};
-use zoetrope::transcript;
 
 /// The scales every group runs over.
 fn scales() -> Vec<(&'static str, Session)> {
@@ -68,7 +68,7 @@ fn bench_parse(c: &mut Criterion) {
             b.iter(|| {
                 let mut n = 0usize;
                 for l in lines {
-                    if transcript::parse_line(black_box(l)).is_some() {
+                    if wire::parse_line(black_box(l)).is_some() {
                         n += 1;
                     }
                 }
@@ -102,7 +102,9 @@ fn bench_load(c: &mut Criterion) {
                 |items| {
                     let mut m = SessionModel::new("bench".to_string());
                     for it in &items {
-                        m.apply_update(&it.update);
+                        for f in &it.facts {
+                            m.apply_fact(f);
+                        }
                     }
                     black_box(m.agent_count())
                 },
