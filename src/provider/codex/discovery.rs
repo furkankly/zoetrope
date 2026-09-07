@@ -166,6 +166,12 @@ pub fn all_paths(scope: &Scope) -> Vec<PathBuf> {
         let day_floor = day_dir_floor(since);
         out.retain(|p| day_of(p).and_then(day_key).is_none_or(|d| d >= day_floor));
     }
+    // A rollout's name ends in its thread id, and a session's id is its
+    // root's thread id: the root can be found by name without reading. The
+    // children, whose names carry their own ids, are found from the root.
+    if let Some(prefix) = &scope.id_prefix {
+        out.retain(|p| thread_id_from_path(p).is_some_and(|id| id.starts_with(prefix.as_str())));
+    }
     out
 }
 
@@ -236,12 +242,19 @@ fn from_meta(path: &Path, meta: &SessionMeta, modified: SystemTime) -> Option<Se
     })
 }
 
-/// Where the rest of a file's session is. From a root: rollouts in its day
-/// and every later one, where children land. From a child: every rollout in
-/// the tree, since the root may be in an earlier day.
+/// Where the rest of a file's session is. From a root: rollouts between its
+/// day and the day of its last write, since a child is spawned while the
+/// root runs and the root writes after every spawn. From a child: every
+/// rollout in the tree, since the root may be in an earlier day.
 pub fn related_paths(file: &SessionFile) -> Vec<PathBuf> {
     let paths = match file.role {
-        FileRole::Root => rollouts_from(&file.path),
+        FileRole::Root => {
+            let last = day_dir_floor(file.modified);
+            rollouts_from(&file.path)
+                .into_iter()
+                .filter(|p| day_of(p).and_then(day_key).is_none_or(|d| d <= last))
+                .collect()
+        }
         _ => file
             .path
             .parent()
@@ -260,6 +273,33 @@ pub fn project_key(cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root's children are looked for only up to the day of its last
+    /// write: a child is spawned while the root runs, and the root writes
+    /// after every spawn.
+    #[test]
+    fn related_paths_stop_at_the_roots_last_write() {
+        let Some(dir) = crate::provider::harness::fixture_dir("codex") else {
+            return;
+        };
+        let day = dir.join("desktop-0.150.0/2026/08/26");
+        let root_path = std::fs::read_dir(&day)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| read_meta(p).is_some_and(|m| m.is_root()))
+            .unwrap();
+        let mut root = session_file(&root_path).unwrap();
+        // Last written on its own day: the day's other rollouts are candidates.
+        root.modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_787_760_000);
+        let near = related_paths(&root);
+        assert_eq!(near.len(), 6, "the six children share the root's day");
+        assert!(near.iter().all(|p| p.parent() == Some(day.as_path())));
+        // Last written before its own day (impossible, but the bound is the
+        // point): nothing after that day is looked at.
+        root.modified = std::time::UNIX_EPOCH;
+        assert!(related_paths(&root).is_empty());
+    }
 
     #[test]
     fn thread_id_is_the_tail_of_the_stem() {
