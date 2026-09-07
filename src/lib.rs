@@ -21,14 +21,16 @@
 //!
 //! Portable everywhere: the domain [`state`] (model + unified replay/live
 //! [`timeline`](state::timeline) + flow-graph projection), the [`ui`] rendering,
-//! and [`transcript`] parsing. The wire types and pure replay assembly live in
-//! [`tailer`]; its live file-tailing + the terminal loop ([`tui`]) and input
+//! the [`fact`] vocabulary every transcript format is reduced to, and the
+//! [`provider`] providers that do the reducing. The wire types and pure replay
+//! assembly live in [`tailer`]; its live file-tailing + the terminal loop ([`tui`]) and input
 //! ([`handler`]) are native-only (they pull tokio/crossterm/fs) and `cfg`-gated
 //! behind the `native` feature.
 
+pub mod fact;
+pub mod provider;
 pub mod state;
 pub mod tailer;
-pub mod transcript;
 pub mod ui;
 
 // The native frontend: terminal loop + crossterm input.
