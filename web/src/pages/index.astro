@@ -21,15 +21,15 @@ const KEYS_URL = '/guides/usage/';
     <meta charset="UTF-8" />
     <Analytics />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>zoetrope — watch your agents work</title>
+    <title>zoetrope — watch your Claude Code and Codex agents work</title>
     <meta
       name="description"
-      content="A terminal UI that visualizes Claude Code agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
+      content="A terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
     />
     <Schema />
     <Seo
-      title="zoetrope — watch your agents work"
-      description="A terminal UI that visualizes Claude Code agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
+      title="zoetrope — watch your Claude Code and Codex agents work"
+      description="A terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <Font cssVariable="--font-mono" preload />
@@ -83,15 +83,15 @@ const KEYS_URL = '/guides/usage/';
         <div class="pitch">
           <h1>watch your<br />agents <em>work.</em></h1>
           <p class="sub">
-            Claude Code writes a JSONL log for every session. zoetrope reads it and
-            lays the session out as a graph: which agents ran, and what each one is
-            doing. Watch a live session, or replay a finished one.
+            Claude Code and Codex write a transcript for every session. zoetrope
+            reads it and lays the session out as a graph: which agents ran, and
+            what each one is doing. Watch a live session, or replay a finished one.
           </p>
           <div class="actions">
             <a class="btn primary" href="/app">▸ try it in your browser</a>
             <a class="btn ghost" href={DOCS_URL}>install the TUI</a>
           </div>
-          <p class="fineprint">reads the JSONL Claude Code already writes · runs fully local.</p>
+          <p class="fineprint">reads the transcripts Claude Code and Codex already write · runs fully local.</p>
         </div>
       </section>
 
@@ -163,6 +163,17 @@ const KEYS_URL = '/guides/usage/';
             <img src="/zoetrope-tour.gif" alt="Panning, zooming, opening an agent's detail panel, and dragging the scrubber to time-travel" width="1728" height="944" loading="lazy" decoding="async" />
           </video>
         </div>
+        <div class="shot">
+          <div class="shot-head"><span class="dots"><i></i><i></i><i></i></span><span>a Codex session · same app</span></div>
+          <video src="/zoetrope-codex.mp4" aria-label="zoetrope replaying a Codex CLI session as a flow graph: the main agent and the four agents it spawned, with an agent's detail panel and the session info overlay" width="1728" height="944"
+                 autoplay muted loop playsinline preload="metadata">
+            <img src="/zoetrope-codex.gif" alt="zoetrope replaying a Codex CLI session as a flow graph: the main agent and the four agents it spawned, with an agent's detail panel and the session info overlay" width="1728" height="944" loading="lazy" decoding="async" />
+          </video>
+        </div>
+        <p class="shotcap">The same graph from a Codex session: the CLI on the same brief, four
+        agents spawned in parallel, and both layers of every <code>exec</code> call, the
+        program the model wrote and the commands that actually ran.</p>
+
         <p class="shotcap">Click an agent for its provenance — the prompt that spawned it, the
           reasoning, every tool it ran. Then drag the scrubber to travel back through the session.</p>
 

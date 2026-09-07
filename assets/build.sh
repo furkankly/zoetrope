@@ -34,6 +34,7 @@ DEMOS=(
   "demo:zoetrope-demo"
   "follow:zoetrope-follow"
   "tour:zoetrope-tour"
+  "codex:zoetrope-codex"
 )
 WEB_PUBLIC=web/public
 
