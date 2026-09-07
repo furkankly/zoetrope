@@ -926,6 +926,17 @@ impl App {
         self.flow.selected_nodes().next().map(|n| n.id.clone())
     }
 
+    /// Drop every ladder rung, keeping the folded model and the canvas.
+    ///
+    /// A bench hook, not a feature: pricing the ladder means reading the heap
+    /// with the rungs and again without them, and the ladder is private. Hidden
+    /// from the docs so it is no part of the published API's contract. The
+    /// next fold or backward seek simply starts a fresh ladder.
+    #[doc(hidden)]
+    pub fn drop_snapshot_ladder(&mut self) {
+        self.snapshots.clear();
+    }
+
     /// Unified play/pause (`space`) that works from any state — **including at a
     /// live edge**:
     /// - **playing** (following the edge, not paused) → park at the current

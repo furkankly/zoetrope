@@ -84,11 +84,14 @@ fn measure(name: &str, spec: Spec) {
     let after_app = live();
 
     // The ladder is the part that trades memory for seek time, so price it on
-    // its own: fold to the edge, then read what the rungs added.
-    let before_seek = live();
-    app.seek_to_fraction(0.0);
-    app.seek_to_fraction(1.0);
-    let ladder = live().saturating_sub(before_seek);
+    // its own. The rungs were taken during the fold to the edge above, and they
+    // share structure with the live model, so their cost is only what nothing
+    // else keeps alive: read the heap with them, drop them, read it again.
+    // (Seeking away and back does NOT measure this — rungs already exist at
+    // every stride, so a seek takes none; it only builds a second model.)
+    let with_ladder = live();
+    app.drop_snapshot_ladder();
+    let ladder = with_ladder.saturating_sub(live());
 
     let d = |a: usize, b: usize| mb(b.saturating_sub(a));
 
