@@ -1,5 +1,5 @@
 //! `SessionModel`: the pure domain model — agents, their statuses, and tool
-//! calls, derived solely from parsed transcript updates. No rataflow types
+//! calls, folded solely from `Fact`s. No provider records and no rataflow types
 //! here; the graph layer ([`crate::state::graph`]) projects this onto a `Flow`.
 //!
 //! Node ids are stable strings: `"main"` for the root agent, the 17-hex
@@ -11,10 +11,7 @@ use imbl::{HashMap, HashSet, OrdMap, Vector};
 
 use chrono::{DateTime, Utc};
 
-use crate::tailer::{Source, Update};
-use crate::transcript::{
-    AgentToolInput, ContentBlock, Entry, LedgerEntry, SubagentMeta, UserContent, UserContentBlock,
-};
+use crate::fact::{Fact, FactKind, Outcome};
 
 /// Stable node id of the main (root) agent.
 pub const MAIN_ID: &str = "main";
@@ -38,43 +35,39 @@ pub struct SessionModel {
     pub(crate) spawn_order: Vector<String>,
     /// Most recent activity timestamp seen across all files.
     pub last_activity: Option<DateTime<Utc>>,
-    /// `runId → (workflowName, summary)` from main-transcript workflow launches,
-    /// kept as a FACT rather than applied on arrival: the launch and the group's
-    /// first subagent meta can fold in either order, so both sides consult this.
-    workflow_labels: OrdMap<String, (Option<String>, Option<String>)>,
-    /// Completion facts, kept so model state is a function of the fact SET,
-    /// not of arrival order — a completion can arrive before its target
-    /// exists (live attach applies the main transcript before directory scans
-    /// deliver metas; replay merges many files). `tool_use_id → (is_err, ack_ts)`
-    /// for every main-transcript tool_result. The timestamp matters because a
-    /// PARALLEL subagent's `Agent` result is an immediate spawn-ack (ms after the
-    /// call), NOT its completion — so it only completes the subagent when not
-    /// superseded by the subagent's own later activity (see
-    /// [`resolve_spawn_status`](Self::resolve_spawn_status)).
-    completed_spawns: HashMap<String, (bool, Option<DateTime<Utc>>)>,
-    /// Agent ids named done by workflow-journal `result` entries.
-    journal_done: HashSet<String>,
-    /// Authoritative terminal status per agent id, from an async
-    /// `<task-notification>`. Recorded order-independently (the notification may
-    /// arrive before the agent exists) and applied by
-    /// [`resolve_spawn_status`](Self::resolve_spawn_status), where it OUTRANKS the
-    /// spawn-ack and time-derived liveness — the only real completion report the
-    /// async format gives us.
-    task_terminal: HashMap<String, AgentStatus>,
+    /// Names stated for an agent by records other than its own (`Label`
+    /// facts: a workflow launch naming its group). Kept as a FACT rather than
+    /// applied on arrival: the label and the agent's birth fold in either order.
+    labels: OrdMap<String, (Option<String>, Option<String>)>,
+    /// Every observed tool end, `call → (is_err, ts)`, kept so model state is a
+    /// function of the fact SET, not of arrival order: a spawning call's end
+    /// can arrive before the agent it spawned exists (live attach applies the
+    /// main transcript before directory scans deliver metas; replay merges many
+    /// files). The timestamp matters because a PARALLEL subagent's spawn result
+    /// is an immediate acknowledgement (ms after the call), NOT its completion,
+    /// so it only completes the subagent when not superseded by the subagent's
+    /// own later activity (see [`resolve_spawn_status`](Self::resolve_spawn_status)).
+    completed_calls: HashMap<String, (bool, Option<DateTime<Utc>>)>,
+    /// Authoritative terminal status per agent, from an `Ended` fact (a
+    /// `<task-notification>`, a workflow journal `result`, a Codex lifecycle
+    /// record). Recorded order-independently — the fact may arrive before the
+    /// agent exists — and applied by
+    /// [`resolve_spawn_status`](Self::resolve_spawn_status), where it OUTRANKS
+    /// the spawn acknowledgement and time-derived liveness.
+    ended: HashMap<String, AgentStatus>,
     /// Provenance facts: why each spawned agent exists, keyed by the spawning
-    /// `tool_use_id` (order-independent, like the completion stores). Captured
-    /// at the spawning call in the main transcript; joined to the agent via
-    /// `spawned_by_tool_use` at render time.
+    /// call (order-independent, like the other stores). Captured at the
+    /// `Spawn` fact; joined to the agent via `spawned_by_tool_use` at render.
     spawn_context: HashMap<String, SpawnContext>,
     /// Every plain user prompt in the main transcript, in order — the
     /// session's spine. Tool calls and spawns attribute to a prompt era via
     /// [`Self::prompt_for_ts`] (timestamp-derived, order-independent).
     pub(crate) prompts: Vector<PromptInfo>,
-    /// Excerpt of the most recent assistant text in the main transcript.
-    /// One logical turn spans several JSONL lines, so the reasoning for a
-    /// spawn usually lives on an EARLIER line than the tool_use — this is the
-    /// cross-line fallback for [`SpawnContext::reasoning`].
-    last_main_text: Option<String>,
+    /// Excerpt of each agent's most recent reasoning. One logical turn spans
+    /// several records, so the reasoning for a spawn usually lives on an
+    /// EARLIER record than the call — this is the cross-record fallback for
+    /// [`SpawnContext::reasoning`].
+    last_reasoning: HashMap<String, String>,
 }
 
 /// A notable timeline event for the scrubber's log line: a prompt (era
@@ -118,39 +111,9 @@ pub struct SpawnContext {
     pub reasoning: Option<String>,
 }
 
-/// Distinguishes the three kinds of node the model produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentKind {
-    /// The root agent (`"main"`).
-    Main,
-    /// A direct or workflow subagent.
-    Subagent,
-    /// A group node representing a workflow run.
-    WorkflowGroup,
-}
-
-/// Lifecycle status of an agent. Drives node color and edge animation.
-///
-/// The states encode what we can truthfully claim. Spawned agents (direct
-/// subagents, workflow subagents, groups) have completion evidence in the
-/// format and use `Running`/`Done`/`Failed`. Interactive agents (main, forks)
-/// have NO end marker in the format — completion is unknowable — so they use
-/// `Running`/`Idle`: "entries within the idle window" vs "silent" — both
-/// statements of fact, neither a claim of completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentStatus {
-    Running,
-    /// Interactive agent with no recent activity (never claims completion).
-    Idle,
-    Done,
-    Failed,
-    /// A background agent the user stopped mid-run — from an async
-    /// `<task-notification>` with `<status>stopped</status>`. Terminal, but NOT
-    /// a success — kept distinct from `Done` so a reviewer sees it was cut short.
-    /// (`meta.stoppedByUser` reports the same outcome but is intentionally inert;
-    /// see the NOTE in [`apply_meta`](SessionModel::apply_meta).)
-    Stopped,
-}
+// The vocabulary shared with every provider lives on the boundary;
+// re-exported here so `state::session::AgentKind` keeps resolving.
+pub use crate::fact::{AgentKind, AgentStatus};
 
 impl AgentStatus {
     /// The status glyph — single source for cards, cells, panel, inspect.
@@ -333,19 +296,22 @@ impl SessionModel {
     /// pre-seeded as [`AgentStatus::Running`].
     pub fn new(session_id: String) -> Self {
         let mut agents = OrdMap::new();
-        agents.insert(MAIN_ID.to_string(), AgentInfo::new(AgentKind::Main));
+        let mut main = AgentInfo::new(AgentKind::Main);
+        // The root agent's display name is provider data, not a constant of the
+        // graph projection. Seeded here until the parser layer owns it.
+        main.agent_type = Some("claude".to_string());
+        agents.insert(MAIN_ID.to_string(), main);
         SessionModel {
             session_id,
             agents,
             spawn_order: Vector::unit(MAIN_ID.to_string()),
             last_activity: None,
-            workflow_labels: OrdMap::new(),
-            completed_spawns: HashMap::new(),
-            task_terminal: HashMap::new(),
-            journal_done: HashSet::new(),
+            labels: OrdMap::new(),
+            completed_calls: HashMap::new(),
+            ended: HashMap::new(),
             spawn_context: HashMap::new(),
             prompts: Vector::new(),
-            last_main_text: None,
+            last_reasoning: HashMap::new(),
         }
     }
 
@@ -356,46 +322,18 @@ impl SessionModel {
             return false;
         }
         let mut info = AgentInfo::new(kind);
-        // A journal `result` naming this agent may have arrived first.
-        if self.journal_done.contains(id) {
-            info.status = AgentStatus::Done;
+        // Facts ABOUT this agent may have arrived before it did.
+        if let Some(&status) = self.ended.get(id) {
+            info.status = status;
             info.terminal = true;
+        }
+        if let Some((agent_type, description)) = self.labels.get(id) {
+            info.agent_type = agent_type.clone();
+            info.description = description.clone();
         }
         self.agents.insert(id.to_string(), info);
         self.spawn_order.push_back(id.to_string());
         true
-    }
-
-    /// Copy a recorded workflow label onto its group node, if both are known.
-    /// Idempotent, and never overwrites a value already set. Returns whether the
-    /// title changed (a structural change — the node relabels).
-    fn label_workflow_group(&mut self, run_id: &str) -> bool {
-        let Some((name, summary)) = self.workflow_labels.get(run_id).cloned() else {
-            return false;
-        };
-        let Some(group) = self.agents.get_mut(run_id) else {
-            return false;
-        };
-        let mut changed = false;
-        if group.agent_type.is_none() && name.is_some() {
-            group.agent_type = name;
-            changed = true;
-        }
-        if group.description.is_none() && summary.is_some() {
-            group.description = summary;
-        }
-        changed
-    }
-
-    /// Record a workflow launch (`toolUseResult.taskType == "local_workflow"`)
-    /// and label its group if that node already exists. Only records the fact
-    /// when the group is absent — the group is created by the subagent metas
-    /// (from the `workflows/<run_id>/` directory), so a launch alone never
-    /// fabricates an empty, parentless node.
-    fn apply_workflow_launch(&mut self, wf: &crate::transcript::WorkflowLaunch) -> bool {
-        self.workflow_labels
-            .insert(wf.run_id.clone(), (wf.name.clone(), wf.summary.clone()));
-        self.label_workflow_group(&wf.run_id)
     }
 
     fn note_activity(&mut self, ts: Option<DateTime<Utc>>) {
@@ -406,290 +344,253 @@ impl SessionModel {
         }
     }
 
-    /// Fold a single [`Update`] into the model, mutating agents, statuses, and
-    /// tool calls. Defensive: unknown/irrelevant updates are no-ops.
+    /// Fold one Claude record through the provider. Test convenience: the
+    /// production paths hand facts in directly.
+    #[cfg(test)]
+    pub(crate) fn apply_update(&mut self, record: &crate::provider::claude::Record) -> bool {
+        record
+            .facts()
+            .iter()
+            .fold(false, |s, f| self.apply_fact(f) | s)
+    }
+
+    /// Fold one [`Fact`] into the model. The only entry point that mutates
+    /// agents, statuses and tool calls; every provider reaches it and nothing
+    /// in here knows which one did.
     ///
-    /// Returns `true` if this update changed graph *structure* (an agent node
-    /// or parent edge appeared), so the caller can mark layout dirty.
-    pub fn apply_update(&mut self, update: &Update) -> bool {
-        match update {
-            Update::Entry { source, entry } => self.apply_entry(source, entry),
-            Update::SubagentMeta {
-                agent_id,
-                workflow,
-                meta,
-            } => self.apply_meta(agent_id, workflow.as_deref(), meta),
+    /// Idempotent and commutative: re-applying a fact is a no-op, and two facts
+    /// reach the same state in either order (ARCHITECTURE.md §1.1). Facts *by*
+    /// an agent create it ("an agent exists once it has spoken"); facts *about*
+    /// one (`Label`, `Ended`) only record until it appears.
+    ///
+    /// Returns `true` if graph *structure* changed.
+    pub fn apply_fact(&mut self, fact: &Fact) -> bool {
+        let mut structural = false;
+        self.note_activity(fact.ts);
+        if fact.is_session_meta() {
+            return false;
         }
-    }
-
-    /// Digest one parsed transcript entry from a specific source file.
-    fn apply_entry(&mut self, source: &Source, entry: &Entry) -> bool {
-        match entry {
-            Entry::Assistant(e) => {
-                let target = match source {
-                    Source::Main => MAIN_ID.to_string(),
-                    Source::Sub(id) => id.clone(),
-                    // Journal files carry no assistant turns.
-                    Source::Journal(_) => return false,
-                };
-                self.note_activity(e.envelope.timestamp);
-                let mut structural = false;
-                // Subagent files reference an agent we may not have meta for
-                // yet — make sure the node exists so its activity is visible.
-                if let Source::Sub(id) = source {
-                    structural |= self.ensure_agent(id, AgentKind::Subagent);
-                }
-                self.apply_assistant(&target, e);
-                // The subagent just produced activity — re-resolve its spawn ack
-                // (its `last_ts` may now supersede an immediate spawn-ack).
-                if let Source::Sub(id) = source {
-                    self.resolve_spawn_status(id);
-                }
-                structural
-            }
-            Entry::User(e) => {
-                self.note_activity(e.envelope.timestamp);
-                // User entries are activity of their owner too (tool results,
-                // fork prompts) — without this an agent's `last_ts` lags at
-                // its last assistant turn, skewing activity-derived liveness.
-                let mut structural = false;
-                if let Source::Sub(id) = source {
-                    structural |= self.ensure_agent(id, AgentKind::Subagent);
-                }
-                let owner = match source {
-                    Source::Main => Some(MAIN_ID),
-                    Source::Sub(id) => Some(id.as_str()),
-                    Source::Journal(_) => None,
-                };
-                if let Some(agent) = owner.and_then(|id| self.agents.get_mut(id)) {
-                    agent.touch_ts(e.envelope.timestamp);
-                }
-                // A workflow launch names its group node (`runId` is the group id).
-                if matches!(source, Source::Main)
-                    && let Some(wf) = e.workflow_launch()
-                {
-                    structural |= self.apply_workflow_launch(&wf);
-                }
-                // Main-thread user strings come in three flavours: an async
-                // agent's `<task-notification>` (a terminal report — apply it),
-                // other system-injected text (background-stop notices, etc.), and
-                // a genuine human prompt. Only the last is an era boundary, gated
-                // on `origin.kind == "human"`; the rest stay off the prompt spine.
-                if matches!(source, Source::Main)
-                    && let Some(text) = e.prompt_text()
-                {
-                    if let Some(tn) = crate::transcript::parse_task_notification(text) {
-                        self.apply_task_notification(&tn);
-                    } else if e.is_human_prompt() {
-                        let ex = excerpt(text);
-                        let ts = e.envelope.timestamp;
-                        // Idempotent AND order-independent: a re-applied entry is a
-                        // dup wherever it lands, not only when it's the trailing
-                        // prompt (the facts layer must hold under out-of-order
-                        // replay). A genuine repeat at a *different* ts is kept.
-                        let dup = self.prompts.iter().any(|p| p.excerpt == ex && p.ts == ts);
-                        if !dup {
-                            self.prompts.push_back(PromptInfo { excerpt: ex, ts });
-                        }
-                    }
-                }
-                // tool_result blocks complete tool calls (and, in the main
-                // transcript, direct-subagent + workflow nodes).
-                if let Some(msg) = &e.message
-                    && let Some(UserContent::Blocks(blocks)) = &msg.content
-                {
-                    for block in blocks {
-                        if let UserContentBlock::ToolResult(r) = block
-                            && let Some(tid) = &r.tool_use_id
-                        {
-                            let is_err = r.is_error == Some(true);
-                            self.complete_tool(source, tid, is_err, e.envelope.timestamp);
-                        }
-                    }
-                }
-                // The subagent just produced activity — re-resolve its spawn ack
-                // (its `last_ts` may now supersede an immediate spawn-ack).
-                if let Source::Sub(id) = source {
-                    self.resolve_spawn_status(id);
-                }
-                structural
-            }
-            Entry::Result(ledger) => {
-                // In a workflow journal, a `result` entry marks completion of
-                // the workflow subagent it names.
-                if let Source::Journal(_) = source {
-                    self.complete_journal_result(ledger);
-                }
-                false
-            }
-            // System, attachment, flat metadata, started, unknown: no graph
-            // effect.
-            _ => false,
-        }
-    }
-
-    /// Apply an assistant entry to the agent identified by `target` id.
-    fn apply_assistant(&mut self, target: &str, e: &crate::transcript::AssistantEntry) {
-        let ts = e.envelope.timestamp;
-        let Some(agent) = self.agents.get_mut(target) else {
-            return;
+        let Some(id) = fact.agent.as_deref() else {
+            return false;
         };
-        agent.touch_ts(ts);
-        if let Some(msg) = &e.message {
-            if agent.model.is_none()
-                && let Some(model) = &msg.model
-            {
-                agent.model = Some(model.clone());
+        let by_agent = !matches!(fact.kind, FactKind::Label { .. } | FactKind::Ended(_));
+        if by_agent {
+            match &fact.kind {
+                FactKind::Agent { kind, parent, .. } => {
+                    // A parent named before it has spoken is a group: the only
+                    // node born from its first child rather than its own record.
+                    // No format seen so far names a parent that later speaks
+                    // for itself (Claude's groups never do); if one appears,
+                    // this is where the placeholder's kind would be revisited.
+                    if let Some(p) = parent
+                        && !self.agents.contains_key(p)
+                    {
+                        structural |= self.ensure_agent(p, AgentKind::Group);
+                        if let Some(group) = self.agents.get_mut(p) {
+                            group.parent = Some(MAIN_ID.to_string());
+                        }
+                    }
+                    structural |= self.ensure_agent(id, *kind);
+                }
+                _ => structural |= self.ensure_agent(id, AgentKind::Subagent),
             }
-            if let Some(usage) = &msg.usage
-                && let Some(out) = usage.output_tokens
-            {
-                // One assistant turn spans multiple lines that each repeat the
-                // same cumulative usage; count it once per `requestId`. Lines
-                // with no `requestId` can't be deduped, so they sum per line.
-                match &e.envelope.request_id {
-                    Some(req) if agent.seen_request_ids.insert(req.clone()).is_some() => {}
-                    // Saturating: counts come from untrusted transcript
-                    // content; overflow must not panic (debug) or wrap.
-                    _ => agent.output_tokens = agent.output_tokens.saturating_add(out),
+            if let Some(a) = self.agents.get_mut(id) {
+                a.touch_ts(fact.ts);
+            }
+        }
+
+        let structural = structural | self.fold_kind(id, fact);
+        // The agent just produced activity — re-resolve its spawn
+        // acknowledgement, since its `last_ts` may now supersede an immediate
+        // one. Idempotent; a no-op for agents with no spawning call.
+        if by_agent {
+            self.resolve_spawn_status(id);
+        }
+        structural
+    }
+
+    /// The per-kind half of [`apply_fact`](Self::apply_fact): the agent (if
+    /// any) already exists and has been touched. Returns whether structure
+    /// changed.
+    fn fold_kind(&mut self, id: &str, fact: &Fact) -> bool {
+        let mut structural = false;
+        match &fact.kind {
+            FactKind::Activity
+            | FactKind::Session { .. }
+            | FactKind::Tally(_)
+            | FactKind::Title(_) => {}
+            FactKind::Agent {
+                parent,
+                agent_type,
+                description,
+                spawned_by,
+                interactive,
+                ..
+            } => {
+                if let Some(a) = self.agents.get_mut(id) {
+                    if a.parent.is_none() {
+                        a.parent = parent.clone();
+                    }
+                    if agent_type.is_some() {
+                        a.agent_type = agent_type.clone();
+                    }
+                    if a.description.is_none() {
+                        a.description = description.clone();
+                    }
+                    if a.spawned_by_tool_use.is_none() {
+                        a.spawned_by_tool_use = spawned_by.clone();
+                    }
+                    a.interactive |= *interactive;
+                }
+                // The spawning call may have ended before this agent was seen —
+                // its end survives in `completed_calls` regardless of order. Now
+                // that the join key is set, the trailing resolve in `apply_fact`
+                // reads it (honouring the immediate-ack rule, and any recorded
+                // `Ended`, which outranks it).
+            }
+            FactKind::Label {
+                agent_type,
+                description,
+            } => {
+                self.labels
+                    .insert(id.to_string(), (agent_type.clone(), description.clone()));
+                if let Some(a) = self.agents.get_mut(id) {
+                    if a.agent_type.is_none() && agent_type.is_some() {
+                        a.agent_type = agent_type.clone();
+                        // The node relabels: a structural change.
+                        structural = true;
+                    }
+                    if a.description.is_none() {
+                        a.description = description.clone();
+                    }
                 }
             }
-            // Walk blocks in order: the text block nearest above a spawning
-            // tool_use is the assistant's stated reason for the spawn.
-            let mut last_text: Option<&str> = None;
-            let mut spawns: Vec<(String, Option<String>)> = Vec::new();
-            for block in &msg.content {
-                // Thinking counts as reasoning too — spawns are often preceded
-                // only by a thinking block (verified on real transcripts), and
-                // the panel label is literally "thought".
-                match block {
-                    ContentBlock::Text { text } if !text.trim().is_empty() => {
-                        last_text = Some(text);
-                    }
-                    ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                        last_text = Some(thinking);
-                    }
-                    _ => {}
+            FactKind::Model(model) => {
+                if let Some(a) = self.agents.get_mut(id)
+                    && a.model.is_none()
+                {
+                    a.model = Some(model.clone());
                 }
-                if let ContentBlock::ToolUse(tu) = block {
-                    let Some(id) = &tu.id else { continue };
-                    let name = tu.name.clone().unwrap_or_default();
-                    if crate::transcript::is_spawn_tool(&name) {
-                        spawns.push((id.clone(), last_text.map(excerpt)));
+            }
+            FactKind::Tokens { output, dedup } => {
+                if let Some(a) = self.agents.get_mut(id) {
+                    match dedup {
+                        Some(key) if a.seen_request_ids.insert(key.clone()).is_some() => {}
+                        // Saturating: counts come from untrusted transcript
+                        // content; overflow must not panic (debug) or wrap.
+                        _ => a.output_tokens = a.output_tokens.saturating_add(*output),
                     }
-                    // Avoid duplicating a tool call already recorded (idempotent
-                    // re-application of the same batch).
-                    if agent.tool_index.contains_key(id) {
-                        continue;
-                    }
-                    let summary = summarize_tool(&name, &tu.input, e.envelope.cwd.as_deref());
-                    agent.tool_index.insert(id.clone(), agent.tool_calls.len());
-                    agent.tool_calls.push_back(ToolCallInfo {
-                        id: id.clone(),
-                        name,
-                        summary,
-                        ts,
+                }
+            }
+            // The session's spine is the root agent's prompts.
+            FactKind::Prompt(text) if id == MAIN_ID => {
+                let ex = excerpt(text);
+                let ts = fact.ts;
+                // Idempotent AND order-independent: a re-applied fact is a dup
+                // wherever it lands, not only when it's the trailing prompt. A
+                // genuine repeat at a *different* ts is kept.
+                if !self.prompts.iter().any(|p| p.excerpt == ex && p.ts == ts) {
+                    self.prompts.push_back(PromptInfo { excerpt: ex, ts });
+                }
+            }
+            FactKind::Prompt(_) => {}
+            FactKind::Reasoning(text) => {
+                self.last_reasoning.insert(id.to_string(), excerpt(text));
+            }
+            FactKind::ToolStart {
+                call,
+                name,
+                summary,
+            } => {
+                if let Some(a) = self.agents.get_mut(id)
+                    && !a.tool_index.contains_key(call)
+                {
+                    a.tool_index.insert(call.clone(), a.tool_calls.len());
+                    a.tool_calls.push_back(ToolCallInfo {
+                        id: call.clone(),
+                        name: name.clone(),
+                        summary: summary.clone(),
+                        ts: fact.ts,
                         end_ts: None,
                         state: ToolState::Pending,
                     });
                 }
             }
-            // Record provenance after the agent borrow ends (fact store —
-            // idempotent on re-application, order-independent for the join).
-            // Reasoning: same-message text wins; else fall back to the last
-            // main-transcript assistant text (turns span multiple lines).
-            let cross_line = (target == MAIN_ID)
-                .then(|| self.last_main_text.clone())
-                .flatten();
-            for (id, reasoning) in spawns {
-                let reasoning = reasoning.or_else(|| cross_line.clone());
+            // Provenance: why the agent this call spawns will exist. The
+            // reasoning is the agent's latest text before the call.
+            FactKind::Spawn { call } => {
+                let reasoning = self.last_reasoning.get(id).cloned();
                 self.spawn_context
-                    .entry(id)
-                    .or_insert_with(|| SpawnContext { ts, reasoning });
+                    .entry(call.clone())
+                    .or_insert_with(|| SpawnContext {
+                        ts: fact.ts,
+                        reasoning,
+                    });
             }
-            if target == MAIN_ID
-                && let Some(t) = last_text
-            {
-                self.last_main_text = Some(excerpt(t));
+            FactKind::ToolEnd { call, outcome } => {
+                self.complete_tool(id, call, *outcome == Outcome::Err, fact.ts);
+            }
+            FactKind::Ended(status) => {
+                self.ended.insert(id.to_string(), *status);
+                self.resolve_spawn_status(id);
             }
         }
+        structural
     }
 
-    /// Complete a tool call by id within the agent owning the originating file,
-    /// flipping its state and — if the tool spawned a subagent — completing
-    /// that subagent too.
+    /// Complete a tool call by id within its owner, flipping its state and
+    /// recording the end as a fact, since a spawning call's end is the
+    /// acknowledgement for the agent it spawned.
     fn complete_tool(
         &mut self,
-        source: &Source,
-        tool_use_id: &str,
+        owner: &str,
+        call: &str,
         is_err: bool,
-        ack_ts: Option<DateTime<Utc>>,
+        end_ts: Option<DateTime<Utc>>,
     ) {
-        let owner = match source {
-            Source::Main => MAIN_ID.to_string(),
-            Source::Sub(id) => id.clone(),
-            Source::Journal(_) => return,
-        };
         let new_state = if is_err {
             ToolState::Err
         } else {
             ToolState::Ok
         };
-        if let Some(agent) = self.agents.get_mut(&owner)
-            && let Some(&i) = agent.tool_index.get(tool_use_id)
+        if let Some(agent) = self.agents.get_mut(owner)
+            && let Some(&i) = agent.tool_index.get(call)
         {
             agent.tool_calls[i].state = new_state;
             // The result's timestamp is the tool's finish time → its duration.
-            agent.tool_calls[i].end_ts = ack_ts;
+            agent.tool_calls[i].end_ts = end_ts;
         }
-        // A tool_result in the *main* transcript may complete a subagent spawned
-        // by that tool_use id. Record the fact (with its timestamp) first — the
-        // spawned agent may not exist yet (arrival order is unguaranteed) — then
-        // resolve any agent already present. `resolve_spawn_status` decides
-        // whether this ack is a real completion or a premature spawn-ack.
-        if let Source::Main = source {
-            self.completed_spawns
-                .insert(tool_use_id.to_string(), (is_err, ack_ts));
-            let ids: Vec<String> = self
-                .agents
-                .iter()
-                .filter(|(_, a)| a.spawned_by_tool_use.as_deref() == Some(tool_use_id))
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in ids {
-                self.resolve_spawn_status(&id);
-            }
+        // Record the fact first — the spawned agent may not exist yet (arrival
+        // order is unguaranteed) — then resolve any agent already present.
+        // `resolve_spawn_status` decides whether this end is a real completion
+        // or a premature spawn acknowledgement.
+        self.completed_calls
+            .insert(call.to_string(), (is_err, end_ts));
+        let ids: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|(_, a)| a.spawned_by_tool_use.as_deref() == Some(call))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.resolve_spawn_status(&id);
         }
     }
 
-    /// Record an async agent's terminal report and apply it. Order-independent:
-    /// if the agent isn't folded yet, the status is stored and applied when it
-    /// appears (its activity re-runs `resolve_spawn_status`).
-    fn apply_task_notification(&mut self, tn: &crate::transcript::TaskNotification) {
-        use crate::transcript::TaskStatus;
-        let status = match tn.status {
-            TaskStatus::Completed => AgentStatus::Done,
-            TaskStatus::Stopped => AgentStatus::Stopped,
-            TaskStatus::Failed => AgentStatus::Failed,
-            // Unknown status string — don't override derived liveness.
-            TaskStatus::Other => return,
-        };
-        self.task_terminal.insert(tn.agent_id.clone(), status);
-        self.resolve_spawn_status(&tn.agent_id);
-    }
-
-    /// Set a direct subagent's status from its spawn ack, honoring the fact that
-    /// a PARALLEL subagent's `Agent` result lands milliseconds after the call (a
-    /// spawn-ack), while the subagent then runs for minutes. The ack completes it
-    /// only when NOT superseded by the subagent's own later activity (its
-    /// `last_ts` is after the ack); otherwise it's still `Running` (settled to
-    /// `Done` at [`end_of_stream`](Self::end_of_stream)). A pure function of the
-    /// folded facts — `last_ts` and the recorded ack — so it is order-invariant.
+    /// Derive a spawned agent's status from its recorded facts: an `Ended`
+    /// fact if there is one, else the end of the call that spawned it.
+    ///
+    /// The spawning call's end is an *acknowledgement*, which doubles as the
+    /// completion only for a synchronous subagent. The tell is the timestamp:
+    /// an agent whose own activity postdates the acknowledgement was launched
+    /// asynchronously, and the acknowledgement was a handle, not a result. A
+    /// pure function of folded facts — `last_ts` and the recorded end — so it
+    /// is order-invariant.
     fn resolve_spawn_status(&mut self, id: &str) {
-        // An async `<task-notification>` is the real terminal report — it
-        // outranks the spawn-ack and the time-derived fallback. Applied here so
-        // any later activity fold can't revive it.
-        if let Some(&status) = self.task_terminal.get(id)
+        // An observed ending is the real terminal report — it outranks the
+        // acknowledgement and the time-derived fallback. Applied here so any
+        // later activity fold can't revive it.
+        if let Some(&status) = self.ended.get(id)
             && let Some(agent) = self.agents.get_mut(id)
         {
             agent.status = status;
@@ -699,21 +600,22 @@ impl SessionModel {
         let Some(agent) = self.agents.get(id) else {
             return;
         };
-        let Some(tid) = agent.spawned_by_tool_use.clone() else {
+        let Some(call) = agent.spawned_by_tool_use.clone() else {
             return;
         };
-        let Some(&(is_err, ack_ts)) = self.completed_spawns.get(&tid) else {
+        let Some(&(is_err, ack_ts)) = self.completed_calls.get(&call) else {
             return;
         };
         let superseded = matches!((agent.last_ts, ack_ts), (Some(l), Some(a)) if l > a);
         let agent = self.agents.get_mut(id).unwrap();
         if superseded {
-            // Async agent: the ack was a spawn handle, not a completion. Hand it
-            // to time-derived liveness (not terminal).
+            // Async agent: the acknowledgement was a spawn handle, not a
+            // completion. Hand it to time-derived liveness (not terminal).
             agent.status = AgentStatus::Running;
             agent.terminal = false;
         } else {
-            // The ack IS the completion (sync subagent, or no own activity).
+            // The acknowledgement IS the completion (sync subagent, or no own
+            // activity).
             agent.status = if is_err {
                 AgentStatus::Failed
             } else {
@@ -723,11 +625,11 @@ impl SessionModel {
         }
     }
 
-    /// Roll workflow group nodes up from their children.
+    /// Roll group nodes up from their children.
     ///
-    /// A `WorkflowGroup` has no direct completion signal in the transcript (its
-    /// own `Workflow` tool_use id is not the workflow id used to key the node),
-    /// so the DESIGN fallback is "all-children-done": when every subagent under
+    /// A `Group` is by definition a node with no completion signal of its own
+    /// (for Claude workflows, the `Workflow` tool_use id is not the workflow id
+    /// the node is keyed by), so its status is "all-children-done": when every subagent under
     /// a workflow is terminal, the group is terminal too — `Failed` if any child
     /// failed, else `Done`. A childless workflow stays `Running`.
     ///
@@ -736,11 +638,11 @@ impl SessionModel {
     /// that rolled up to `Done` (all known children terminal) must revert to
     /// `Running` when a still-running child is discovered later. Derived state
     /// is a pure function of the current fact set, never of rollup history.
-    pub fn recompute_workflow_status(&mut self) {
+    pub fn recompute_group_status(&mut self) {
         let wf_ids: Vec<String> = self
             .agents
             .iter()
-            .filter(|(_, a)| a.kind == AgentKind::WorkflowGroup)
+            .filter(|(_, a)| a.kind == AgentKind::Group)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -774,91 +676,18 @@ impl SessionModel {
         }
     }
 
-    /// Complete a workflow subagent named by a journal `result` ledger entry.
-    fn complete_journal_result(&mut self, ledger: &LedgerEntry) {
-        let Some(agent_id) = &ledger.agent_id else {
-            return;
-        };
-        // Record the fact — the agent may not exist yet (journal entries carry
-        // no timestamps, so in replay they can arrive arbitrarily early);
-        // `ensure_agent` consults `journal_done` on creation.
-        self.journal_done.insert(agent_id.clone());
-        if let Some(agent) = self.agents.get_mut(agent_id) {
-            // A journal result is a RELIABLE completion (dated to the agent's
-            // last entry): mark success and pin it terminal so time-derived
-            // liveness won't revive it. Failures still surface via the main
-            // transcript tool_result when present.
-            if agent.status == AgentStatus::Running {
-                agent.status = AgentStatus::Done;
-            }
-            agent.terminal = true;
-        }
-    }
-
-    /// Fold a discovered subagent `meta.json` into the model.
-    ///
-    /// Returns `true` if this introduced a new agent node (structural change).
-    pub fn apply_meta(
+    /// Fold a Claude `meta.json` sidecar through the provider. Test
+    /// convenience; returns `true` if it introduced a new agent node.
+    #[cfg(test)]
+    pub(crate) fn apply_meta(
         &mut self,
         agent_id: &str,
         workflow: Option<&str>,
-        meta: &SubagentMeta,
+        meta: &crate::provider::claude::wire::SubagentMeta,
     ) -> bool {
-        let mut structural = false;
-        // Workflow subagents live under a group node; ensure it exists first.
-        let parent = match workflow {
-            Some(wf_id) => {
-                structural |= self.ensure_agent(wf_id, AgentKind::WorkflowGroup);
-                if let Some(group) = self.agents.get_mut(wf_id)
-                    && group.parent.is_none()
-                {
-                    group.parent = Some(MAIN_ID.to_string());
-                }
-                // The launch may have folded already — take its label now.
-                structural |= self.label_workflow_group(wf_id);
-                wf_id.to_string()
-            }
-            None => MAIN_ID.to_string(),
-        };
-
-        structural |= self.ensure_agent(agent_id, AgentKind::Subagent);
-
-        if let Some(agent) = self.agents.get_mut(agent_id) {
-            if agent.parent.is_none() {
-                agent.parent = Some(parent);
-            }
-            if let Some(t) = &meta.agent_type {
-                // Category decided here, structurally — forks are interactive
-                // sidechains (verified: no completion marker in the format).
-                if t == "fork" {
-                    agent.interactive = true;
-                }
-                agent.agent_type = Some(t.clone());
-            }
-            if let Some(d) = &meta.description
-                && agent.description.is_none()
-            {
-                agent.description = Some(d.clone());
-            }
-            if let Some(tid) = &meta.tool_use_id
-                && agent.spawned_by_tool_use.is_none()
-            {
-                agent.spawned_by_tool_use = Some(tid.clone());
-            }
-        }
-        // NOTE: `meta.stopped_by_user` is deliberately NOT applied here. The
-        // sidecar records the agent's FINAL outcome, but the meta folds at the
-        // agent's FIRST activity (it's dated there) — applying it would mark the
-        // agent `Stopped` for the entire replay, before it has done anything. The
-        // timestamped `<task-notification>` is the correct terminal signal; a
-        // subagent with no notification falls back to time-derived liveness.
-        // Order independence: the spawning tool call may have completed before
-        // this meta was seen — its completion fact survives in `completed_spawns`
-        // regardless of arrival order. Now that the `tool_use_id` link is set,
-        // resolve the status from that fact (honoring the immediate-ack rule, and
-        // any recorded task-notification, which outranks it).
-        self.resolve_spawn_status(agent_id);
-        structural
+        crate::provider::claude::meta_facts(agent_id, workflow, meta)
+            .iter()
+            .fold(false, |s, f| self.apply_fact(f) | s)
     }
 
     /// Re-derive time-based liveness from each agent's own activity.
@@ -1059,7 +888,7 @@ impl SessionModel {
                 consider(agent.first_ts, LogKind::Spawn, text);
             }
             for tc in &agent.tool_calls {
-                if crate::transcript::is_spawn_tool(&tc.name) {
+                if self.spawn_context.contains_key(&tc.id) {
                     // Fallback: a spawn whose subagent isn't loaded (no meta) is
                     // marked at the call — matching the strip's tool_use fallback.
                     if !meta_tool_use_ids.contains(&tc.id) {
@@ -1129,86 +958,11 @@ fn excerpt(s: &str) -> String {
     }
 }
 
-/// Derive a short one-line summary from a tool_use input, if a natural field
-/// exists for the tool. Defensive: any shape that doesn't match yields `None`.
-fn summarize_tool(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> Option<String> {
-    let pick = |key: &str| {
-        input
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(truncate_summary)
-    };
-    // File paths: show project-relative (`src/main.rs`) instead of the absolute
-    // path, and keep the basename if it still needs truncating.
-    let pick_path = |key: &str| {
-        input
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(|p| short_path(p, cwd))
-    };
-    match name {
-        "Bash" => pick("command").or_else(|| pick("description")),
-        "Read" | "Write" | "Edit" => pick_path("file_path").or_else(|| pick_path("path")),
-        n if crate::transcript::is_spawn_tool(n) => {
-            // Prefer the typed view for description/subagent_type.
-            let typed: AgentToolInput = serde_json::from_value(input.clone()).unwrap_or_default();
-            typed
-                .description
-                .or(typed.subagent_type)
-                .map(|s| truncate_summary(&s))
-        }
-        "WebFetch" => pick("url"),
-        "ToolSearch" => pick("query"),
-        _ => pick("description").or_else(|| pick("query")),
-    }
-}
-
-/// Upper bound on a stored tool summary. Generous on purpose: the detail panel
-/// truncates to its (often wide) width at render time, so this only caps
-/// pathological inputs. The node cards don't render summaries, so it is NOT a
-/// card-width constraint — capping tighter here just starved the panel.
-const SUMMARY_MAX: usize = 200;
-
-/// Collapse whitespace and truncate a summary to [`SUMMARY_MAX`].
-fn truncate_summary(s: &str) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    const MAX: usize = SUMMARY_MAX;
-    if flat.chars().count() > MAX {
-        let truncated: String = flat.chars().take(MAX - 1).collect();
-        format!("{truncated}…")
-    } else {
-        flat
-    }
-}
-
-/// A file path, made readable for the panel: relative to `cwd` when it lives
-/// under the project root, and truncated keeping the BASENAME (not the root) if
-/// it's still long — `…/state/timeline.rs`, never `/Users/.../src/sta…`.
-fn short_path(path: &str, cwd: Option<&str>) -> String {
-    let rel = cwd
-        .and_then(|c| path.strip_prefix(c).map(|r| (c, r)))
-        // Only a match at a path-component boundary counts: without this a
-        // SIBLING dir sharing the cwd as a string prefix is mangled
-        // (cwd `…/zoetrope` + path `…/zoetrope-web/src/app.rs` → `-web/src/app.rs`).
-        .filter(|(c, r)| r.starts_with('/') || c.ends_with('/'))
-        .map(|(_, r)| r.trim_start_matches('/'))
-        .filter(|r| !r.is_empty())
-        .unwrap_or(path);
-    const MAX: usize = SUMMARY_MAX;
-    let n = rel.chars().count();
-    if n <= MAX {
-        return rel.to_string();
-    }
-    // Keep the tail (basename + nearest dirs) with a leading ellipsis.
-    let tail: String = rel.chars().skip(n - (MAX - 1)).collect();
-    format!("…{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tailer::{Source, Update};
-    use crate::transcript::parse_line;
+    use crate::provider::claude::wire::{Entry, SubagentMeta, parse_line};
+    use crate::provider::claude::{Record, Source};
 
     /// Build an `Entry` from a JSONL line, panicking in tests only if the
     /// fixture itself is malformed (parser returns `None`).
@@ -1263,8 +1017,16 @@ mod tests {
             ToolState::Ok,
         ));
 
-        // No subagent is loaded here, so the `Agent` call ("s1") is the fallback
-        // spawn marker (at call time).
+        // Which calls spawn is provenance the provider states, not a tool name
+        // the model recognises: record it as the fold would.
+        m.apply_fact(&Fact {
+            agent: Some(MAIN_ID.to_string()),
+            ts: Some(ts("2026-06-05T10:05:00Z")),
+            kind: FactKind::Spawn { call: "s1".into() },
+        });
+
+        // No subagent is loaded here, so the spawning call ("s1") is the
+        // fallback spawn marker (at call time).
         let none = std::collections::BTreeSet::new();
 
         // Before the first event, and with no playhead → nothing.
@@ -1335,13 +1097,13 @@ mod tests {
 
     #[test]
     fn subagent_liveness_is_time_derived_running_then_done() {
-        let sub_asst = |ts: &str| Update::Entry {
+        let sub_asst = |ts: &str| Record::Entry {
             source: Source::Sub("sub".into()),
             entry: entry(&format!(
                 r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#
             )),
         };
-        let sub_result = |ts: &str| Update::Entry {
+        let sub_result = |ts: &str| Record::Entry {
             source: Source::Sub("sub".into()),
             entry: entry(&format!(
                 r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"b1"}}]}}}}"#
@@ -1375,13 +1137,13 @@ mod tests {
         // minutes, but its pending tool_call is direct proof it's still working.
         // It must NOT settle to Done mid-tool (which dropped its in-flight chip
         // and hid the tool's eventual result — a real error even went unshown).
-        let sub_asst = |ts: &str| Update::Entry {
+        let sub_asst = |ts: &str| Record::Entry {
             source: Source::Sub("sub".into()),
             entry: entry(&format!(
                 r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#
             )),
         };
-        let sub_result = |ts: &str| Update::Entry {
+        let sub_result = |ts: &str| Record::Entry {
             source: Source::Sub("sub".into()),
             entry: entry(&format!(
                 r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"b1"}}]}}}}"#
@@ -1406,22 +1168,22 @@ mod tests {
 
     #[test]
     fn a_parallel_subagent_stays_running_past_its_immediate_spawn_ack() {
-        let asst = |src: Source, id: &str, name: &str, ts: &str| Update::Entry {
+        let asst = |src: Source, id: &str, name: &str, ts: &str| Record::Entry {
             source: src,
             entry: entry(&format!(
                 r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{}}}}]}}}}"#
             )),
         };
-        let result = |src: Source, tid: &str, ts: &str| Update::Entry {
+        let result = |src: Source, tid: &str, ts: &str| Record::Entry {
             source: src,
             entry: entry(&format!(
                 r#"{{"type":"user","uuid":"r","parentUuid":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tid}"}}]}}}}"#
             )),
         };
-        let meta = |agent: &str, tid: &str| Update::SubagentMeta {
+        let meta = |agent: &str, tid: &str| Record::Meta {
             agent_id: agent.into(),
             workflow: None,
-            meta: crate::transcript::SubagentMeta {
+            meta: crate::provider::claude::wire::SubagentMeta {
                 agent_type: Some("guide".into()),
                 description: None,
                 tool_use_id: Some(tid.into()),
@@ -1460,13 +1222,13 @@ mod tests {
 
     #[test]
     fn a_task_notification_marks_the_agent_stopped_and_is_not_a_prompt() {
-        let sub_asst = |ts: &str| Update::Entry {
+        let sub_asst = |ts: &str| Record::Entry {
             source: Source::Sub("sub".into()),
             entry: entry(&format!(
                 r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b","name":"Bash","input":{{}}}}]}}}}"#
             )),
         };
-        let notif = Update::Entry {
+        let notif = Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"user","uuid":"n","parentUuid":null,"timestamp":"2026-06-05T10:05:00.000Z","message":{"role":"user","content":"<task-notification>\n<task-id>sub</task-id>\n<status>stopped</status>\n<summary>x</summary>\n</task-notification>"}}"#,
@@ -1499,14 +1261,14 @@ mod tests {
         // `Stopped` for the whole replay (and prune its chips). Only the
         // timestamped `<task-notification>` terminates it.
         let mut m = SessionModel::new("s".into());
-        let meta = crate::transcript::SubagentMeta {
+        let meta = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag".into()),
             stopped_by_user: Some(true),
         };
         m.apply_meta("sub", None, &meta);
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Sub("sub".into()),
             entry: entry(
                 r#"{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"Bash","input":{}}]}}"#,
@@ -1519,11 +1281,11 @@ mod tests {
         );
     }
 
-    fn assistant_tool_use(source: Source, tool_id: &str, name: &str) -> Update {
+    fn assistant_tool_use(source: Source, tool_id: &str, name: &str) -> Record {
         let line = format!(
             r#"{{"type":"assistant","uuid":"u1","parentUuid":null,"timestamp":"2026-06-05T13:51:15.151Z","message":{{"role":"assistant","model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{"command":"ls -la"}}}}],"usage":{{"output_tokens":42}}}}}}"#
         );
-        Update::Entry {
+        Record::Entry {
             source,
             entry: entry(&line),
         }
@@ -1534,71 +1296,37 @@ mod tests {
     /// (within-source order is preserved — that is what reality guarantees:
     /// each file is tailed in file order, but files interleave arbitrarily).
     ///
-    #[test]
-    fn summarize_tool_relativizes_paths() {
-        // File paths show project-relative, not absolute.
-        let edit = serde_json::json!({ "file_path": "/proj/src/main.rs" });
-        assert_eq!(
-            summarize_tool("Edit", &edit, Some("/proj")).as_deref(),
-            Some("src/main.rs")
-        );
-        // A path outside the cwd is kept as-is.
-        let outside = serde_json::json!({ "file_path": "/other/x.rs" });
-        assert_eq!(
-            summarize_tool("Read", &outside, Some("/proj")).as_deref(),
-            Some("/other/x.rs")
-        );
-        // Non-path tools are unaffected (command kept, head-truncated elsewhere).
-        let bash = serde_json::json!({ "command": "cargo test" });
-        assert_eq!(
-            summarize_tool("Bash", &bash, Some("/proj")).as_deref(),
-            Some("cargo test")
-        );
-    }
-
-    #[test]
-    fn short_path_strips_cwd_only_at_a_component_boundary() {
-        assert_eq!(
-            short_path(
-                "/Users/me/projects/zoetrope/src/a.rs",
-                Some("/Users/me/projects/zoetrope")
-            ),
-            "src/a.rs"
-        );
-        // A SIBLING dir sharing the cwd as a string prefix must NOT be mangled
-        // into a fake relative path ("-web/src/a.rs").
-        assert_eq!(
-            short_path(
-                "/Users/me/projects/zoetrope-web/src/a.rs",
-                Some("/Users/me/projects/zoetrope")
-            ),
-            "/Users/me/projects/zoetrope-web/src/a.rs"
-        );
-        assert_eq!(short_path("/project/x.rs", Some("/proj")), "/project/x.rs");
-        // A trailing-slash cwd still relativizes.
-        assert_eq!(short_path("/proj/x.rs", Some("/proj/")), "x.rs");
-        // cwd == path falls back to the absolute path (not an empty string).
-        assert_eq!(short_path("/proj", Some("/proj")), "/proj");
-    }
-
     /// This is the enforcement test for the order-independence invariant; it
     /// would have caught the lost-completion and journal-before-agent bugs.
+    ///
+    /// It shuffles *facts*, not Claude records: the streams below are what the
+    /// Claude provider states for its files, and the fold under test is the one
+    /// every provider reaches. A second provider proves itself the same way, by
+    /// supplying its own streams to this interleaver.
     #[test]
     fn final_state_is_arrival_order_invariant() {
-        // Per-source streams (internal order preserved by the interleaver).
-        fn streams() -> Vec<Vec<Update>> {
-            let meta = |agent_id: &str, wf: Option<&str>, tid: Option<&str>| Update::SubagentMeta {
+        // Per-source streams of facts (internal order preserved by the
+        // interleaver), as the provider states them for each file.
+        fn streams() -> Vec<Vec<Fact>> {
+            records()
+                .into_iter()
+                .map(|recs| recs.iter().flat_map(Record::facts).collect())
+                .collect()
+        }
+
+        fn records() -> Vec<Vec<Record>> {
+            let meta = |agent_id: &str, wf: Option<&str>, tid: Option<&str>| Record::Meta {
                 agent_id: agent_id.into(),
                 workflow: wf.map(String::from),
-                meta: crate::transcript::SubagentMeta {
+                meta: crate::provider::claude::wire::SubagentMeta {
                     agent_type: Some("guide".into()),
                     description: None,
                     tool_use_id: tid.map(String::from),
                     stopped_by_user: None,
                 },
             };
-            let journal_result = |agent_id: &str| Update::Entry {
-                source: Source::Journal("wf_1".into()),
+            let journal_result = |agent_id: &str| Record::Entry {
+                source: Source::Ledger("wf_1".into()),
                 entry: entry(&format!(
                     r#"{{"type":"result","key":"v2:k","agentId":"{agent_id}","result":{{"ok":true}}}}"#
                 )),
@@ -1625,53 +1353,7 @@ mod tests {
             ]
         }
 
-        // Comparable snapshot of the facts (spawn_order is presentation —
-        // creation order legitimately varies — so compare by sorted id).
-        fn snapshot(m: &SessionModel) -> Vec<String> {
-            m.agents
-                .iter()
-                .map(|(id, a)| {
-                    let tools: Vec<String> = a
-                        .tool_calls
-                        .iter()
-                        .map(|t| format!("{}:{:?}", t.id, t.state))
-                        .collect();
-                    let prov = m
-                        .provenance(a)
-                        .map(|c| format!("{:?}/{:?}", m.provenance_prompt(c), c.reasoning))
-                        .unwrap_or_default();
-                    format!(
-                        "{id}|{:?}|{:?}|{:?}|{:?}|{}|{prov}",
-                        a.kind,
-                        a.status,
-                        a.parent,
-                        a.spawned_by_tool_use,
-                        tools.join(",")
-                    )
-                })
-                .collect()
-        }
-
-        // Deterministic LCG so failures are reproducible.
-        let interleave = |mut seed: u64| -> SessionModel {
-            let mut queues = streams();
-            let mut m = SessionModel::new("s".into());
-            while queues.iter().any(|q| !q.is_empty()) {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let nonempty: Vec<usize> = (0..queues.len())
-                    .filter(|&i| !queues[i].is_empty())
-                    .collect();
-                let pick = nonempty[(seed >> 33) as usize % nonempty.len()];
-                let update = queues[pick].remove(0);
-                m.apply_update(&update);
-            }
-            m.recompute_workflow_status();
-            m
-        };
-
-        let baseline = snapshot(&interleave(0));
+        let baseline = crate::provider::harness::assert_order_invariant(streams);
         // Semantic anchors: every completion must have landed.
         assert!(
             baseline
@@ -1693,11 +1375,6 @@ mod tests {
                 .iter()
                 .any(|s| s.starts_with("wf_1|") && s.contains("Done"))
         );
-
-        for seed in 1..40u64 {
-            let got = snapshot(&interleave(seed));
-            assert_eq!(got, baseline, "order-dependent state at seed {seed}");
-        }
     }
 
     #[test]
@@ -1708,29 +1385,29 @@ mod tests {
         let mut m = SessionModel::new("s1".into());
 
         // Child A arrives already completed (journal result first).
-        m.apply_update(&Update::Entry {
-            source: Source::Journal("wf_1".into()),
+        m.apply_update(&Record::Entry {
+            source: Source::Ledger("wf_1".into()),
             entry: entry(r#"{"type":"result","key":"v2:k","agentId":"childA","result":{}}"#),
         });
-        let meta_a = crate::transcript::SubagentMeta {
+        let meta_a = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("workflow-subagent".into()),
             description: None,
             tool_use_id: None,
             stopped_by_user: None,
         };
         m.apply_meta("childA", Some("wf_1"), &meta_a);
-        m.recompute_workflow_status();
+        m.recompute_group_status();
         assert_eq!(m.agent("wf_1").unwrap().status, AgentStatus::Done);
 
         // Child B (still running) is discovered later: the group must revert.
-        let meta_b = crate::transcript::SubagentMeta {
+        let meta_b = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("workflow-subagent".into()),
             description: None,
             tool_use_id: None,
             stopped_by_user: None,
         };
         m.apply_meta("childB", Some("wf_1"), &meta_b);
-        m.recompute_workflow_status();
+        m.recompute_group_status();
         assert_eq!(
             m.agent("wf_1").unwrap().status,
             AgentStatus::Running,
@@ -1747,7 +1424,7 @@ mod tests {
                 r#"{{"type":"assistant","uuid":"{uid}","parentUuid":null,"requestId":"{req}","message":{{"role":"assistant","content":[],"usage":{{"output_tokens":{}}}}}}}"#,
                 u64::MAX
             );
-            m.apply_update(&Update::Entry {
+            m.apply_update(&Record::Entry {
                 source: Source::Main,
                 entry: entry(&line),
             });
@@ -1759,7 +1436,7 @@ mod tests {
     fn fork_liveness_is_activity_derived() {
         let mut m = SessionModel::new("s1".into());
         // A fork sidechain: agentType "fork", no toolUseId, no journal.
-        let meta = crate::transcript::SubagentMeta {
+        let meta = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("fork".into()),
             description: Some("yess".into()),
             tool_use_id: None,
@@ -1768,7 +1445,7 @@ mod tests {
         m.apply_meta("ayess-123", None, &meta);
 
         // The fork acts at 13:00.
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Sub("ayess-123".into()),
             entry: entry(
                 r#"{"type":"assistant","uuid":"f1","parentUuid":null,"timestamp":"2026-06-07T13:00:00.000Z","message":{"role":"assistant","content":[]}}"#,
@@ -1779,7 +1456,7 @@ mod tests {
 
         // The session moves on without it (main activity 3.5 min later):
         // the silent fork is shown done.
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"user","uuid":"u9","parentUuid":null,"origin":{"kind":"human"},"timestamp":"2026-06-07T13:03:30.000Z","message":{"role":"user","content":"hi"}}"#,
@@ -1790,7 +1467,7 @@ mod tests {
 
         // The user returns to the fork (a USER entry — exercises the
         // owner-touch fix): it resurrects.
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Sub("ayess-123".into()),
             entry: entry(
                 r#"{"type":"user","uuid":"f2","parentUuid":"f1","timestamp":"2026-06-07T13:04:00.000Z","message":{"role":"user","content":"more"}}"#,
@@ -1804,7 +1481,7 @@ mod tests {
         assert_eq!(m.agent("ayess-123").unwrap().status, AgentStatus::Idle);
 
         // Spawned (non-interactive) subagents are untouched by the derivation.
-        let spawned = crate::transcript::SubagentMeta {
+        let spawned = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("t1".into()),
@@ -1822,7 +1499,7 @@ mod tests {
     #[test]
     fn prompt_log_and_era_attribution() {
         let mut m = SessionModel::new("s1".into());
-        let prompt = |uid: &str, ts: &str, text: &str| Update::Entry {
+        let prompt = |uid: &str, ts: &str, text: &str| Record::Entry {
             source: Source::Main,
             entry: entry(&format!(
                 r#"{{"type":"user","uuid":"{uid}","parentUuid":null,"origin":{{"kind":"human"}},"timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
@@ -1860,20 +1537,20 @@ mod tests {
         let mut m = SessionModel::new("s1".into());
 
         // The human asks for something.
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"user","uuid":"u1","parentUuid":null,"origin":{"kind":"human"},"timestamp":"2026-06-07T10:00:00.000Z","message":{"role":"user","content":"please research the flag handling"}}"#,
             ),
         });
         // The assistant explains, then spawns an agent in the same message.
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"assistant","uuid":"u2","parentUuid":"u1","timestamp":"2026-06-07T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"I will spawn a guide to research this."},{"type":"tool_use","id":"ag1","name":"Agent","input":{"description":"research","subagent_type":"guide","prompt":"go"}}]}}"#,
             ),
         });
-        let meta = crate::transcript::SubagentMeta {
+        let meta = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag1".into()),
@@ -1899,19 +1576,19 @@ mod tests {
 
         // Cross-line reasoning: text on an EARLIER line (turns span multiple
         // JSONL lines), spawn on a later line with no text of its own.
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"assistant","uuid":"u3","parentUuid":"u2","timestamp":"2026-06-07T10:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Now a second agent for the docs."}]}}"#,
             ),
         });
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"assistant","uuid":"u4","parentUuid":"u3","timestamp":"2026-06-07T10:01:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"ag2","name":"Agent","input":{"description":"docs","subagent_type":"guide","prompt":"go"}}]}}"#,
             ),
         });
-        let meta2 = crate::transcript::SubagentMeta {
+        let meta2 = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag2".into()),
@@ -1930,19 +1607,19 @@ mod tests {
     #[test]
     fn provenance_reasoning_from_prior_thinking_line() {
         let mut m = SessionModel::new("s1".into());
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"assistant","uuid":"t1","parentUuid":null,"timestamp":"2026-06-07T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants the preferences file located.","signature":"x"}]}}"#,
             ),
         });
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(
                 r#"{"type":"assistant","uuid":"t2","parentUuid":"t1","timestamp":"2026-06-07T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"agx","name":"Agent","input":{"description":"find prefs","subagent_type":"guide","prompt":"go"}}]}}"#,
             ),
         });
-        let meta = crate::transcript::SubagentMeta {
+        let meta = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("agx".into()),
@@ -1966,7 +1643,7 @@ mod tests {
         m.apply_update(&assistant_tool_use(Source::Main, "ag1", "Agent"));
         m.apply_update(&tool_result(Source::Main, "ag1", false));
 
-        let meta = crate::transcript::SubagentMeta {
+        let meta = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag1".into()),
@@ -1982,7 +1659,7 @@ mod tests {
         // Failed variant.
         m.apply_update(&assistant_tool_use(Source::Main, "ag2", "Agent"));
         m.apply_update(&tool_result(Source::Main, "ag2", true));
-        let meta_err = crate::transcript::SubagentMeta {
+        let meta_err = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag2".into()),
@@ -1993,7 +1670,7 @@ mod tests {
 
         // Still-pending spawn stays Running.
         m.apply_update(&assistant_tool_use(Source::Main, "ag3", "Agent"));
-        let meta_pending = crate::transcript::SubagentMeta {
+        let meta_pending = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("ag3".into()),
@@ -2011,7 +1688,7 @@ mod tests {
 
         // A subagent spawns but has no timestamped activity yet: the
         // timestamped main still wins (None < Some).
-        let meta = crate::transcript::SubagentMeta {
+        let meta = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("t1".into()),
@@ -2033,12 +1710,12 @@ mod tests {
         assert_eq!(m.last_active_agent_id().as_deref(), Some(MAIN_ID));
     }
 
-    fn tool_result(source: Source, tool_id: &str, is_error: bool) -> Update {
+    fn tool_result(source: Source, tool_id: &str, is_error: bool) -> Record {
         let err = if is_error { r#","is_error":true"# } else { "" };
         let line = format!(
             r#"{{"type":"user","uuid":"u2","parentUuid":"u1","timestamp":"2026-06-05T13:51:16.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_id}","content":"done"{err}}}]}}}}"#
         );
-        Update::Entry {
+        Record::Entry {
             source,
             entry: entry(&line),
         }
@@ -2177,7 +1854,7 @@ mod tests {
 
         // Launch first, then the subagent meta creates the group.
         let mut a = SessionModel::new("s1".into());
-        a.apply_update(&Update::Entry {
+        a.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(LAUNCH),
         });
@@ -2186,14 +1863,14 @@ mod tests {
         // Meta first, then the launch labels the existing group.
         let mut b = SessionModel::new("s1".into());
         b.apply_meta("wfsub1", Some("wf-99"), &meta);
-        b.apply_update(&Update::Entry {
+        b.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(LAUNCH),
         });
 
         for (name, m) in [("launch-first", &a), ("meta-first", &b)] {
             let group = m.agent("wf-99").expect("group exists");
-            assert_eq!(group.kind, AgentKind::WorkflowGroup, "{name}");
+            assert_eq!(group.kind, AgentKind::Group, "{name}");
             assert_eq!(
                 group.agent_type.as_deref(),
                 Some("code-review"),
@@ -2219,7 +1896,7 @@ mod tests {
     #[test]
     fn workflow_launch_alone_creates_no_group_node() {
         let mut m = SessionModel::new("s1".into());
-        m.apply_update(&Update::Entry {
+        m.apply_update(&Record::Entry {
             source: Source::Main,
             entry: entry(r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:00.000Z","toolUseResult":{"taskType":"local_workflow","workflowName":"code-review","runId":"wf-99"}}"#),
         });
@@ -2239,7 +1916,7 @@ mod tests {
         assert!(structural);
         // Group node created, parented to main.
         let group = m.agent("wf-99").unwrap();
-        assert_eq!(group.kind, AgentKind::WorkflowGroup);
+        assert_eq!(group.kind, AgentKind::Group);
         assert_eq!(group.parent.as_deref(), Some("main"));
         // Subagent parented to the group.
         assert_eq!(m.agent("wfsub1").unwrap().parent.as_deref(), Some("wf-99"));
@@ -2247,8 +1924,8 @@ mod tests {
 
         // A journal `result` for wfsub1 marks it done.
         let line = r#"{"type":"result","key":"k","agentId":"wfsub1","result":{"ok":true}}"#;
-        m.apply_update(&Update::Entry {
-            source: Source::Journal("wf-99".into()),
+        m.apply_update(&Record::Entry {
+            source: Source::Ledger("wf-99".into()),
             entry: entry(line),
         });
         assert_eq!(m.agent("wfsub1").unwrap().status, AgentStatus::Done);
@@ -2267,17 +1944,17 @@ mod tests {
         m.apply_meta("c2", Some("wf-1"), &meta);
 
         // Both children running → group stays running.
-        m.recompute_workflow_status();
+        m.recompute_group_status();
         assert_eq!(m.agent("wf-1").unwrap().status, AgentStatus::Running);
 
         // One child done, one still running → group still running.
         m.agents.get_mut("c1").unwrap().status = AgentStatus::Done;
-        m.recompute_workflow_status();
+        m.recompute_group_status();
         assert_eq!(m.agent("wf-1").unwrap().status, AgentStatus::Running);
 
         // All children terminal (one failed) → group Failed.
         m.agents.get_mut("c2").unwrap().status = AgentStatus::Failed;
-        m.recompute_workflow_status();
+        m.recompute_group_status();
         assert_eq!(m.agent("wf-1").unwrap().status, AgentStatus::Failed);
     }
 
@@ -2292,7 +1969,7 @@ mod tests {
         };
         m.apply_meta("c1", Some("wf-1"), &meta);
         m.agents.get_mut("c1").unwrap().status = AgentStatus::Done;
-        m.recompute_workflow_status();
+        m.recompute_group_status();
         assert_eq!(m.agent("wf-1").unwrap().status, AgentStatus::Done);
     }
 
@@ -2310,11 +1987,11 @@ mod tests {
 
     /// An assistant turn line carrying a `requestId` and a fixed
     /// `usage.output_tokens` (no tool_use), to model a multi-line turn.
-    fn assistant_turn(source: Source, request_id: &str, out_tokens: u64) -> Update {
+    fn assistant_turn(source: Source, request_id: &str, out_tokens: u64) -> Record {
         let line = format!(
             r#"{{"type":"assistant","uuid":"u1","parentUuid":null,"timestamp":"2026-06-05T13:51:15.151Z","requestId":"{request_id}","message":{{"role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"hi"}}],"usage":{{"output_tokens":{out_tokens}}}}}}}"#
         );
-        Update::Entry {
+        Record::Entry {
             source,
             entry: entry(&line),
         }
@@ -2357,7 +2034,7 @@ mod tests {
     #[test]
     fn end_of_stream_idles_interactive_agents_only() {
         let mut m = SessionModel::new("s1".into());
-        let spawned = crate::transcript::SubagentMeta {
+        let spawned = crate::provider::claude::wire::SubagentMeta {
             agent_type: Some("guide".into()),
             description: None,
             tool_use_id: Some("t1".into()),

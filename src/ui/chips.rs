@@ -443,8 +443,8 @@ fn chip_style(state: ToolState, age: Duration, palette: &Palette) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::claude::wire::SubagentMeta;
     use crate::state::session::SessionModel;
-    use crate::transcript::SubagentMeta;
 
     /// A model with one subagent carrying `n` tool calls.
     fn model_with_tools(n: usize) -> SessionModel {

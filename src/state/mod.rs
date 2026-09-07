@@ -8,6 +8,7 @@
 
 pub mod graph;
 pub mod info;
+pub mod render;
 pub mod session;
 pub mod timeline;
 
@@ -307,12 +308,14 @@ impl App {
             .timeline
             .items
             .iter()
-            .filter_map(|i| match &i.update {
-                crate::tailer::Update::Entry {
-                    source: crate::tailer::Source::Main,
-                    entry: crate::transcript::Entry::User(e),
-                } if e.is_human_prompt() => i.ts().or(e.envelope.timestamp),
-                _ => None,
+            .filter_map(|i| {
+                i.facts
+                    .iter()
+                    .find(|f| {
+                        matches!(f.kind, crate::fact::FactKind::Prompt(_))
+                            && f.agent.as_deref() == Some(session::MAIN_ID)
+                    })
+                    .and_then(|f| i.ts().or(f.ts))
             })
             .collect();
         bounds.sort_unstable();
@@ -354,22 +357,23 @@ impl App {
         match event {
             UiEvent::Batch {
                 session_id,
-                updates,
+                statements,
             } => {
                 if !self.is_current(&session_id) {
                     return;
                 }
                 // Route untimed session-level metadata to the info store; only
                 // real activity (timestamped / dated) goes on the timeline.
-                let mut activity = Vec::with_capacity(updates.len());
-                for update in updates {
-                    if let crate::tailer::Update::Entry { entry, .. } = &update
-                        && entry.is_timeline_noise()
-                    {
-                        self.session_info.apply(entry);
+                let mut activity = Vec::with_capacity(statements.len());
+                for statement in statements {
+                    if statement.is_session_meta() {
+                        statement
+                            .facts
+                            .iter()
+                            .for_each(|f| self.session_info.apply(f));
                         continue;
                     }
-                    activity.push(update);
+                    activity.push(statement);
                 }
                 // Stamp freshness for the emergent "live" state.
                 self.last_batch_at = Some(web_time::Instant::now());
@@ -400,8 +404,10 @@ impl App {
                         // never force a rebuild. Then mark the whole stream
                         // folded.
                         let mut structural = false;
-                        for update in &activity {
-                            structural |= self.session.apply_update(update);
+                        for statement in &activity {
+                            for fact in &statement.facts {
+                                structural |= self.session.apply_fact(fact);
+                            }
                         }
                         self.timeline.append_live(activity);
                         self.timeline.folded = self.timeline.items.len();
@@ -505,7 +511,9 @@ impl App {
         self.drop_stale_rungs(generation);
         let mut structural = false;
         for i in from..to {
-            structural |= self.session.apply_update(&self.timeline.items[i].update);
+            for fact in &self.timeline.items[i].facts {
+                structural |= self.session.apply_fact(fact);
+            }
             self.maybe_snapshot(i + 1, generation);
         }
         structural
@@ -754,7 +762,7 @@ impl App {
     /// group would otherwise render Running with an animated edge until the next
     /// batch). Returns whether the sync changed graph structure.
     fn resync(&mut self) -> bool {
-        self.session.recompute_workflow_status();
+        self.session.recompute_group_status();
         // Interactive sidechains (forks) derive liveness against the timeline's
         // "now": wall clock at a live edge, the playhead when replaying or
         // scrubbed back (so the as-of-then state shows, no wall-clock bleed).
@@ -803,7 +811,7 @@ impl App {
     pub fn status_tick(&mut self) {
         let now = self.timeline.now_reference();
         if self.session.recompute_liveness(now) {
-            self.session.recompute_workflow_status();
+            self.session.recompute_group_status();
             // Status flips never change topology, so this is a content-only sync;
             // layout stays user-driven (no auto-relayout — see `resync`).
             graph::sync(&mut self.flow, &self.session, false);
@@ -994,11 +1002,13 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tailer::{UiEvent, Update};
-    use crate::transcript::SubagentMeta;
+    use crate::fact::Statement;
+    use crate::provider::claude::wire::SubagentMeta;
+    use crate::provider::claude::{Record, Source};
+    use crate::tailer::UiEvent;
 
-    fn meta_update(agent_id: &str) -> Update {
-        Update::SubagentMeta {
+    fn meta_update(agent_id: &str) -> Statement {
+        Record::Meta {
             agent_id: agent_id.to_string(),
             workflow: None,
             meta: SubagentMeta {
@@ -1008,6 +1018,8 @@ mod tests {
                 stopped_by_user: None,
             },
         }
+        .statement()
+        .unwrap()
     }
 
     #[test]
@@ -1026,7 +1038,7 @@ mod tests {
         // A batch from the new session must be accepted, not dropped.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "NEW".into(),
-            updates: vec![meta_update("newsub")],
+            statements: vec![meta_update("newsub")],
         });
         assert!(
             app.session.agent("newsub").is_some(),
@@ -1052,7 +1064,7 @@ mod tests {
         let mut app = App::new("s".into(), Mode::Live);
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            statements: vec![meta_update("sub1")],
         });
         assert!(
             app.chips.is_seeded(),
@@ -1063,7 +1075,7 @@ mod tests {
         let mut replay = App::new("s".into(), Mode::Replay);
         replay.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            statements: vec![meta_update("sub1")],
         });
         assert!(!replay.chips.is_seeded());
     }
@@ -1086,7 +1098,7 @@ mod tests {
         // A genuine reset (graph populated) still resets the view.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            statements: vec![meta_update("sub1")],
         });
         app.handle_ui_event(UiEvent::SessionReset {
             session_id: "s".into(),
@@ -1101,7 +1113,7 @@ mod tests {
         // Seed chips (live mode first batch) then deliver an agent.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![meta_update("sub1")],
+            statements: vec![meta_update("sub1")],
         });
         // Simulate a moment with no selection (e.g. just after a reset).
         app.flow.clear_selection();
@@ -1120,7 +1132,7 @@ mod tests {
         let mut app = App::new("CURRENT".into(), Mode::Live);
         app.handle_ui_event(UiEvent::Batch {
             session_id: "STALE".into(),
-            updates: vec![meta_update("ghost")],
+            statements: vec![meta_update("ghost")],
         });
         assert!(
             app.session.agent("ghost").is_none(),
@@ -1164,7 +1176,7 @@ mod tests {
         let t: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
         app.handle_ui_event(UiEvent::ReplayLoaded {
             session_id: "s".into(),
-            items: vec![ReplayItem::at(Some(t), meta_update("sub1"))],
+            items: vec![ReplayItem::at(Some(t), meta_update("sub1").facts)],
             speed: 8.0,
             info: Default::default(),
         });
@@ -1233,16 +1245,17 @@ mod tests {
         let mut app = App::new("s".to_string(), Mode::Live);
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: (0..n)
-                .map(|i| {
-                    crate::tailer::Update::Entry {
-                        source: crate::tailer::Source::Main,
-                        entry: crate::transcript::parse_line(&format!(
+            statements: (0..n)
+                .filter_map(|i| {
+                    Record::Entry {
+                        source: Source::Main,
+                        entry: crate::provider::claude::wire::parse_line(&format!(
                             r#"{{"type":"user","uuid":"u{i}","parentUuid":null,"timestamp":"{}","message":{{"role":"user","content":"hi"}}}}"#,
                             (t0 + chrono::Duration::seconds(i as i64)).to_rfc3339()
                         ))
                         .unwrap(),
                     }
+                    .statement()
                 })
                 .collect(),
         });
@@ -1272,7 +1285,7 @@ mod tests {
                 .map(|i| {
                     crate::tailer::ReplayItem::at(
                         Some(t0 + chrono::Duration::seconds(i as i64)),
-                        meta_update(&format!("sub{i}")),
+                        meta_update(&format!("sub{i}")).facts,
                     )
                 })
                 .collect(),
@@ -1325,7 +1338,7 @@ mod tests {
                         Some(t0 + chrono::Duration::seconds(i as i64)),
                         // Re-touch earlier agents as well as adding new ones, so
                         // the fold is not purely insert-only.
-                        meta_update(&format!("sub{}", i % (n / 4).max(1))),
+                        meta_update(&format!("sub{}", i % (n / 4).max(1))).facts,
                     )
                 })
                 .collect()
@@ -1381,7 +1394,7 @@ mod tests {
                 .map(|i| {
                     crate::tailer::ReplayItem::at(
                         Some(t0 + chrono::Duration::seconds(i as i64)),
-                        meta_update(&format!("sub{i}")),
+                        meta_update(&format!("sub{i}")).facts,
                     )
                 })
                 .collect(),
@@ -1403,7 +1416,7 @@ mod tests {
         // A meta with no timestamp of its own — the `needs_dating` path.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![meta_update("late")],
+            statements: vec![meta_update("late")],
         });
         // Only a rung taken at the new edge remains; every rung describing the
         // old prefix is gone.
@@ -1432,14 +1445,16 @@ mod tests {
         // it cannot disturb anything earlier than itself.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![crate::tailer::Update::Entry {
-                source: crate::tailer::Source::Sub("late".into()),
-                entry: crate::transcript::parse_line(&format!(
+            statements: vec![Record::Entry {
+                source: Source::Sub("late".into()),
+                entry: crate::provider::claude::wire::parse_line(&format!(
                     r#"{{"type":"assistant","uuid":"u","parentUuid":null,"timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{}}}}]}}}}"#,
                     (t0 + chrono::Duration::seconds(count as i64 - 2)).to_rfc3339()
                 ))
                 .unwrap(),
-            }],
+            }
+            .statement()
+            .unwrap()],
         });
 
         assert!(
@@ -1479,8 +1494,8 @@ mod tests {
         let t1: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
         let t2: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:10.000Z".parse().unwrap();
         let items = vec![
-            ReplayItem::at(Some(t1), meta_update("sub1")),
-            ReplayItem::at(Some(t2), meta_update("sub2")),
+            ReplayItem::at(Some(t1), meta_update("sub1").facts),
+            ReplayItem::at(Some(t2), meta_update("sub2").facts),
         ];
 
         let mut app = App::new("s".into(), Mode::Replay);
@@ -1519,18 +1534,19 @@ mod tests {
 
     #[test]
     fn seek_prompt_steps_between_eras() {
-        use crate::tailer::{ReplayItem, Source};
+        use crate::tailer::ReplayItem;
         let ts = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
         let prompt = |uuid: &str, t: &str, text: &str| {
             let line = format!(
                 r#"{{"type":"user","uuid":"{uuid}","parentUuid":null,"origin":{{"kind":"human"}},"timestamp":"{t}","message":{{"role":"user","content":"{text}"}}}}"#
             );
-            ReplayItem::at(
-                Some(ts(t)),
-                Update::Entry {
+            ReplayItem::new(
+                Record::Entry {
                     source: Source::Main,
-                    entry: crate::transcript::parse_line(&line).unwrap(),
-                },
+                    entry: crate::provider::claude::wire::parse_line(&line).unwrap(),
+                }
+                .statement()
+                .unwrap(),
             )
         };
         let items = vec![
@@ -1538,7 +1554,10 @@ mod tests {
             prompt("p2", "2026-06-05T11:00:00.000Z", "second"),
             prompt("p3", "2026-06-05T12:00:00.000Z", "third"),
             // Trailing activity after the last era.
-            ReplayItem::at(Some(ts("2026-06-05T13:00:00.000Z")), meta_update("sub1")),
+            ReplayItem::at(
+                Some(ts("2026-06-05T13:00:00.000Z")),
+                meta_update("sub1").facts,
+            ),
         ];
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
@@ -1581,8 +1600,8 @@ mod tests {
         let t1: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
         let t2: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:10.000Z".parse().unwrap();
         let items = vec![
-            ReplayItem::at(Some(t1), meta_update("sub1")),
-            ReplayItem::at(Some(t2), meta_update("sub2")),
+            ReplayItem::at(Some(t1), meta_update("sub1").facts),
+            ReplayItem::at(Some(t2), meta_update("sub2").facts),
         ];
         let mut app = App::new("s".into(), Mode::Replay);
         app.handle_ui_event(UiEvent::ReplayLoaded {
@@ -1614,8 +1633,8 @@ mod tests {
         app.handle_ui_event(UiEvent::ReplayLoaded {
             session_id: "s".into(),
             items: vec![
-                ReplayItem::at(Some(t1), meta_update("sub1")),
-                ReplayItem::at(Some(t2), meta_update("sub2")),
+                ReplayItem::at(Some(t1), meta_update("sub1").facts),
+                ReplayItem::at(Some(t2), meta_update("sub2").facts),
             ],
             speed: 8.0,
             info: Default::default(),
@@ -1633,7 +1652,7 @@ mod tests {
         // replay now reads Live — "live" is following + fresh, not a mode.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![meta_update("sub3")],
+            statements: vec![meta_update("sub3")],
         });
         assert_eq!(app.transport(), Transport::Live);
         assert!(
@@ -1655,8 +1674,8 @@ mod tests {
         app.handle_ui_event(UiEvent::ReplayLoaded {
             session_id: "s".into(),
             items: vec![
-                ReplayItem::at(Some(t1), meta_update("sub1")),
-                ReplayItem::at(Some(t2), meta_update("sub2")),
+                ReplayItem::at(Some(t1), meta_update("sub1").facts),
+                ReplayItem::at(Some(t2), meta_update("sub2").facts),
             ],
             speed: 8.0,
             info: Default::default(),
@@ -1691,8 +1710,8 @@ mod tests {
         app.handle_ui_event(UiEvent::ReplayLoaded {
             session_id: "s".into(),
             items: vec![
-                ReplayItem::at(Some(t1), meta_update("sub1")),
-                ReplayItem::at(Some(t2), meta_update("sub2")),
+                ReplayItem::at(Some(t1), meta_update("sub1").facts),
+                ReplayItem::at(Some(t2), meta_update("sub2").facts),
             ],
             speed: 8.0,
             info: Default::default(),
@@ -1720,8 +1739,8 @@ mod tests {
         app.handle_ui_event(UiEvent::ReplayLoaded {
             session_id: "s".into(),
             items: vec![
-                ReplayItem::at(Some(t1), meta_update("sub1")),
-                ReplayItem::at(Some(t2), meta_update("sub2")),
+                ReplayItem::at(Some(t1), meta_update("sub1").facts),
+                ReplayItem::at(Some(t2), meta_update("sub2").facts),
             ],
             speed: 8.0,
             info: Default::default(),
@@ -1741,13 +1760,15 @@ mod tests {
     #[test]
     fn pausing_at_the_live_edge_buffers_appends_instead_of_snapping() {
         let e = |ts: &str| {
-            Update::Entry {
-            source: crate::tailer::Source::Main,
-            entry: crate::transcript::parse_line(&format!(
+            Record::Entry {
+            source: Source::Main,
+            entry: crate::provider::claude::wire::parse_line(&format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{ts}","message":{{"role":"user","content":"x"}}}}"#
             ))
             .unwrap(),
         }
+        .statement()
+        .unwrap()
         };
         let mut app = App::new("s".into(), Mode::Live);
         app.handle_ui_event(UiEvent::SessionReset {
@@ -1756,7 +1777,7 @@ mod tests {
         // Ride the live edge at t0.
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![e("2026-06-05T10:00:00.000Z")],
+            statements: vec![e("2026-06-05T10:00:00.000Z")],
         });
         assert!(app.timeline.follow_head, "live session follows the edge");
         let cursor_at_pause = app.timeline.cursor;
@@ -1776,7 +1797,7 @@ mod tests {
         // the whole point of live-pause. (Previously it snapped the playhead.)
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![e("2026-06-05T10:00:10.000Z")],
+            statements: vec![e("2026-06-05T10:00:10.000Z")],
         });
         assert_eq!(
             app.timeline.cursor, cursor_at_pause,
@@ -1811,18 +1832,20 @@ mod tests {
             session_id: "s".into(),
         });
         let e = |ts: &str| {
-            Update::Entry {
-            source: crate::tailer::Source::Main,
-            entry: crate::transcript::parse_line(&format!(
+            Record::Entry {
+            source: Source::Main,
+            entry: crate::provider::claude::wire::parse_line(&format!(
                 r#"{{"type":"user","uuid":"u","timestamp":"{ts}","message":{{"role":"user","content":"x"}}}}"#
             ))
             .unwrap(),
         }
+        .statement()
+        .unwrap()
         };
         // An out-of-order batch (file-grouped arrival / backfilled block).
         app.handle_ui_event(UiEvent::Batch {
             session_id: "s".into(),
-            updates: vec![
+            statements: vec![
                 e("2026-06-05T10:00:05.000Z"),
                 e("2026-06-05T10:00:01.000Z"),
                 e("2026-06-05T10:00:03.000Z"),

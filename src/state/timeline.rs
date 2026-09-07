@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::tailer::{ReplayItem, Source, Timing, Update};
+use crate::fact::{FactKind, Statement};
+use crate::state::session::MAIN_ID;
+use crate::tailer::{ReplayItem, Timing};
 
 /// The replay/live timeline and its playhead.
 pub struct Timeline {
@@ -190,7 +192,7 @@ impl Timeline {
     /// back, or mid-replay) keeps its place and reaches the new events by playing
     /// forward, never jumping to them. New growth also un-latches the
     /// end-of-stream signal (a resumed session can end again).
-    pub fn append_live(&mut self, updates: Vec<Update>) {
+    pub fn append_live(&mut self, statements: Vec<Statement>) {
         let before = self.items.len();
         // Ride the new edge only if the cursor was already at it. If behind —
         // scrubbed back, or catching up after pressing play — keep our place and
@@ -217,8 +219,8 @@ impl Timeline {
         // Earliest timestamp in this batch: where a re-sort can start moving
         // things, and so where the untouched prefix ends.
         let mut earliest_new: Option<DateTime<Utc>> = None;
-        for update in updates {
-            let item = ReplayItem::live(update);
+        for statement in statements {
+            let item = ReplayItem::new(statement);
             match item.ts() {
                 Some(ts) => {
                     self.head = Some(self.head.map_or(ts, |h| h.max(ts)));
@@ -228,11 +230,11 @@ impl Timeline {
                     }
                     tail_ts = Some(tail_ts.map_or(ts, |t| t.max(ts)));
                     if !self.undated_agents.is_empty()
-                        && let Update::Entry {
-                            source: Source::Sub(id),
-                            ..
-                        } = &item.update
-                        && self.undated_agents.contains(id)
+                        && item.any(|f| {
+                            f.agent
+                                .as_ref()
+                                .is_some_and(|id| self.undated_agents.contains(id))
+                        })
                     {
                         needs_dating = true;
                     }
@@ -534,17 +536,16 @@ impl Timeline {
     /// (task-notifications, background-stop notices) is never marked.
     ///
     /// [`App::seek_prompt`]: crate::state::App::seek_prompt
-    /// [`UserEntry::is_human_prompt`]: crate::transcript::UserEntry::is_human_prompt
+    /// [`UserEntry::is_human_prompt`]: crate::provider::claude::wire::UserEntry::is_human_prompt
     pub fn prompt_markers(&self) -> Vec<usize> {
         self.items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| match &item.update {
-                Update::Entry {
-                    source: Source::Main,
-                    entry: crate::transcript::Entry::User(e),
-                } if e.is_human_prompt() => Some(i),
-                _ => None,
+            .filter_map(|(i, item)| {
+                item.any(|f| {
+                    matches!(f.kind, FactKind::Prompt(_)) && f.agent.as_deref() == Some(MAIN_ID)
+                })
+                .then_some(i)
             })
             .collect()
     }
@@ -570,35 +571,46 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tailer::{ReplayItem, Source, Update};
-    use crate::transcript::{self, Entry};
+    use crate::fact::Fact;
+    use crate::provider::claude::wire;
+    use crate::provider::claude::{Record, Source};
+    use crate::tailer::ReplayItem;
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
     }
 
-    fn entry_item(t: &str) -> ReplayItem {
+    /// A human prompt on the main file at `t`.
+    fn stmt(t: &str) -> Statement {
         let line = format!(
             "{{\"type\":\"user\",\"uuid\":\"u\",\"parentUuid\":null,\"origin\":{{\"kind\":\"human\"}},\"timestamp\":\"{t}\",\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}"
         );
-        ReplayItem::at(
-            Some(ts(t)),
-            Update::Entry {
-                source: Source::Main,
-                entry: transcript::parse_line(&line).unwrap(),
-            },
-        )
+        Record::Entry {
+            source: Source::Main,
+            entry: wire::parse_line(&line).unwrap(),
+        }
+        .statement()
+        .unwrap()
+    }
+
+    fn entry_item(t: &str) -> ReplayItem {
+        ReplayItem::new(stmt(t))
+    }
+
+    /// An untimed leader (no join target) — rides at the head.
+    fn leader() -> Statement {
+        Statement {
+            at: None,
+            facts: vec![Fact {
+                agent: None,
+                ts: None,
+                kind: FactKind::Activity,
+            }],
+        }
     }
 
     fn meta_item() -> ReplayItem {
-        // An untimed leader (no join target) — rides at the head.
-        ReplayItem::at(
-            None,
-            Update::Entry {
-                source: Source::Main,
-                entry: Entry::Unknown,
-            },
-        )
+        ReplayItem::new(leader())
     }
 
     #[test]
@@ -693,12 +705,13 @@ mod tests {
         // indices, not columns.
         let system = {
             let line = r#"{"type":"user","uuid":"u","parentUuid":null,"origin":{"kind":"task-notification"},"timestamp":"2026-06-05T10:30:00.000Z","message":{"role":"user","content":"3 background agents were stopped"}}"#;
-            ReplayItem::at(
-                Some(ts("2026-06-05T10:30:00.000Z")),
-                Update::Entry {
+            ReplayItem::new(
+                Record::Entry {
                     source: Source::Main,
-                    entry: transcript::parse_line(line).unwrap(),
-                },
+                    entry: wire::parse_line(line).unwrap(),
+                }
+                .statement()
+                .unwrap(),
             )
         };
         let mut tl = Timeline::new();
@@ -890,11 +903,11 @@ mod tests {
         assert!(!tl.replay);
 
         // A timestamp-less update (e.g. a meta) rides along at the head.
-        tl.append_live(vec![meta_item().update]);
+        tl.append_live(vec![leader()]);
         assert_eq!(tl.fold_target(), tl.items.len());
 
         // A timestamped live entry advances the head, and following pins to it.
-        tl.append_live(vec![entry_item("2026-06-05T10:00:05.000Z").update]);
+        tl.append_live(vec![stmt("2026-06-05T10:00:05.000Z")]);
         assert_eq!(tl.head_ts(), Some(ts("2026-06-05T10:00:05.000Z")));
         assert_eq!(tl.cursor, Some(ts("2026-06-05T10:00:05.000Z")));
         assert_eq!(
@@ -910,9 +923,9 @@ mod tests {
         // An out-of-order arrival: a later main entry, then a backfilled subagent
         // block with earlier timestamps (read after the main file on one tick).
         tl.append_live(vec![
-            entry_item("2026-06-05T10:00:05.000Z").update,
-            entry_item("2026-06-05T10:00:01.000Z").update,
-            entry_item("2026-06-05T10:00:03.000Z").update,
+            stmt("2026-06-05T10:00:05.000Z"),
+            stmt("2026-06-05T10:00:01.000Z"),
+            stmt("2026-06-05T10:00:03.000Z"),
         ]);
         let got: Vec<_> = tl.items.iter().filter_map(|i| i.ts()).collect();
         let mut want = got.clone();
@@ -925,8 +938,8 @@ mod tests {
 
         // A later out-of-order batch still merges into sorted order.
         tl.append_live(vec![
-            entry_item("2026-06-05T10:00:08.000Z").update,
-            entry_item("2026-06-05T10:00:04.000Z").update,
+            stmt("2026-06-05T10:00:08.000Z"),
+            stmt("2026-06-05T10:00:04.000Z"),
         ]);
         let got: Vec<_> = tl.items.iter().filter_map(|i| i.ts()).collect();
         let mut want = got.clone();
@@ -938,29 +951,25 @@ mod tests {
     fn early_journal_result_is_redated_once_its_agent_arrives() {
         let mut tl = Timeline::new();
         // The session starts at 10:00.
-        tl.append_live(vec![entry_item("2026-06-05T10:00:00.000Z").update]);
+        tl.append_live(vec![stmt("2026-06-05T10:00:00.000Z")]);
 
         // A workflow journal `result` arrives BEFORE the agent's transcript is
         // discovered (journal flushed a tick earlier) — it must NOT be
         // permanently dated to the session start.
         let result_line = r#"{"type":"result","key":"v2:abcd","agentId":"aaaaaaaaaaaaaaaaa","result":{"summary":"done"}}"#;
-        let entry = transcript::parse_line(result_line).unwrap();
-        tl.append_live(vec![Update::Entry {
-            source: Source::Journal("wf1".into()),
-            entry,
-        }]);
+        let entry = wire::parse_line(result_line).unwrap();
+        tl.append_live(vec![
+            Record::Entry {
+                source: Source::Ledger("wf1".into()),
+                entry,
+            }
+            .statement()
+            .unwrap(),
+        ]);
         let journal_ts = |tl: &Timeline| {
             tl.items
                 .iter()
-                .find(|i| {
-                    matches!(
-                        &i.update,
-                        Update::Entry {
-                            source: Source::Journal(_),
-                            ..
-                        }
-                    )
-                })
+                .find(|i| i.any(|f| matches!(f.kind, FactKind::Ended(_))))
                 .unwrap()
                 .ts()
         };
@@ -969,10 +978,14 @@ mod tests {
         // The agent's entries land on a later tick: the result is re-dated to
         // the agent's last entry, not the session start.
         let sub_line = r#"{"type":"user","uuid":"s1","parentUuid":null,"isSidechain":true,"agentId":"aaaaaaaaaaaaaaaaa","timestamp":"2026-06-05T11:30:00.000Z","message":{"role":"user","content":"task"}}"#;
-        tl.append_live(vec![Update::Entry {
-            source: Source::Sub("aaaaaaaaaaaaaaaaa".into()),
-            entry: transcript::parse_line(sub_line).unwrap(),
-        }]);
+        tl.append_live(vec![
+            Record::Entry {
+                source: Source::Sub("aaaaaaaaaaaaaaaaa".into()),
+                entry: wire::parse_line(sub_line).unwrap(),
+            }
+            .statement()
+            .unwrap(),
+        ]);
         assert_eq!(
             journal_ts(&tl),
             Some(ts("2026-06-05T11:30:00.000Z")),
@@ -985,10 +998,10 @@ mod tests {
         let mut tl = Timeline::new();
         // In-order timed batches take the fast path; order must still hold.
         tl.append_live(vec![
-            entry_item("2026-06-05T10:00:01.000Z").update,
-            entry_item("2026-06-05T10:00:02.000Z").update,
+            stmt("2026-06-05T10:00:01.000Z"),
+            stmt("2026-06-05T10:00:02.000Z"),
         ]);
-        tl.append_live(vec![entry_item("2026-06-05T10:00:03.000Z").update]);
+        tl.append_live(vec![stmt("2026-06-05T10:00:03.000Z")]);
         let got: Vec<_> = tl.items.iter().filter_map(|i| i.ts()).collect();
         let mut want = got.clone();
         want.sort();
@@ -1011,7 +1024,7 @@ mod tests {
         // move a cursor the user parked in the past.
         tl.cursor = Some(ts("2026-06-05T10:00:00.000Z"));
         tl.follow_head = false;
-        tl.append_live(vec![entry_item("2026-06-05T10:00:20.000Z").update]);
+        tl.append_live(vec![stmt("2026-06-05T10:00:20.000Z")]);
         assert_eq!(tl.head_ts(), Some(ts("2026-06-05T10:00:20.000Z")));
         assert_eq!(
             tl.cursor,
@@ -1022,7 +1035,7 @@ mod tests {
         // Resumed (follow_head) but still BEHIND the edge — catching up. An append
         // still must not snap the cursor to the edge; `advance` paces it forward.
         tl.follow_head = true;
-        tl.append_live(vec![entry_item("2026-06-05T10:00:30.000Z").update]);
+        tl.append_live(vec![stmt("2026-06-05T10:00:30.000Z")]);
         assert_eq!(tl.head_ts(), Some(ts("2026-06-05T10:00:30.000Z")));
         assert_eq!(
             tl.cursor,
@@ -1155,47 +1168,55 @@ mod tests {
         }
     }
 
-    fn main_entry(sec: u64, uid: usize) -> Update {
+    fn main_entry(sec: u64, uid: usize) -> Statement {
         let line = format!(
             "{{\"type\":\"user\",\"uuid\":\"m{uid}\",\"parentUuid\":null,\"timestamp\":\"2026-06-05T10:00:{sec:02}.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}"
         );
-        Update::Entry {
+        Record::Entry {
             source: Source::Main,
-            entry: transcript::parse_line(&line).unwrap(),
+            entry: wire::parse_line(&line).unwrap(),
         }
+        .statement()
+        .unwrap()
     }
 
-    fn sub_entry(agent: &str, sec: u64, uid: usize) -> Update {
+    fn sub_entry(agent: &str, sec: u64, uid: usize) -> Statement {
         let line = format!(
             "{{\"type\":\"user\",\"uuid\":\"s{uid}\",\"parentUuid\":null,\"isSidechain\":true,\"agentId\":\"{agent}\",\"timestamp\":\"2026-06-05T10:00:{sec:02}.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}"
         );
-        Update::Entry {
+        Record::Entry {
             source: Source::Sub(agent.to_string()),
-            entry: transcript::parse_line(&line).unwrap(),
+            entry: wire::parse_line(&line).unwrap(),
         }
+        .statement()
+        .unwrap()
     }
 
-    fn meta_update(agent: &str) -> Update {
-        Update::SubagentMeta {
+    fn meta_update(agent: &str) -> Statement {
+        Record::Meta {
             agent_id: agent.to_string(),
             workflow: None,
-            meta: transcript::SubagentMeta {
+            meta: wire::SubagentMeta {
                 agent_type: Some("explorer".into()),
                 description: None,
                 tool_use_id: None,
                 stopped_by_user: None,
             },
         }
+        .statement()
+        .unwrap()
     }
 
-    fn journal_result(agent: &str) -> Update {
+    fn journal_result(agent: &str) -> Statement {
         let line = format!(
             "{{\"type\":\"result\",\"key\":\"v2:x\",\"agentId\":\"{agent}\",\"result\":{{\"summary\":\"done\"}}}}"
         );
-        Update::Entry {
-            source: Source::Journal("wf1".into()),
-            entry: transcript::parse_line(&line).unwrap(),
+        Record::Entry {
+            source: Source::Ledger("wf1".into()),
+            entry: wire::parse_line(&line).unwrap(),
         }
+        .statement()
+        .unwrap()
     }
 
     /// Build one scenario deterministically from `seed` as a set of per-file
@@ -1206,14 +1227,13 @@ mod tests {
     /// while preserving the two guarantees a real tailer gives (see the test):
     /// each file's lines arrive in order, and a `result` (agent finished) trails
     /// all its agent's entries. Called twice per seed (bulk + live) since
-    /// `Update` is not `Clone`.
-    fn scenario(seed: u64) -> Vec<Vec<Update>> {
+    fn scenario(seed: u64) -> Vec<Vec<Statement>> {
         let mut rng = Rng::new(seed);
         let mut uid = 0;
         let mut streams = Vec::new();
 
         // Main file: entries in chronological (nondecreasing) order.
-        let mut main: Vec<(u64, Update)> = (0..(2 + rng.below(4)))
+        let mut main: Vec<(u64, Statement)> = (0..(2 + rng.below(4)))
             .map(|_| {
                 let sec = rng.below(30) as u64;
                 let u = main_entry(sec, uid);
@@ -1232,7 +1252,7 @@ mod tests {
         ];
         for &agent in agents.iter().take(1 + rng.below(agents.len())) {
             let mut s = vec![meta_update(agent)];
-            let mut entries: Vec<(u64, Update)> = (0..(1 + rng.below(3)))
+            let mut entries: Vec<(u64, Statement)> = (0..(1 + rng.below(3)))
                 .map(|_| {
                     let sec = rng.below(30) as u64;
                     let u = sub_entry(agent, sec, uid);
@@ -1258,7 +1278,7 @@ mod tests {
             let mut bulk: Vec<ReplayItem> = scenario(seed)
                 .into_iter()
                 .flatten()
-                .map(ReplayItem::live)
+                .map(ReplayItem::new)
                 .collect();
             crate::tailer::date_and_sort(&mut bulk);
             let bulk_ts: Vec<_> = bulk.iter().map(|i| i.ts()).collect();
@@ -1269,7 +1289,7 @@ mod tests {
             // its agent's entries). Then chop the interleaving into arbitrary
             // batches and deliver incrementally.
             let mut rng = Rng::new(seed ^ 0x00AB_CDEF);
-            let mut decks: Vec<VecDeque<Update>> =
+            let mut decks: Vec<VecDeque<Statement>> =
                 scenario(seed).into_iter().map(VecDeque::from).collect();
             let mut merged = Vec::new();
             loop {

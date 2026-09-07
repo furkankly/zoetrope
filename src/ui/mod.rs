@@ -11,6 +11,7 @@ pub mod edges;
 pub mod nodes;
 pub mod panel;
 
+use crate::fact::{FactKind, Outcome};
 use rataflow::{Background, MiniMap, MiniMapPosition};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -125,7 +126,7 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
     let info = &app.session_info;
 
     let value_w = (w as usize).saturating_sub(12);
-    let row = |label: &'static str, value: String, style: Style| {
+    let row = |label: &str, value: String, style: Style| {
         Line::from(vec![
             Span::styled(format!(" {label:<8} "), key),
             Span::styled(truncate(&value, value_w), style),
@@ -133,37 +134,28 @@ fn render_info(frame: &mut Frame, area: Rect, app: &App) {
     };
     let dash = "—".to_string();
 
-    let lines = vec![
+    // Rows are whatever the provider labelled: it knows what its session
+    // metadata means, the overlay only knows how to line it up.
+    let mut lines = vec![
         Line::from(""),
         row(
             "title",
             info.title.clone().unwrap_or_else(|| dash.clone()),
             txt,
         ),
-        row(
-            "perms",
-            info.permission_mode.clone().unwrap_or_else(|| dash.clone()),
-            txt,
-        ),
-        row(
-            "mode",
-            info.mode.clone().unwrap_or_else(|| dash.clone()),
-            txt,
-        ),
-        row(
-            "queued",
-            format!("{} · {} file edits", info.queued_ops, info.file_snapshots),
-            dim,
-        ),
-        row(
-            "last",
-            info.last_prompt
-                .as_deref()
-                .map(|p| format!("\"{p}\""))
-                .unwrap_or_else(|| dash.clone()),
-            dim,
-        ),
     ];
+    for (label, value) in &info.fields {
+        lines.push(row(label, value.clone(), txt));
+    }
+    if !info.tallies.is_empty() {
+        let tally = info
+            .tallies
+            .iter()
+            .map(|(label, n)| format!("{n} {label}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(row("count", tally, dim));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -218,8 +210,12 @@ pub(crate) fn compute_scrubber_tally(
     // single-file upload). Scanned over ALL items, so it's fold-independent.
     let meta_tool_use_ids: std::collections::BTreeSet<&str> = items
         .iter()
-        .filter_map(|it| match &it.update {
-            crate::tailer::Update::SubagentMeta { meta, .. } => meta.tool_use_id.as_deref(),
+        .flat_map(|it| it.facts.iter())
+        .filter_map(|f| match &f.kind {
+            FactKind::Agent {
+                spawned_by: Some(call),
+                ..
+            } => Some(call.as_str()),
             _ => None,
         })
         .collect();
@@ -228,23 +224,24 @@ pub(crate) fn compute_scrubber_tally(
     let mut fail_at = vec![false; width];
     for c in 0..width {
         let (a, b) = (col_idx(c), if c + 1 < width { col_idx(c + 1) } else { len });
-        for it in &items[a..b] {
-            match &it.update {
-                crate::tailer::Update::Entry { entry, .. } => {
-                    counts[c] += entry.tool_use_count() as u64;
-                    // A spawn call marks ❋ only when its subagent has no meta (not
-                    // loaded); otherwise the subagent's own meta marks it at birth.
-                    spawn_at[c] |= entry
-                        .spawn_tool_use_ids()
-                        .iter()
-                        .any(|id| !meta_tool_use_ids.contains(id));
-                    fail_at[c] |= entry.tool_failure_count() > 0;
+        for f in items[a..b].iter().flat_map(|it| it.facts.iter()) {
+            match &f.kind {
+                FactKind::ToolStart { .. } => counts[c] += 1,
+                // A spawn call marks ❋ only when its subagent has no birth
+                // record (not loaded); otherwise the birth marks it.
+                FactKind::Spawn { call } => {
+                    spawn_at[c] |= !meta_tool_use_ids.contains(call.as_str());
                 }
-                // A subagent's meta discovery IS its birth on the timeline — the
-                // moment the node appears on the canvas. Mark ❋ here for every
-                // subagent, so the strip, the canvas, and the log all agree on
-                // when the agent starts to exist.
-                crate::tailer::Update::SubagentMeta { .. } => spawn_at[c] = true,
+                FactKind::ToolEnd {
+                    outcome: Outcome::Err,
+                    ..
+                } => fail_at[c] = true,
+                // An agent's birth on the timeline is the moment its node
+                // appears on the canvas. Mark ❋ here for every agent, so the
+                // strip, the canvas, and the log all agree on when it starts
+                // to exist.
+                FactKind::Agent { .. } => spawn_at[c] = true,
+                _ => {}
             }
         }
     }
@@ -497,8 +494,12 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
         .timeline
         .items
         .iter()
-        .filter_map(|it| match &it.update {
-            crate::tailer::Update::SubagentMeta { meta, .. } => meta.tool_use_id.clone(),
+        .flat_map(|it| it.facts.iter())
+        .filter_map(|f| match &f.kind {
+            FactKind::Agent {
+                spawned_by: Some(call),
+                ..
+            } => Some(call.clone()),
             _ => None,
         })
         .collect();
@@ -921,7 +922,8 @@ pub(crate) fn truncate_tail(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{compute_scrubber_tally, truncate, truncate_tail, wrap};
-    use crate::tailer::{ReplayItem, Source, Update};
+    use crate::provider::claude::{Record, Source};
+    use crate::tailer::ReplayItem;
 
     #[test]
     fn truncate_basic() {
@@ -972,26 +974,26 @@ mod tests {
         let assistant = r#"{"type":"assistant","uuid":"a","timestamp":"2026-06-05T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Agent","input":{}}]}}"#;
         // A user turn carrying an errored tool_result.
         let failure = r#"{"type":"user","uuid":"u","timestamp":"2026-06-05T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true}]}}"#;
-        let item = |line: &str, t: &str| {
-            ReplayItem::at(
-                Some(t.parse().unwrap()),
-                Update::Entry {
+        // One item per record: the assistant line states two tool starts and a
+        // spawn, the user line one failed end.
+        let item = |line: &str| {
+            ReplayItem::new(
+                Record::Entry {
                     source: Source::Main,
-                    entry: crate::transcript::parse_line(line).unwrap(),
-                },
+                    entry: crate::provider::claude::wire::parse_line(line).unwrap(),
+                }
+                .statement()
+                .unwrap(),
             )
         };
-        let items = vec![
-            item(assistant, "2026-06-05T10:00:01.000Z"),
-            item(failure, "2026-06-05T10:00:02.000Z"),
-        ];
+        let items = vec![item(assistant), item(failure)];
 
         let t = compute_scrubber_tally(&items, 4, 0);
         assert_eq!(t.len, 2);
         assert_eq!(t.width, 4);
-        // Two tool_use blocks total across the columns; one spawn; one failure.
+        // Two tool starts total across the columns; one spawn; one failure.
         assert_eq!(t.counts.iter().sum::<u64>(), 2);
-        assert_eq!(t.maxc, 2, "both tool_use land in the same column");
+        assert_eq!(t.maxc, 2, "both tool starts land in the same column");
         assert!(t.spawn_at.iter().any(|&s| s), "the Agent spawn is flagged");
         assert!(
             t.fail_at.iter().any(|&f| f),
@@ -1007,27 +1009,29 @@ mod tests {
             r#"{{"type":"assistant","uuid":"a","timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Agent","input":{{}}}}]}}}}"#
         );
         let call_item = || {
-            ReplayItem::at(
-                Some(ts.parse().unwrap()),
-                Update::Entry {
+            ReplayItem::new(
+                Record::Entry {
                     source: Source::Main,
-                    entry: crate::transcript::parse_line(&call).unwrap(),
-                },
+                    entry: crate::provider::claude::wire::parse_line(&call).unwrap(),
+                }
+                .statement()
+                .unwrap(),
             )
         };
         let meta_item = |tool_use_id: Option<&str>| {
             ReplayItem::at(
                 Some("2026-06-05T10:00:05.000Z".parse().unwrap()),
-                Update::SubagentMeta {
+                Record::Meta {
                     agent_id: "a1000000000000001".into(),
                     workflow: None,
-                    meta: crate::transcript::SubagentMeta {
+                    meta: crate::provider::claude::wire::SubagentMeta {
                         agent_type: Some("subagent".into()),
                         description: None,
                         tool_use_id: tool_use_id.map(str::to_string),
                         stopped_by_user: None,
                     },
-                },
+                }
+                .facts(),
             )
         };
 
