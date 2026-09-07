@@ -101,10 +101,15 @@ impl SessionMeta {
         }
     }
 
-    /// The spawning thread, for a child.
+    /// The spawning thread, for a child. The spawn object states it when the
+    /// shape carries one; older files state it at the top level instead, so
+    /// both are tried before giving up.
     pub fn parent(&self) -> Option<&str> {
         match &self.source {
-            Source::Spawn { subagent } => subagent.thread_spawn.parent_thread_id.as_deref(),
+            Source::Spawn { subagent } => subagent
+                .spawn()
+                .and_then(|s| s.parent_thread_id.as_deref())
+                .or(self.parent_thread_id.as_deref()),
             _ => self.parent_thread_id.as_deref(),
         }
     }
@@ -113,9 +118,8 @@ impl SessionMeta {
     pub fn path(&self) -> Option<&str> {
         match &self.source {
             Source::Spawn { subagent } => subagent
-                .thread_spawn
-                .agent_path
-                .as_deref()
+                .spawn()
+                .and_then(|s| s.agent_path.as_deref())
                 .or(self.agent_path.as_deref()),
             _ => self.agent_path.as_deref(),
         }
@@ -124,9 +128,8 @@ impl SessionMeta {
     pub fn nickname(&self) -> Option<&str> {
         match &self.source {
             Source::Spawn { subagent } => subagent
-                .thread_spawn
-                .agent_nickname
-                .as_deref()
+                .spawn()
+                .and_then(|s| s.agent_nickname.as_deref())
                 .or(self.agent_nickname.as_deref()),
             _ => self.agent_nickname.as_deref(),
         }
@@ -146,10 +149,31 @@ pub enum Source {
     Unknown,
 }
 
+/// `source.subagent`. Two shapes in the wild: an object carrying the spawn
+/// detail, and — on 0.146.0 and older — the bare kind of the subagent, as in
+/// `{"subagent": "review"}` for `codex exec review`. The older shape carries no
+/// spawn detail at all, but those files state `parent_thread_id` at the top
+/// level of the payload, so the link survives.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct SubagentSource {
-    #[serde(default)]
-    pub thread_spawn: ThreadSpawn,
+#[serde(untagged)]
+pub enum SubagentSource {
+    Spawn {
+        #[serde(default)]
+        thread_spawn: ThreadSpawn,
+    },
+    Kind(String),
+    #[default]
+    Unknown,
+}
+
+impl SubagentSource {
+    /// The spawn detail, when this shape carries any.
+    fn spawn(&self) -> Option<&ThreadSpawn> {
+        match self {
+            Self::Spawn { thread_spawn } => Some(thread_spawn),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -530,6 +554,23 @@ mod tests {
         assert_eq!(m.path(), Some("/root/explore_theme"));
         assert_eq!(m.nickname(), Some("Huygens"));
         assert_eq!(m.subagent_history_start_ordinal, Some(19));
+    }
+
+    /// 0.146.0 writes the subagent kind as a bare string and states the parent
+    /// at the top level. Before this shape was accepted, `session_meta` failed
+    /// to deserialize and the whole file was rejected as unreadable, which hid
+    /// every `codex exec review` — the child holds all the work, the parent
+    /// holds none.
+    #[test]
+    fn child_meta_reads_the_older_string_subagent() {
+        let l = parse_line(r#"{"timestamp":"2026-09-03T09:28:42.858Z","ordinal":0,"type":"session_meta","payload":{"id":"c","session_id":"a","cwd":"/p","originator":"codex_exec","cli_version":"0.146.0","source":{"subagent":"review"},"thread_source":"subagent","parent_thread_id":"a","multi_agent_version":"disabled"}}"#).unwrap();
+        let Payload::SessionMeta(m) = l.payload else {
+            panic!("not meta");
+        };
+        assert!(!m.is_root());
+        assert_eq!(m.parent(), Some("a"));
+        assert_eq!(m.path(), None);
+        assert_eq!(m.nickname(), None);
     }
 
     #[test]

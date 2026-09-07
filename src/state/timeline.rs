@@ -532,11 +532,10 @@ impl Timeline {
     /// Item indices of main-thread human prompts — the prompt-era boundaries that
     /// `[`/`]` step between (see [`App::seek_prompt`]). Surfaced on the scrubber
     /// as chapter ticks so those jump targets are visible. Shares the era spine's
-    /// definition ([`UserEntry::is_human_prompt`]), so system-injected user text
-    /// (task-notifications, background-stop notices) is never marked.
+    /// definition: a `Prompt` fact, which a provider states only for text a
+    /// person typed, so injected user text is never marked.
     ///
     /// [`App::seek_prompt`]: crate::state::App::seek_prompt
-    /// [`UserEntry::is_human_prompt`]: crate::provider::claude::wire::UserEntry::is_human_prompt
     pub fn prompt_markers(&self) -> Vec<usize> {
         self.items
             .iter()

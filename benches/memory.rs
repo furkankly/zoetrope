@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{Session, Spec};
 use zoetrope::state::{App, Mode};
-use zoetrope::tailer::{UiEvent, replay_from_session};
+use zoetrope::tailer::UiEvent;
 
 /// Bytes currently allocated and not yet freed.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -69,7 +69,7 @@ fn measure(name: &str, spec: Spec) {
     let s: Session = common::session(spec);
     let after_gen = live();
 
-    let (items, info) = replay_from_session(&s.main, &s.demo_subagents());
+    let (items, info) = s.load();
     let item_count = items.len();
     let after_items = live();
 

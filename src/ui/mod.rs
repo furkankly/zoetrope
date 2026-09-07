@@ -208,7 +208,7 @@ pub(crate) fn compute_scrubber_tally(
     // the canvas node appears — so we mark ❋ there (the meta), and the spawning
     // tool_use is only a fallback for spawns whose subagent isn't loaded (e.g. a
     // single-file upload). Scanned over ALL items, so it's fold-independent.
-    let meta_tool_use_ids: std::collections::BTreeSet<&str> = items
+    let born_calls: std::collections::BTreeSet<&str> = items
         .iter()
         .flat_map(|it| it.facts.iter())
         .filter_map(|f| match &f.kind {
@@ -230,7 +230,7 @@ pub(crate) fn compute_scrubber_tally(
                 // A spawn call marks ❋ only when its subagent has no birth
                 // record (not loaded); otherwise the birth marks it.
                 FactKind::Spawn { call } => {
-                    spawn_at[c] |= !meta_tool_use_ids.contains(call.as_str());
+                    spawn_at[c] |= !born_calls.contains(call.as_str());
                 }
                 FactKind::ToolEnd {
                     outcome: Outcome::Err,
@@ -490,7 +490,7 @@ fn render_timeline_panel(frame: &mut Frame, area: Rect, app: &mut App, show_log:
 fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
     // Spawn `tool_use_id`s that have a discovered subagent — so a spawn call only
     // narrates as a fallback when its subagent isn't loaded (matches the strip).
-    let meta_tool_use_ids: std::collections::BTreeSet<String> = app
+    let born_calls: std::collections::BTreeSet<String> = app
         .timeline
         .items
         .iter()
@@ -505,7 +505,7 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
         .collect();
     let Some(ev) = app
         .session
-        .latest_event_at(app.timeline.cursor, &meta_tool_use_ids)
+        .latest_event_at(app.timeline.cursor, &born_calls)
     else {
         return;
     };

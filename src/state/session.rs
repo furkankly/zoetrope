@@ -2,10 +2,10 @@
 //! calls, folded solely from `Fact`s. No provider records and no rataflow types
 //! here; the graph layer ([`crate::state::graph`]) projects this onto a `Flow`.
 //!
-//! Node ids are stable strings: `"main"` for the root agent, the 17-hex
-//! `agentId` for direct/workflow subagents, and the workflow id for a workflow
-//! group node. Spawn order is tracked explicitly so layout and navigation are
-//! deterministic.
+//! Node ids are stable strings: `"main"` for the root agent, and otherwise
+//! whatever id the provider stated the agent under (Claude's 17-hex agent id,
+//! Codex's thread id, a group's own id). Spawn order is tracked explicitly so
+//! layout and navigation are deterministic.
 
 use imbl::{HashMap, HashSet, OrdMap, Vector};
 
@@ -57,7 +57,7 @@ pub struct SessionModel {
     ended: HashMap<String, AgentStatus>,
     /// Provenance facts: why each spawned agent exists, keyed by the spawning
     /// call (order-independent, like the other stores). Captured at the
-    /// `Spawn` fact; joined to the agent via `spawned_by_tool_use` at render.
+    /// `Spawn` fact; joined to the agent via `spawned_by` at render.
     spawn_context: HashMap<String, SpawnContext>,
     /// Every plain user prompt in the main transcript, in order — the
     /// session's spine. Tool calls and spawns attribute to a prompt era via
@@ -203,7 +203,7 @@ pub struct AgentInfo {
     /// Node id of the parent (`"main"` or a workflow id).
     pub parent: Option<String>,
     /// The `toolUseId` that spawned this agent — completion join key.
-    pub spawned_by_tool_use: Option<String>,
+    pub spawned_by: Option<String>,
     pub status: AgentStatus,
     /// A RELIABLE completion signal has been recorded (a non-superseded spawn
     /// ack, or a workflow journal `result`) — the status is terminal and must
@@ -228,7 +228,7 @@ pub struct AgentInfo {
     /// total (~2.7x on real transcripts), so we add a turn's tokens only the
     /// first time its `requestId` is seen. Lines without a `requestId` fall back
     /// to per-line summation.
-    seen_request_ids: HashSet<String>,
+    seen_dedup_keys: HashSet<String>,
 }
 
 impl AgentInfo {
@@ -247,7 +247,7 @@ impl AgentInfo {
             agent_type: None,
             description: None,
             parent: None,
-            spawned_by_tool_use: None,
+            spawned_by: None,
             status: AgentStatus::Running,
             terminal: false,
             model: None,
@@ -256,7 +256,7 @@ impl AgentInfo {
             output_tokens: 0,
             first_ts: None,
             last_ts: None,
-            seen_request_ids: HashSet::new(),
+            seen_dedup_keys: HashSet::new(),
         }
     }
 
@@ -296,10 +296,8 @@ impl SessionModel {
     /// pre-seeded as [`AgentStatus::Running`].
     pub fn new(session_id: String) -> Self {
         let mut agents = OrdMap::new();
-        let mut main = AgentInfo::new(AgentKind::Main);
-        // The root agent's display name is provider data, not a constant of the
-        // graph projection. Seeded here until the parser layer owns it.
-        main.agent_type = Some("claude".to_string());
+        // The root agent exists a priori; its name is the provider's to state.
+        let main = AgentInfo::new(AgentKind::Main);
         agents.insert(MAIN_ID.to_string(), main);
         SessionModel {
             session_id,
@@ -437,8 +435,8 @@ impl SessionModel {
                     if a.description.is_none() {
                         a.description = description.clone();
                     }
-                    if a.spawned_by_tool_use.is_none() {
-                        a.spawned_by_tool_use = spawned_by.clone();
+                    if a.spawned_by.is_none() {
+                        a.spawned_by = spawned_by.clone();
                     }
                     a.interactive |= *interactive;
                 }
@@ -475,7 +473,7 @@ impl SessionModel {
             FactKind::Tokens { output, dedup } => {
                 if let Some(a) = self.agents.get_mut(id) {
                     match dedup {
-                        Some(key) if a.seen_request_ids.insert(key.clone()).is_some() => {}
+                        Some(key) if a.seen_dedup_keys.insert(key.clone()).is_some() => {}
                         // Saturating: counts come from untrusted transcript
                         // content; overflow must not panic (debug) or wrap.
                         _ => a.output_tokens = a.output_tokens.saturating_add(*output),
@@ -569,7 +567,7 @@ impl SessionModel {
         let ids: Vec<String> = self
             .agents
             .iter()
-            .filter(|(_, a)| a.spawned_by_tool_use.as_deref() == Some(call))
+            .filter(|(_, a)| a.spawned_by.as_deref() == Some(call))
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -600,7 +598,7 @@ impl SessionModel {
         let Some(agent) = self.agents.get(id) else {
             return;
         };
-        let Some(call) = agent.spawned_by_tool_use.clone() else {
+        let Some(call) = agent.spawned_by.clone() else {
             return;
         };
         let Some(&(is_err, ack_ts)) = self.completed_calls.get(&call) else {
@@ -835,8 +833,7 @@ impl SessionModel {
     /// Why `agent` exists, if its spawning call was observed: the triggering
     /// user prompt and the assistant reasoning before the spawn.
     pub fn provenance(&self, agent: &AgentInfo) -> Option<&SpawnContext> {
-        self.spawn_context
-            .get(agent.spawned_by_tool_use.as_deref()?)
+        self.spawn_context.get(agent.spawned_by.as_deref()?)
     }
 
     /// The triggering prompt for a spawn, derived from the spawn timestamp's
@@ -855,13 +852,13 @@ impl SessionModel {
     ///
     /// A spawn is timed by the agent's **birth** (when it starts to exist and its
     /// node appears), not the parent's spawn *call* — mirroring the strip's meta
-    /// ❋. `meta_tool_use_ids` (the spawn `tool_use_id`s that have a discovered
+    /// ❋. `born_calls` (the spawn `tool_use_id`s that have a discovered
     /// subagent) lets a call act only as a fallback for spawns whose subagent
     /// isn't loaded, matching the strip exactly.
     pub fn latest_event_at(
         &self,
         cursor: Option<DateTime<Utc>>,
-        meta_tool_use_ids: &std::collections::BTreeSet<String>,
+        born_calls: &std::collections::BTreeSet<String>,
     ) -> Option<LogEvent> {
         let cursor = cursor?;
         let mut best: Option<LogEvent> = None;
@@ -891,7 +888,7 @@ impl SessionModel {
                 if self.spawn_context.contains_key(&tc.id) {
                     // Fallback: a spawn whose subagent isn't loaded (no meta) is
                     // marked at the call — matching the strip's tool_use fallback.
-                    if !meta_tool_use_ids.contains(&tc.id) {
+                    if !born_calls.contains(&tc.id) {
                         let text = tc
                             .summary
                             .clone()
@@ -911,6 +908,22 @@ impl SessionModel {
             }
         }
         best
+    }
+
+    /// Which provider's session this is, read off the root's stated name: a
+    /// provider names the root after itself, and that name is the one
+    /// `Provider::parse` knows. `None` until the root has been stated.
+    pub fn provider(&self) -> Option<crate::provider::Provider> {
+        self.agents
+            .get(MAIN_ID)
+            .and_then(|a| a.agent_type.as_deref())
+            .and_then(crate::provider::Provider::parse)
+    }
+
+    /// The first human prompt folded so far, as a one-line excerpt. What a
+    /// session is about when its format records no title.
+    pub fn first_prompt(&self) -> Option<&str> {
+        self.prompts.front().map(|p| p.excerpt.as_str())
     }
 
     /// The prompt era a timestamp falls in: index of the last prompt at or
@@ -1815,7 +1828,7 @@ mod tests {
         assert_eq!(a.kind, AgentKind::Subagent);
         assert_eq!(a.parent.as_deref(), Some("main"));
         assert_eq!(a.status, AgentStatus::Running);
-        assert_eq!(a.spawned_by_tool_use.as_deref(), Some("ag1"));
+        assert_eq!(a.spawned_by.as_deref(), Some("ag1"));
 
         // Re-applying the same meta is NOT structural.
         assert!(!m.apply_meta("abc123", None, &meta));

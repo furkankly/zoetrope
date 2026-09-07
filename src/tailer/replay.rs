@@ -1,8 +1,8 @@
 //! Replay assembly (native).
 //!
-//! Parse every file on disk up front, merge by timestamp into one ordered
+//! Parse every file of a session up front, merge by timestamp into one ordered
 //! [`ReplayItem`] stream, hand it to the App in a single [`UiEvent::ReplayLoaded`]
-//! — then keep tailing the file via [`tail_loop`](super::live::tail_loop) (a
+//! — then keep tailing the files via [`tail_loop`](super::live::tail_loop) (a
 //! replayed file that grows "goes live" on its own). Pacing/seeking live in the
 //! App's `Timeline`. The portable item + ordering live in [`super::item`].
 
@@ -10,44 +10,54 @@ use std::path::Path;
 
 use tokio::sync::mpsc;
 
-use crate::provider::claude::{discovery, wire::SubagentMeta};
+use crate::provider::{Provider, ReadMode, Session, Stream, Target, open};
 
 use super::item::{ReplayItem, date_and_sort};
-use super::live::{LiveSession, SnapshotSeed, resolve_live_target, tail_loop};
+use super::live::{LiveSession, SnapshotSeed, tail_loop};
 use super::{Flow, TailRequest, UiEvent};
-use crate::provider::claude::{self, Source};
 
-/// Replay feeder: parse everything on disk, merge by timestamp, hand the whole
-/// (sorted) stream to the App in one [`UiEvent::ReplayLoaded`] — then KEEP TAILING
-/// the file. Completion is unknowable (any session can be resumed), so a replayed
-/// file is never assumed finished: if it grows, the new appends flow in and the
-/// session "goes live" on its own. Pacing/seeking live in the App's `Timeline`.
+/// Replay feeder: open the session, parse everything on disk, merge by
+/// timestamp, hand the whole (sorted) stream to the App in one
+/// [`UiEvent::ReplayLoaded`] — then KEEP TAILING. Completion is unknowable (any
+/// session can be resumed), so a replayed file is never assumed finished: if it
+/// grows, the new appends flow in and the session "goes live" on its own.
 ///
 /// Returns [`Flow::Switch`] on a `Watch`, [`Flow::Exit`] if the channel closes.
 pub(crate) async fn run_replay(
-    path: &Path,
+    target: &Target,
+    only: Option<Provider>,
     ui_tx: &mpsc::Sender<UiEvent>,
     req_rx: &mut mpsc::Receiver<TailRequest>,
     speed: f64,
 ) -> Flow {
-    let session_id = discovery::session_id_from_path(path);
+    let session = match open(target, only) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ui_tx.send(UiEvent::Error(e.to_string())).await;
+            return match req_rx.recv().await {
+                Some(TailRequest::Watch(t)) => Flow::from_watch(t),
+                None => Flow::Exit,
+            };
+        }
+    };
+    let session_id = session.id.clone();
 
     // The up-front full parse reads every session file synchronously (the 2MB
     // transcript takes ~0.3s). Run it on a blocking thread so it never stalls a
     // runtime worker — robust even on a single-threaded runtime flavor.
-    let owned_path = path.to_path_buf();
-    let (items, info, seed) =
-        match tokio::task::spawn_blocking(move || build_replay(&owned_path)).await {
-            Ok(loaded) => loaded,
-            // A panic in the parse task would otherwise `unwrap_or_default()` into an
-            // empty session indistinguishable from a genuinely empty one — surface it.
-            Err(e) => {
-                let _ = ui_tx
-                    .send(UiEvent::Error(format!("failed to load session: {e}")))
-                    .await;
-                return Flow::Exit;
-            }
-        };
+    let owned = session.clone();
+    let (items, info, seed) = match tokio::task::spawn_blocking(move || build_replay(&owned)).await
+    {
+        Ok(loaded) => loaded,
+        // A panic in the parse task would otherwise `unwrap_or_default()` into an
+        // empty session indistinguishable from a genuinely empty one — surface it.
+        Err(e) => {
+            let _ = ui_tx
+                .send(UiEvent::Error(format!("failed to load session: {e}")))
+                .await;
+            return Flow::Exit;
+        }
+    };
 
     let speed = if speed > 0.0 { speed } else { 1.0 };
 
@@ -64,28 +74,20 @@ pub(crate) async fn run_replay(
         return Flow::Exit;
     }
 
-    // Keep tailing the SAME file for appends. Resolve to (dir, file); a replay
-    // target is a concrete file, so disable newer-session auto-switch (you asked
-    // for this file) by clearing project_dir. Tail offsets are seeded from the
-    // byte positions the bulk parse actually consumed — NOT the current EOF —
-    // so lines appended while the bulk parse ran are emitted, not skipped.
-    let Some((project_dir, main_path)) = resolve_live_target(path) else {
-        // Unreadable target: nothing to tail, just wait for a switch/exit.
-        return match req_rx.recv().await {
-            Some(TailRequest::Watch(p)) => Flow::Switch(p),
-            None => Flow::Exit,
-        };
-    };
-    let mut session = LiveSession::new(project_dir, main_path);
-    session.project_dir = None; // replay pins one file — no auto-switch
-    session.seed(seed);
+    // Keep tailing the SAME session for appends. A replay target is pinned (you
+    // asked for this session), so no newer-session auto-switch. Tail offsets
+    // are seeded from the byte positions the bulk parse actually consumed — NOT
+    // the current EOF — so lines appended while the bulk parse ran are emitted,
+    // not skipped.
+    let mut live = LiveSession::new(session, None, only);
+    live.seed(seed);
 
-    tail_loop(session, session_id, ui_tx, req_rx).await
+    tail_loop(live, session_id, ui_tx, req_rx).await
 }
 
-/// Build the merged, timestamp-ordered replay item list from all session files,
-/// plus the [`SnapshotSeed`] recording how far into each file the parse read
-/// (so the follow-up tail resumes exactly there).
+/// Build the merged, timestamp-ordered replay item list from all of a
+/// session's files, plus the [`SnapshotSeed`] recording how far into each file
+/// the parse read (so the follow-up tail resumes exactly there).
 ///
 /// Parsing order within a file is preserved; the global sort is stable so
 /// entries with equal (or missing, via predecessor) timestamps keep their
@@ -93,92 +95,50 @@ pub(crate) async fn run_replay(
 /// timestamp *within their own file* before the merge sort, so they ride along
 /// with their predecessor.
 pub(crate) fn build_replay(
-    main_path: &Path,
+    session: &Session,
 ) -> (Vec<ReplayItem>, crate::state::SessionInfo, SnapshotSeed) {
     let mut items: Vec<ReplayItem> = Vec::new();
     let mut seed = SnapshotSeed::default();
+    let p = session.provider;
 
-    let parse =
-        |path: &Path, source: Source, items: &mut Vec<ReplayItem>, seed: &mut SnapshotSeed| {
-            let consumed = parse_file_into(path, source, items);
-            seed.offsets.insert(path.to_path_buf(), consumed);
-        };
-
-    // Main file.
-    parse(main_path, Source::Main, &mut items, &mut seed);
-
-    // All non-main files via the shared transcript layout API (same discovery
-    // the live tailer and `inspect` use).
-    if let Some(subagents) = discovery::subagents_dir(main_path) {
-        // Direct subagents.
-        for f in discovery::scan_subagent_files(&subagents, None) {
-            if f.meta.is_file()
-                && push_meta_item(&f.meta, f.agent_id.clone(), f.workflow, &mut items)
-            {
-                seed.seen_meta.insert(f.meta.clone());
+    for file in session.every_file() {
+        match file.read {
+            ReadMode::Tail => {
+                let mut stream = p.stream_for(file);
+                let consumed = parse_file_into(&file.path, &mut stream, &mut items);
+                seed.offsets.insert(file.path.clone(), consumed);
+                seed.streams.insert(file.path.clone(), stream);
             }
-            parse(
-                &f.transcript,
-                Source::Sub(f.agent_id),
-                &mut items,
-                &mut seed,
-            );
-        }
-        // Workflow journals + their subagents.
-        for wf_id in discovery::scan_workflow_ids(&subagents) {
-            let journal = discovery::workflow_journal(&subagents, &wf_id);
-            if journal.is_file() {
-                parse(
-                    &journal,
-                    Source::Ledger(wf_id.clone()),
-                    &mut items,
-                    &mut seed,
-                );
-            }
-            let wf_dir = discovery::workflow_dir(&subagents, &wf_id);
-            for f in discovery::scan_subagent_files(&wf_dir, Some(&wf_id)) {
-                if f.meta.is_file()
-                    && push_meta_item(&f.meta, f.agent_id.clone(), f.workflow, &mut items)
+            // A whole-read sidecar states its facts once it parses; one that
+            // does not yet (mid-write) is left for the follow-up tail to retry.
+            ReadMode::Whole => {
+                if let Ok(text) = std::fs::read_to_string(&file.path)
+                    && let Some(statement) = p.sidecar(file, &text)
                 {
-                    seed.seen_meta.insert(f.meta.clone());
+                    items.push(ReplayItem::new(statement));
+                    seed.seen_whole.insert(file.path.clone());
                 }
-                parse(
-                    &f.transcript,
-                    Source::Sub(f.agent_id),
-                    &mut items,
-                    &mut seed,
-                );
             }
         }
     }
 
-    // Route untimed session-level metadata (mode, permission-mode, last-prompt,
-    // queue-operation, file-history-snapshot) into the info store and DROP it
+    // Route untimed session-level metadata into the info store and DROP it
     // from the timeline — it isn't activity, and being untimed it would clump at
     // the front. Done here, in file (chronological) order, so latest-wins holds.
     let mut info = crate::state::SessionInfo::default();
-    items.retain(|item| {
-        if item.facts.iter().all(crate::fact::Fact::is_session_meta) {
-            item.facts.iter().for_each(|f| info.apply(f));
-            false
-        } else {
-            true
-        }
-    });
+    items.retain_mut(|item| item.take_session_meta(&mut info));
 
-    // Date the untimed items (metas/journal/ai-title) and stably sort by ts.
+    // Date the undated items (sidecar births, ledger endings) and stably sort.
     date_and_sort(&mut items);
 
     (items, info, seed)
 }
 
-/// Parse all complete lines of a file into [`ReplayItem`]s, inheriting the
-/// previous in-file timestamp for entries that lack one (so they ride along
-/// with their predecessor through the merge sort). Returns the number of bytes
-/// consumed — up to and including the last newline; a trailing newline-less
-/// fragment is a mid-write line, left for the follow-up tail to emit once its
-/// newline lands.
-fn parse_file_into(path: &Path, source: Source, items: &mut Vec<ReplayItem>) -> u64 {
+/// Parse all complete lines of a file into [`ReplayItem`]s through `stream`.
+/// Returns the number of bytes consumed — up to and including the last
+/// newline; a trailing newline-less fragment is a mid-write line, left for the
+/// follow-up tail to emit once its newline lands.
+fn parse_file_into(path: &Path, stream: &mut Stream, items: &mut Vec<ReplayItem>) -> u64 {
     let Ok(bytes) = std::fs::read(path) else {
         return 0;
     };
@@ -188,36 +148,12 @@ fn parse_file_into(path: &Path, source: Source, items: &mut Vec<ReplayItem>) -> 
         .map(|i| i + 1)
         .unwrap_or(0);
     let text = String::from_utf8_lossy(&bytes[..consumed]);
-    let mut stream = claude::Stream::new(source);
     items.extend(
         text.lines()
             .filter_map(|l| stream.push(l))
             .map(ReplayItem::new),
     );
     consumed as u64
-}
-
-/// Parse a meta sidecar into a [`ReplayItem`] (no timestamp — leads its agent).
-/// Returns whether the meta parsed and was pushed (a mid-write/corrupt sidecar
-/// is left for the follow-up tail to retry).
-fn push_meta_item(
-    path: &Path,
-    agent_id: String,
-    workflow: Option<String>,
-    items: &mut Vec<ReplayItem>,
-) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_slice::<SubagentMeta>(&bytes) else {
-        return false;
-    };
-    items.push(ReplayItem::new(claude::Stream::meta(
-        &agent_id,
-        workflow.as_deref(),
-        &meta,
-    )));
-    true
 }
 
 #[cfg(test)]
@@ -265,10 +201,21 @@ mod tests {
             .write_all(br#"{"agentType":"guide","toolUseId":"t1"}"#)
             .unwrap();
 
-        let (items, _info, _seed) = build_replay(&main);
+        let session = open(&Target::Path(main.clone()), None).unwrap();
+        assert_eq!(session.files.len(), 2, "agent transcript + meta");
+        let (items, _info, seed) = build_replay(&session);
+        assert!(
+            seed.seen_whole
+                .contains(&sub_dir.join("agent-aaaaaaaaaaaaaaaaa.meta.json"))
+        );
         let pos = |pred: &dyn Fn(&ReplayItem) -> bool| items.iter().position(pred);
 
-        let meta_pos = pos(&|i| i.any(|f| matches!(f.kind, FactKind::Agent { .. }))).unwrap();
+        let meta_pos = pos(&|i| {
+            i.any(|f| {
+                matches!(f.kind, FactKind::Agent { .. }) && f.agent.as_deref() != Some(MAIN_ID)
+            })
+        })
+        .unwrap();
         let first_main = pos(&|i| i.any(|f| f.agent.as_deref() == Some(MAIN_ID))).unwrap();
         let sub_entry = pos(&|i| {
             i.any(|f| {

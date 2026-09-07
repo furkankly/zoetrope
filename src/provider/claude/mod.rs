@@ -90,6 +90,9 @@ impl Record {
 pub struct Stream {
     source: Source,
     last_ts: Option<DateTime<Utc>>,
+    /// Whether the main transcript has stated its own agent yet. The root
+    /// has no record of its own birth, so its first dated line states it.
+    announced: bool,
 }
 
 impl Stream {
@@ -97,6 +100,7 @@ impl Stream {
         Stream {
             source,
             last_ts: None,
+            announced: false,
         }
     }
 
@@ -121,6 +125,30 @@ impl Stream {
             if f.ts.is_none() {
                 f.ts = at;
             }
+        }
+        // The root agent, stated once, on the first line that is activity
+        // rather than session metadata (a metadata-only statement stays off
+        // the timeline, and an agent is not metadata).
+        if !self.announced
+            && matches!(self.source, Source::Main)
+            && !out.iter().all(Fact::is_session_meta)
+        {
+            self.announced = true;
+            out.insert(
+                0,
+                Fact {
+                    agent: Some(MAIN_ID.to_string()),
+                    ts: at,
+                    kind: FactKind::Agent {
+                        kind: AgentKind::Main,
+                        parent: None,
+                        agent_type: Some("claude".into()),
+                        description: None,
+                        spawned_by: None,
+                        interactive: true,
+                    },
+                },
+            );
         }
         Some(Statement { at, facts: out })
     }

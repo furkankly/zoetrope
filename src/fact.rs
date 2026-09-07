@@ -127,6 +127,17 @@ impl Statement {
     pub fn is_session_meta(&self) -> bool {
         !self.facts.is_empty() && self.facts.iter().all(Fact::is_session_meta)
     }
+
+    /// Take the session-level metadata out, leaving the activity. Metadata
+    /// belongs to the session whichever record carried it, and a record may
+    /// carry both (a Codex root names itself and its app on one line).
+    pub fn take_session_meta(&mut self) -> Vec<Fact> {
+        let (meta, rest): (Vec<Fact>, Vec<Fact>) = std::mem::take(&mut self.facts)
+            .into_iter()
+            .partition(Fact::is_session_meta);
+        self.facts = rest;
+        meta
+    }
 }
 
 impl From<Fact> for Statement {
@@ -182,8 +193,8 @@ pub enum AgentKind {
 
 impl AgentKind {
     /// Display label when the provider recorded no `agent_type`. `Group`'s
-    /// fallback is still Claude vocabulary; it belongs to the provider once
-    /// the parser layer is separated.
+    /// fallback is Claude's word for the only groups any format produces so
+    /// far; a second kind of group would make it the provider's to state.
     pub fn default_label(self) -> &'static str {
         match self {
             AgentKind::Main => "agent",

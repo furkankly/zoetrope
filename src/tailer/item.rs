@@ -4,11 +4,14 @@
 //! `Timeline`, and free of any IO so it compiles on wasm too.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
 use crate::fact::{Fact, FactKind, Statement};
+#[cfg(test)]
 use crate::provider::claude::{self, Source};
+use crate::provider::{FileRole, Provider, ReadMode, SessionFile, Stream, provider_of};
 
 /// When a timeline item happens — its single source of truth for placement.
 ///
@@ -52,6 +55,21 @@ impl ReplayItem {
             Timing::Dated(t) => Some(t),
             Timing::Pending(_) | Timing::Leader => None,
         }
+    }
+
+    /// Route this item's session-level metadata into `info`, leaving the
+    /// activity. Returns whether anything is left: an item that was metadata
+    /// through and through does not belong on the timeline.
+    pub fn take_session_meta(&mut self, info: &mut crate::state::SessionInfo) -> bool {
+        self.facts.retain(|f| {
+            if f.is_session_meta() {
+                info.apply(f);
+                false
+            } else {
+                true
+            }
+        });
+        !self.facts.is_empty()
     }
 
     /// Wrap a statement as a timeline item, placed where its record was
@@ -173,80 +191,141 @@ fn date_and_sort_inner(items: &mut [ReplayItem], complete: bool) {
     });
 }
 
-/// Build a replay stream from a single transcript's text — the browser
-/// frontend's data source (a bundled or drag-dropped `.jsonl`).
+/// A session handed over as text: the browser's feeder. JS reads the files
+/// (a drop, an upload, or a directory it is allowed to tail) and passes each
+/// one as `(path, text)`; the bundle classifies them with the same primitives
+/// the native feeders use ([`Provider::classify`]), keeps one [`Stream`] per
+/// tailed file so later appends continue where the load stopped, and states
+/// each whole-read sidecar once.
 ///
-/// Unlike the native `build_replay`, there are no sidecar files to discover, so
-/// this parses only the main transcript: subagents appear only insofar as it
-/// records them (their own transcripts live in separate files the browser can't
-/// reach). Untimed session metadata is routed into [`SessionInfo`](crate::state::SessionInfo);
-/// the rest is dated and stably sorted — same shape the App expects from
-/// `UiEvent::ReplayLoaded`.
-pub fn replay_from_jsonl(text: &str) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
-    let mut items: Vec<ReplayItem> = Vec::new();
-    push_lines(text, &Source::Main, &mut items);
-    finish(items)
+/// The provider is read off the content, never a name: the first file any
+/// provider recognises decides, and files that do not belong to the root's
+/// session are ignored.
+pub struct Bundle {
+    provider: Provider,
+    session: String,
+    streams: HashMap<String, Stream>,
+    seen: std::collections::HashSet<String>,
 }
 
-/// One non-main file for [`replay_from_session`]: a subagent's transcript +
-/// `meta.json`, or a workflow's `journal.jsonl`.
-///
-/// Mirrors what the native `build_replay` discovers on disk, so the browser
-/// frontend (which has no filesystem — JS reads the files and hands the text
-/// across) produces the same graph from the same session.
-pub struct DemoSubagent<'a> {
-    pub agent_id: &'a str,
-    pub meta: &'a str,
-    pub transcript: &'a str,
-    /// Owning workflow id for anything under `subagents/workflows/<id>/`;
-    /// `None` for a direct subagent. Drives the group node + parentage.
-    pub workflow: Option<&'a str>,
-    /// True when `transcript` is a workflow's `journal.jsonl` rather than a
-    /// subagent transcript — it folds under [`Source::Ledger`] and carries no
-    /// meta. Requires `workflow` to be set.
-    pub journal: bool,
-}
-
-/// Build a replay stream from a full session's files — the main transcript plus
-/// subagents (transcript + meta), workflow subagents, and workflow journals.
-/// This is the multi-file equivalent of [`replay_from_jsonl`]; the native side
-/// reads the same shapes off disk via `build_replay`. The meta sets each
-/// subagent's parent (→ main, or → its workflow group) and type, so the graph
-/// connects even before the spawning tool call is folded.
-pub fn replay_from_session(
-    main: &str,
-    subagents: &[DemoSubagent],
-) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
-    let mut items: Vec<ReplayItem> = Vec::new();
-    push_lines(main, &Source::Main, &mut items);
-    for sub in subagents {
-        // A journal belongs to the workflow, not to any one agent: no meta, and
-        // it folds under its own source. Ignore one with no workflow id — there
-        // is nothing to attribute it to.
-        if sub.journal {
-            if let Some(wf) = sub.workflow {
-                push_lines(sub.transcript, &Source::Ledger(wf.to_string()), &mut items);
+impl Bundle {
+    /// Load a session from its files. `None` if no file is a transcript any
+    /// provider reads, or none of them is a session's root.
+    pub fn load(
+        files: &[(&str, &str)],
+    ) -> Option<(Bundle, Vec<ReplayItem>, crate::state::SessionInfo)> {
+        let provider = files.iter().find_map(|(_, text)| provider_of(text))?;
+        // The same path handed over twice is one file: the first copy wins.
+        let mut seen_paths = std::collections::HashSet::new();
+        let classified: Vec<(SessionFile, &str)> = files
+            .iter()
+            .filter(|(path, _)| seen_paths.insert(*path))
+            .filter_map(|(path, text)| {
+                provider
+                    .classify(Path::new(path), head_of(text))
+                    .map(|f| (f, *text))
+            })
+            .collect();
+        let root = classified
+            .iter()
+            .find(|(f, _)| f.role == FileRole::Root)?
+            .0
+            .clone();
+        let mut bundle = Bundle {
+            provider,
+            session: root.session.clone(),
+            streams: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+        };
+        let mut items: Vec<ReplayItem> = Vec::new();
+        // Root first, then the rest in the order given.
+        let mut ordered: Vec<&(SessionFile, &str)> = classified.iter().collect();
+        ordered.sort_by_key(|(f, _)| f.path != root.path);
+        for (file, text) in ordered {
+            if file.session != bundle.session {
+                continue;
             }
-            continue;
+            items.extend(bundle.feed(file, text).into_iter().map(ReplayItem::new));
         }
-        if let Ok(meta) =
-            serde_json::from_str::<crate::provider::claude::wire::SubagentMeta>(sub.meta)
-        {
-            items.push(ReplayItem::new(claude::Stream::meta(
-                sub.agent_id,
-                sub.workflow,
-                &meta,
-            )));
-        }
-        push_lines(
-            sub.transcript,
-            &Source::Sub(sub.agent_id.to_string()),
-            &mut items,
-        );
+        let (items, info) = finish(items);
+        Some((bundle, items, info))
     }
-    finish(items)
+
+    /// Feed newly-read text: appended bytes for a file already loaded, or a
+    /// whole new file. Returns what it stated, in order.
+    pub fn append(&mut self, files: &[(&str, &str)]) -> Vec<Statement> {
+        let mut out = Vec::new();
+        for (path, text) in files {
+            if let Some(stream) = self.streams.get_mut(*path) {
+                out.extend(text.lines().filter_map(|l| stream.push(l)));
+                continue;
+            }
+            let Some(file) = self.provider.classify(Path::new(path), head_of(text)) else {
+                continue;
+            };
+            if file.session != self.session || file.role == FileRole::Root {
+                continue;
+            }
+            out.extend(self.feed(&file, text));
+        }
+        out
+    }
+
+    /// One file's statements: through a new stream for a tailed file (kept for
+    /// appends), or its sidecar statement once it parses.
+    fn feed(&mut self, file: &SessionFile, text: &str) -> Vec<Statement> {
+        let key = file.path.to_string_lossy().into_owned();
+        match file.read {
+            ReadMode::Tail => {
+                let mut stream = self.provider.stream_for(file);
+                let out: Vec<Statement> = text.lines().filter_map(|l| stream.push(l)).collect();
+                self.streams.insert(key, stream);
+                out
+            }
+            ReadMode::Whole => {
+                if self.seen.contains(&key) {
+                    return Vec::new();
+                }
+                match self.provider.sidecar(file, text) {
+                    Some(st) => {
+                        self.seen.insert(key);
+                        vec![st]
+                    }
+                    // A mid-write read: retried on the next append.
+                    None => Vec::new(),
+                }
+            }
+        }
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Tailed files being followed.
+    pub fn file_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Whole-read files whose statement has been made. A file handed over
+    /// mid-write is not here until its text parses; the feeder resends it.
+    pub fn accepted(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.seen.iter().cloned().collect();
+        v.sort();
+        v
+    }
 }
 
+/// The first non-blank line, for classification.
+fn head_of(text: &str) -> &str {
+    text.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
+}
+
+#[cfg(test)]
 /// Parse a transcript's complete lines into `items` under `source`, inheriting
 /// the previous in-file timestamp for lines that lack one.
 fn push_lines(text: &str, source: &Source, items: &mut Vec<ReplayItem>) {
@@ -262,14 +341,7 @@ fn push_lines(text: &str, source: &Source, items: &mut Vec<ReplayItem>) {
 /// the timeline), then date + stably sort the rest.
 fn finish(mut items: Vec<ReplayItem>) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
     let mut info = crate::state::SessionInfo::default();
-    items.retain(|item| {
-        if item.facts.iter().all(Fact::is_session_meta) {
-            item.facts.iter().for_each(|f| info.apply(f));
-            false
-        } else {
-            true
-        }
-    });
+    items.retain_mut(|item| item.take_session_meta(&mut info));
     date_and_sort(&mut items);
     (items, info)
 }
@@ -344,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_from_jsonl_parses_orders_and_routes_noise() {
+    fn bundle_parses_orders_and_routes_noise() {
         let text = concat!(
             r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:02.000Z","message":{"role":"user","content":"second"}}"#,
             "\n",
@@ -354,7 +426,9 @@ mod tests {
             r#"garbage that should be skipped"#,
             "\n",
         );
-        let (items, _info) = replay_from_jsonl(text);
+        let (bundle, items, _info) = Bundle::load(&[("s.jsonl", text)]).unwrap();
+        assert_eq!(bundle.provider(), Provider::Claude);
+        assert_eq!(bundle.session(), "s");
         // Two valid entries (blank + garbage skipped), sorted by timestamp.
         assert_eq!(items.len(), 2);
         assert!(items[0].ts().unwrap() < items[1].ts().unwrap());
@@ -364,19 +438,21 @@ mod tests {
                 .iter()
                 .all(|i| i.facts.iter().all(|f| f.agent.as_deref() == Some(MAIN_ID)))
         );
+        // Nothing any provider reads: no session.
+        assert!(Bundle::load(&[("x.txt", "hello")]).is_none());
     }
 
     #[test]
-    fn replay_from_session_emits_subagent_birth_and_activity() {
+    fn bundle_emits_subagent_birth_and_activity_from_paths() {
         let main = r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"go"}}"#;
-        let sub = DemoSubagent {
-            agent_id: "a1000000000000001",
-            meta: r#"{"agentType":"Explore","description":"map it","toolUseId":"toolu_1"}"#,
-            transcript: r#"{"type":"user","uuid":"s1","isSidechain":true,"agentId":"a1000000000000001","timestamp":"2026-06-05T10:00:05.000Z","message":{"role":"user","content":"task"}}"#,
-            workflow: None,
-            journal: false,
-        };
-        let (items, _info) = replay_from_session(main, &[sub]);
+        let meta = r#"{"agentType":"Explore","description":"map it","toolUseId":"toolu_1"}"#;
+        let sub = r#"{"type":"user","uuid":"s1","isSidechain":true,"agentId":"a1000000000000001","timestamp":"2026-06-05T10:00:05.000Z","message":{"role":"user","content":"task"}}"#;
+        let (_, items, _info) = Bundle::load(&[
+            ("s.jsonl", main),
+            ("s/subagents/agent-a1000000000000001.meta.json", meta),
+            ("s/subagents/agent-a1000000000000001.jsonl", sub),
+        ])
+        .unwrap();
 
         let by_sub = |f: &Fact| f.agent.as_deref() == Some("a1000000000000001");
         assert!(
@@ -400,25 +476,24 @@ mod tests {
     /// Without this the browser silently renders workflow sessions as a flat
     /// fan-out, while the native TUI shows the group.
     #[test]
-    fn replay_from_session_tags_workflow_subagents_and_journals() {
+    fn bundle_tags_workflow_subagents_and_journals_from_paths() {
         let main = r#"{"type":"user","uuid":"u1","timestamp":"2026-06-05T10:00:00.000Z","message":{"role":"user","content":"go"}}"#;
-        let subs = [
-            DemoSubagent {
-                agent_id: "w1000000000000001",
-                meta: r#"{"agentType":"workflow-subagent","description":"review:bugs"}"#,
-                transcript: r#"{"type":"user","uuid":"s1","isSidechain":true,"agentId":"w1000000000000001","timestamp":"2026-06-05T10:00:05.000Z","message":{"role":"user","content":"task"}}"#,
-                workflow: Some("wf-99"),
-                journal: false,
-            },
-            DemoSubagent {
-                agent_id: "",
-                meta: "",
-                transcript: r#"{"type":"result","key":"review","agentId":"w1000000000000001","result":{"ok":true}}"#,
-                workflow: Some("wf-99"),
-                journal: true,
-            },
-        ];
-        let (items, _info) = replay_from_session(main, &subs);
+        let (_, items, _info) = Bundle::load(&[
+            ("s.jsonl", main),
+            (
+                "s/subagents/workflows/wf-99/agent-w1000000000000001.meta.json",
+                r#"{"agentType":"workflow-subagent","description":"review:bugs"}"#,
+            ),
+            (
+                "s/subagents/workflows/wf-99/agent-w1000000000000001.jsonl",
+                r#"{"type":"user","uuid":"s1","isSidechain":true,"agentId":"w1000000000000001","timestamp":"2026-06-05T10:00:05.000Z","message":{"role":"user","content":"task"}}"#,
+            ),
+            (
+                "s/subagents/workflows/wf-99/journal.jsonl",
+                r#"{"type":"result","key":"review","agentId":"w1000000000000001","result":{"ok":true}}"#,
+            ),
+        ])
+        .unwrap();
 
         assert!(
             items.iter().any(|i| i.any(|f| matches!(
@@ -433,13 +508,57 @@ mod tests {
                 .iter()
                 .any(|i| i.any(|f| matches!(f.kind, FactKind::Ended(_))
                     && f.agent.as_deref() == Some("w1000000000000001"))),
-            "journal results are endings for the agent they name"
+            "a workflow journal result is the agent's ending"
         );
+    }
+
+    /// A Codex session dropped as its rollout files: the provider comes off
+    /// the content, the root is the `user` thread, a child appended later
+    /// continues to be read by the stream that learned whose file it is.
+    #[test]
+    fn bundle_reads_codex_rollouts_and_continues_streams_on_append() {
+        let root = concat!(
+            r#"{"timestamp":"2026-08-26T15:30:09.955Z","ordinal":0,"type":"session_meta","payload":{"id":"a","session_id":"a","cwd":"/p","originator":"codex-tui","cli_version":"0.149.1","source":"cli","thread_source":"user"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-26T15:31:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"item_completed","thread_id":"a","item":{"type":"UserMessage","content":[{"type":"text","text":"do it"}]},"started_at_ms":1787758260000,"completed_at_ms":1787758260000}}"#,
+            "\n",
+        );
+        let child_head = concat!(
+            r#"{"timestamp":"2026-08-26T15:33:46.000Z","ordinal":0,"type":"session_meta","payload":{"id":"c","session_id":"a","source":{"subagent":{"thread_spawn":{"parent_thread_id":"a","agent_path":"/root/x"}}},"thread_source":"subagent","subagent_history_start_ordinal":1}}"#,
+            "\n",
+        );
+        let (mut bundle, items, _info) = Bundle::load(&[
+            ("rollout-2026-08-26T15-30-09-a.jsonl", root),
+            ("rollout-2026-08-26T15-33-46-c.jsonl", child_head),
+        ])
+        .unwrap();
+        assert_eq!(bundle.provider(), Provider::Codex);
+        assert_eq!(bundle.session(), "a");
+        assert_eq!(bundle.file_count(), 2);
         assert!(
-            !items
+            items
                 .iter()
-                .any(|i| i.any(|f| f.agent.as_deref() == Some(""))),
-            "the journal is not mistaken for a subagent transcript"
+                .any(|i| i.any(|f| matches!(f.kind, FactKind::Prompt(_))))
+        );
+        assert!(items.iter().any(|i| {
+            i.any(|f| f.agent.as_deref() == Some("c") && matches!(f.kind, FactKind::Agent { .. }))
+        }));
+
+        // The child's own line arrives later: attributed to `c`, not lost.
+        let later = r#"{"timestamp":"2026-08-26T15:34:00.000Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"child said"}]}}"#;
+        let statements = bundle.append(&[("rollout-2026-08-26T15-33-46-c.jsonl", later)]);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(statements[0].facts[0].agent.as_deref(), Some("c"));
+        assert!(
+            matches!(&statements[0].facts[0].kind, FactKind::Reasoning(t) if t == "child said")
+        );
+
+        // A file of another session is ignored on append.
+        let stranger = r#"{"timestamp":"2026-08-26T16:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"z","session_id":"z","source":"cli","thread_source":"user"}}"#;
+        assert!(
+            bundle
+                .append(&[("rollout-2026-08-26T16-00-00-z.jsonl", stranger)])
+                .is_empty()
         );
     }
 }
