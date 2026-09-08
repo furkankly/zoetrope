@@ -15,9 +15,9 @@
     "og": "node scripts/og.mjs"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.41.7",
+    "@astrojs/starlight": "^0.42.0",
     "@vercel/analytics": "^2.0.1",
-    "astro": "^7.2.2"
+    "astro": "^7.3.1"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -27,7 +27,7 @@
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",
-    "satori": "^0.29.0",
-    "sharp": "^0.35.3"
+    "satori": "^0.33.4",
+    "sharp": "^0.35.4"
   }
 }
