@@ -153,7 +153,8 @@ pub enum Source {
 /// detail, and — on 0.146.0 and older — the bare kind of the subagent, as in
 /// `{"subagent": "review"}` for `codex exec review`. The older shape carries no
 /// spawn detail at all, but those files state `parent_thread_id` at the top
-/// level of the payload, so the link survives.
+/// level of the payload, so the link survives. That build also writes
+/// `multi_agent_version: "disabled"` beside it; the two go together.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(untagged)]
 pub enum SubagentSource {
