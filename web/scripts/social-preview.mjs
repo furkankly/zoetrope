@@ -82,8 +82,8 @@ const card = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3
 
   <g font-family="JetBrains Mono">
     <text x="${TEXT_X}" y="268" font-size="72" font-weight="700" fill="${GOLD_BRIGHT}">zoetrope</text>
-    <text x="${TEXT_X}" y="332" font-size="27" fill="${TEXT}">Watch Claude Code sessions</text>
-    <text x="${TEXT_X}" y="370" font-size="27" fill="${TEXT}">as a live flow graph.</text>
+    <text x="${TEXT_X}" y="332" font-size="27" fill="${TEXT}">Watch Claude Code and Codex</text>
+    <text x="${TEXT_X}" y="370" font-size="27" fill="${TEXT}">sessions as a live flow graph.</text>
     <rect x="${TEXT_X}" y="404" width="150" height="2" fill="${DIM}"/>
     <text x="${TEXT_X}" y="452" font-size="23" fill="${DIM}">a terminal app · zoetrope.furkankly.dev</text>
   </g>

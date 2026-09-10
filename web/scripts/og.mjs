@@ -230,11 +230,25 @@ const card = {
                 children: "your agents work",
               },
             },
+            // Two lines by hand rather than by wrapping: the column is right
+            // aligned, so an automatic break leaves one orphaned word hanging
+            // off the end of the card.
             {
               type: "div",
               props: {
-                style: { fontSize: 19, color: DIM, marginTop: 22, lineHeight: 1.5 },
-                children: "claude code sessions as a live flow graph",
+                style: {
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "flex-end",
+                  fontSize: 19,
+                  color: DIM,
+                  marginTop: 22,
+                  lineHeight: 1.5,
+                },
+                children: [
+                  { type: "div", props: { children: "claude code and codex sessions" } },
+                  { type: "div", props: { children: "as a live flow graph" } },
+                ],
               },
             },
           ],
