@@ -144,18 +144,44 @@ impl Session {
                 .sum::<usize>()
     }
 
-    /// Borrowed view in the shape `tailer::replay_from_session` expects.
-    pub fn demo_subagents(&self) -> Vec<zoetrope::tailer::DemoSubagent<'_>> {
-        self.sidecars
-            .iter()
-            .map(|s| zoetrope::tailer::DemoSubagent {
-                agent_id: &s.agent_id,
-                meta: &s.meta,
-                transcript: &s.transcript,
-                workflow: s.workflow.as_deref(),
-                journal: s.journal,
-            })
-            .collect()
+    /// The session as the files it would be on disk, `(path, text)`, which is
+    /// what the browser hands `tailer::Bundle` and the shape the benches load.
+    pub fn files(&self) -> Vec<(String, &str)> {
+        let mut out = vec![("bench.jsonl".to_string(), self.main.as_str())];
+        for s in &self.sidecars {
+            let dir = match &s.workflow {
+                Some(wf) => format!("bench/subagents/workflows/{wf}"),
+                None => "bench/subagents".to_string(),
+            };
+            if s.journal {
+                out.push((format!("{dir}/journal.jsonl"), s.transcript.as_str()));
+                continue;
+            }
+            out.push((
+                format!("{dir}/agent-{}.jsonl", s.agent_id),
+                s.transcript.as_str(),
+            ));
+            if !s.meta.is_empty() {
+                out.push((
+                    format!("{dir}/agent-{}.meta.json", s.agent_id),
+                    s.meta.as_str(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The assembled, timestamp-ordered replay stream plus the session info.
+    pub fn load(
+        &self,
+    ) -> (
+        Vec<zoetrope::tailer::ReplayItem>,
+        zoetrope::state::SessionInfo,
+    ) {
+        let files = self.files();
+        let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        let (_, items, info) = zoetrope::tailer::Bundle::load(&borrowed).expect("a session");
+        (items, info)
     }
 }
 

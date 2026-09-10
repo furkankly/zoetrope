@@ -208,7 +208,7 @@ pub(crate) fn compute_scrubber_tally(
     // the canvas node appears — so we mark ❋ there (the meta), and the spawning
     // tool_use is only a fallback for spawns whose subagent isn't loaded (e.g. a
     // single-file upload). Scanned over ALL items, so it's fold-independent.
-    let meta_tool_use_ids: std::collections::BTreeSet<&str> = items
+    let born_calls: std::collections::BTreeSet<&str> = items
         .iter()
         .flat_map(|it| it.facts.iter())
         .filter_map(|f| match &f.kind {
@@ -230,17 +230,20 @@ pub(crate) fn compute_scrubber_tally(
                 // A spawn call marks ❋ only when its subagent has no birth
                 // record (not loaded); otherwise the birth marks it.
                 FactKind::Spawn { call } => {
-                    spawn_at[c] |= !meta_tool_use_ids.contains(call.as_str());
+                    spawn_at[c] |= !born_calls.contains(call.as_str());
                 }
                 FactKind::ToolEnd {
                     outcome: Outcome::Err,
                     ..
                 } => fail_at[c] = true,
                 // An agent's birth on the timeline is the moment its node
-                // appears on the canvas. Mark ❋ here for every agent, so the
-                // strip, the canvas, and the log all agree on when it starts
-                // to exist.
-                FactKind::Agent { .. } => spawn_at[c] = true,
+                // appears on the canvas. Mark ❋ here for every spawned agent,
+                // so the strip, the canvas, and the log all agree on when it
+                // starts to exist. The root is not spawned: it exists before
+                // its first line, which merely names it.
+                FactKind::Agent { kind, .. } if *kind != crate::fact::AgentKind::Main => {
+                    spawn_at[c] = true
+                }
                 _ => {}
             }
         }
@@ -262,6 +265,22 @@ pub(crate) fn compute_scrubber_tally(
 /// [`render_timeline_panel`]): a 2-row-tall tool-activity sparkline (with the
 /// playhead + markers overlaid) above a 1-row info line (playhead date+time on
 /// the left, transport tag on the right).
+/// The spawn mark on the scrubber strip and in the narration line: the
+/// session's provider's own emblem, in its own colour. Claude's sunburst in
+/// coral, Codex's circled star in green, a plain star in a neutral for a
+/// session whose root has not been stated yet. Two columns wide, like the
+/// other marks. Dingbats on purpose: every terminal and the browser's font
+/// atlas render them, the hexagon block is not. The browser's atlas drops the
+/// colour and shows the glyph alone, which still tells the providers apart.
+fn spawn_mark(provider: Option<crate::provider::Provider>) -> (&'static str, Color) {
+    use crate::provider::Provider;
+    match provider {
+        Some(Provider::Claude) => ("❋ ", Color::Indexed(173)),
+        Some(Provider::Codex) => ("❂ ", Color::Indexed(36)),
+        None => ("✦ ", Color::Indexed(252)),
+    }
+}
+
 fn render_scrubber(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.width < 8 || area.height < 4 {
         return;
@@ -381,11 +400,11 @@ fn render_scrubber(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         // Event markers, PAST only (reveal as the playhead reaches them — in sync
         // with the graph's chips): spawns, then failures (more urgent → on top).
-        // Spawn = the Claude sunburst in Claude coral (#d7875f ≈ xterm 173).
+        let (spawn_glyph, spawn_color) = spawn_mark(app.session.provider());
         for c in (0..head).filter(|&c| spawn_at[c]) {
             buf[(x(c), marker_y)]
-                .set_symbol("❋")
-                .set_style(bg.fg(Color::Indexed(173)).add_modifier(Modifier::BOLD));
+                .set_symbol(spawn_glyph)
+                .set_style(bg.fg(spawn_color).add_modifier(Modifier::BOLD));
         }
         for c in (0..head).filter(|&c| fail_at[c]) {
             buf[(x(c), marker_y)]
@@ -490,7 +509,7 @@ fn render_timeline_panel(frame: &mut Frame, area: Rect, app: &mut App, show_log:
 fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
     // Spawn `tool_use_id`s that have a discovered subagent — so a spawn call only
     // narrates as a fallback when its subagent isn't loaded (matches the strip).
-    let meta_tool_use_ids: std::collections::BTreeSet<String> = app
+    let born_calls: std::collections::BTreeSet<String> = app
         .timeline
         .items
         .iter()
@@ -505,7 +524,7 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
         .collect();
     let Some(ev) = app
         .session
-        .latest_event_at(app.timeline.cursor, &meta_tool_use_ids)
+        .latest_event_at(app.timeline.cursor, &born_calls)
     else {
         return;
     };
@@ -521,13 +540,11 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
         .with_timezone(&chrono::Local)
         .format("%H:%M:%S")
         .to_string();
+    let (spawn_glyph, spawn_color) = spawn_mark(app.session.provider());
     let (icon, icon_style) = match ev.kind {
         LogKind::Prompt => ("◆ ", bg.fg(palette.accent).add_modifier(Modifier::BOLD)),
-        // Coral to match the spawn ❋ on the scrubber's marker strip (xterm 173).
-        LogKind::Spawn => (
-            "❋ ",
-            bg.fg(Color::Indexed(173)).add_modifier(Modifier::BOLD),
-        ),
+        // The same mark as the spawn on the scrubber's marker strip.
+        LogKind::Spawn => (spawn_glyph, bg.fg(spawn_color).add_modifier(Modifier::BOLD)),
         LogKind::Failure => ("✗ ", bg.fg(palette.error).add_modifier(Modifier::BOLD)),
     };
     // Width left for the text after the "HH:MM:SS " prefix and the 2-col icon.
@@ -685,7 +702,13 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let palette = app.flow.theme.palette();
     let bg = Style::default().bg(palette.surface);
 
-    let title = app.session_info.title.as_deref().unwrap_or("session");
+    // A format with no title record (Codex) is described by its first prompt.
+    let title = app
+        .session_info
+        .title
+        .as_deref()
+        .or_else(|| app.session.first_prompt())
+        .unwrap_or("session");
 
     // Emergent transport badge — "LIVE" is following + fresh appends, never a
     // hardcoded mode.

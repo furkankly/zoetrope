@@ -28,78 +28,80 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use zoetrope::state::{App, Camera, Mode};
-use zoetrope::fact::Statement;
-use zoetrope::provider::claude::wire::SubagentMeta;
-use zoetrope::provider::claude::{Source, Stream};
-use zoetrope::tailer::{DemoSubagent, UiEvent, replay_from_jsonl, replay_from_session};
+use zoetrope::tailer::{Bundle, UiEvent};
 
-/// The demo session's main transcript, compiled into the wasm binary.
-const DEMO_MAIN: &str = include_str!("../../../assets/claude/demo.jsonl");
 /// Default replay speed (matches the native default).
 const DEMO_SPEED: f64 = 8.0;
 
-/// Bind a subagent's `agent-<id>` stem to its embedded meta + transcript.
+/// A subagent transcript as `(path, text)`, at its path under the demo session.
 macro_rules! demo_subagent {
     ($id:literal) => {
-        DemoSubagent {
-            agent_id: $id,
-            meta: include_str!(concat!(
-                "../../../assets/claude/demo/subagents/agent-",
-                $id,
-                ".meta.json"
-            )),
-            transcript: include_str!(concat!(
-                "../../../assets/claude/demo/subagents/agent-",
-                $id,
-                ".jsonl"
-            )),
-            workflow: None,
-            journal: false,
-        }
+        (
+            concat!("demo/subagents/agent-", $id, ".jsonl"),
+            include_str!(concat!("../../../assets/claude/demo/subagents/agent-", $id, ".jsonl")),
+        )
     };
 }
-
-/// Same, for a subagent under `assets/claude/demo/subagents/workflows/<wf>/`.
+/// Its `meta.json` sidecar.
+macro_rules! demo_meta {
+    ($id:literal) => {
+        (
+            concat!("demo/subagents/agent-", $id, ".meta.json"),
+            include_str!(concat!("../../../assets/claude/demo/subagents/agent-", $id, ".meta.json")),
+        )
+    };
+}
+/// Same, for a subagent under `subagents/workflows/<wf>/`.
 macro_rules! demo_workflow_subagent {
     ($wf:literal, $id:literal) => {
-        DemoSubagent {
-            agent_id: $id,
-            meta: include_str!(concat!(
-                "../../../assets/claude/demo/subagents/workflows/",
-                $wf,
-                "/agent-",
-                $id,
-                ".meta.json"
-            )),
-            transcript: include_str!(concat!(
+        (
+            concat!("demo/subagents/workflows/", $wf, "/agent-", $id, ".jsonl"),
+            include_str!(concat!(
                 "../../../assets/claude/demo/subagents/workflows/",
                 $wf,
                 "/agent-",
                 $id,
                 ".jsonl"
             )),
-            workflow: Some($wf),
-            journal: false,
-        }
+        )
     };
 }
-
-/// The workflow's `journal.jsonl` — no meta, folds under `Source::Ledger`.
-macro_rules! demo_workflow_journal {
-    ($wf:literal) => {
-        DemoSubagent {
-            agent_id: "",
-            meta: "",
-            transcript: include_str!(concat!(
+macro_rules! demo_workflow_meta {
+    ($wf:literal, $id:literal) => {
+        (
+            concat!("demo/subagents/workflows/", $wf, "/agent-", $id, ".meta.json"),
+            include_str!(concat!(
                 "../../../assets/claude/demo/subagents/workflows/",
                 $wf,
-                "/journal.jsonl"
+                "/agent-",
+                $id,
+                ".meta.json"
             )),
-            workflow: Some($wf),
-            journal: true,
-        }
+        )
     };
 }
+/// The demo session, compiled into the wasm binary as the files it is on disk,
+/// under the paths the native discovery would see them at. The same
+/// `Bundle` that loads a user's session loads this one.
+const DEMO_FILES: &[(&str, &str)] = &[
+    ("demo.jsonl", include_str!("../../../assets/claude/demo.jsonl")),
+    demo_subagent!("a1000000000000001"),
+    demo_meta!("a1000000000000001"),
+    demo_subagent!("a2000000000000002"),
+    demo_meta!("a2000000000000002"),
+    demo_subagent!("a3000000000000003"),
+    demo_meta!("a3000000000000003"),
+    demo_subagent!("a4000000000000004"),
+    demo_meta!("a4000000000000004"),
+    demo_workflow_subagent!("wf_demo01", "w1000000000000001"),
+    demo_workflow_meta!("wf_demo01", "w1000000000000001"),
+    demo_workflow_subagent!("wf_demo01", "w2000000000000002"),
+    demo_workflow_meta!("wf_demo01", "w2000000000000002"),
+    (
+        "demo/subagents/workflows/wf_demo01/journal.jsonl",
+        include_str!("../../../assets/claude/demo/subagents/workflows/wf_demo01/journal.jsonl"),
+    ),
+];
 /// The DOM element the WebGl2 grid fills (see `index.html`).
 const CONTAINER: &str = "terminal-container";
 /// Rows moved per PageUp/PageDown in the detail panel.
@@ -116,23 +118,17 @@ thread_local! {
     /// next animation frame renders the change. wasm is single-threaded, so these
     /// calls never interleave with a frame mid-borrow.
     static APP: RefCell<Option<Rc<RefCell<App>>>> = const { RefCell::new(None) };
+    /// The loaded session's per-file streams, so live appends continue where
+    /// the load stopped (a Codex stream learns whose file it is from the first
+    /// line; a fresh one per append would know nothing).
+    static BUNDLE: RefCell<Option<Bundle>> = const { RefCell::new(None) };
 }
 
 fn main() -> io::Result<()> {
     console_error_panic_hook::set_once();
 
-    // Build the App from the bundled session (main + subagents) — the same shape
-    // the native replay assembles from disk (UiEvent::ReplayLoaded).
-    let subagents = [
-        demo_subagent!("a1000000000000001"),
-        demo_subagent!("a2000000000000002"),
-        demo_subagent!("a3000000000000003"),
-        demo_subagent!("a4000000000000004"),
-        demo_workflow_subagent!("wf_demo01", "w1000000000000001"),
-        demo_workflow_subagent!("wf_demo01", "w2000000000000002"),
-        demo_workflow_journal!("wf_demo01"),
-    ];
-    let (items, info) = replay_from_session(DEMO_MAIN, &subagents);
+    // Build the App from the bundled session, the way a dropped one is built.
+    let (bundle, items, info) = Bundle::load(DEMO_FILES).expect("the bundled demo is a session");
     let mut app = App::new("demo".to_string(), Mode::Replay);
     app.handle_ui_event(UiEvent::ReplayLoaded {
         session_id: "demo".to_string(),
@@ -140,6 +136,7 @@ fn main() -> io::Result<()> {
         speed: DEMO_SPEED,
         info,
     });
+    BUNDLE.with(|cell| *cell.borrow_mut() = Some(bundle));
 
     let app = Rc::new(RefCell::new(app));
     // Stash the shared handle so the JS-callable loaders (`zoetrope_load` /
@@ -242,30 +239,22 @@ fn main() -> io::Result<()> {
 // native app and the demo use.
 // ---------------------------------------------------------------------------
 
-/// One subagent's embedded files, as passed from JS. Mirrors [`DemoSubagent`]
-/// but owns its strings (deserialized from the JS-side JSON). For an append,
-/// `meta` is `""` once already sent and `transcript` carries only new bytes.
+/// One file as passed from JS: the path it came with (what discovery would
+/// see) and its text. For an append, `text` carries only the new bytes of a
+/// file already loaded, or the whole of a file seen for the first time. The
+/// page does not say what a file is; the engine reads that off the path and
+/// the content.
 #[derive(serde::Deserialize, Default)]
-struct OwnedSub {
+struct OwnedFile {
     #[serde(default)]
-    agent_id: String,
+    path: String,
     #[serde(default)]
-    meta: String,
-    #[serde(default)]
-    transcript: String,
-    /// Set for anything under `subagents/workflows/<id>/` — drives the group
-    /// node, matching what the native tailer derives from the directory layout.
-    #[serde(default)]
-    workflow: Option<String>,
-    /// True when `transcript` is a workflow's `journal.jsonl`.
-    #[serde(default)]
-    journal: bool,
+    text: String,
 }
 
-/// Parse the JS-side `[{agent_id, meta, transcript}, …]` payload, tolerating an
-/// empty string (no subagents) and malformed JSON (→ none) rather than panicking
-/// across the wasm boundary.
-fn parse_subs(json: &str) -> Vec<OwnedSub> {
+/// Parse the JS-side `[{path, text}, …]` payload, tolerating an empty string
+/// and malformed JSON (→ none) rather than panicking across the wasm boundary.
+fn parse_files(json: &str) -> Vec<OwnedFile> {
     if json.trim().is_empty() {
         return Vec::new();
     }
@@ -273,27 +262,29 @@ fn parse_subs(json: &str) -> Vec<OwnedSub> {
 }
 
 /// Load a whole session into the view, replacing whatever is showing (the demo,
-/// or a previously loaded one). `main_text` is the main transcript; `subagents_json`
-/// is the (possibly empty) sidecar payload. `live` opens it at the edge in live
-/// mode (ready for [`zoetrope_append`]) instead of replaying paced from the start.
+/// or a previously loaded one). `files_json` is every file of the session as
+/// `[{path, text}]`; the provider is read off the content. `live` opens it at
+/// the edge in live mode (ready for [`zoetrope_append`]) instead of replaying
+/// paced from the start. Returns a JSON summary, `{provider, session, files}`,
+/// or `{error}` when no file is a session's root.
 #[wasm_bindgen]
-pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
-    let subs = parse_subs(&subagents_json);
-    let sub_refs: Vec<DemoSubagent> = subs
+pub fn zoetrope_load(files_json: String, live: bool) -> String {
+    let owned = parse_files(&files_json);
+    let files: Vec<(&str, &str)> = owned
         .iter()
-        .map(|s| DemoSubagent {
-            agent_id: &s.agent_id,
-            meta: &s.meta,
-            transcript: &s.transcript,
-            workflow: s.workflow.as_deref(),
-            journal: s.journal,
-        })
+        .map(|f| (f.path.as_str(), f.text.as_str()))
         .collect();
-    let (items, info) = if sub_refs.is_empty() {
-        replay_from_jsonl(&main_text)
-    } else {
-        replay_from_session(&main_text, &sub_refs)
+    let Some((bundle, items, info)) = Bundle::load(&files) else {
+        return r#"{"error":"no transcript any provider reads, or no session root among the files"}"#
+            .to_string();
     };
+    let summary = serde_json::json!({
+        "provider": bundle.provider().name(),
+        "session": bundle.session(),
+        "files": bundle.file_count(),
+        "accepted": bundle.accepted(),
+    })
+    .to_string();
 
     let mode = if live { Mode::Live } else { Mode::Replay };
     let mut next = App::new(LOADED_SESSION_ID.to_string(), mode);
@@ -304,50 +295,38 @@ pub fn zoetrope_load(main_text: String, subagents_json: String, live: bool) {
         info,
     });
 
+    BUNDLE.with(|cell| *cell.borrow_mut() = Some(bundle));
     APP.with(|cell| {
         if let Some(rc) = cell.borrow().as_ref() {
             *rc.borrow_mut() = next;
         }
     });
+    summary
 }
 
-/// Feed newly-appended bytes from a live-followed session as one batch (the wasm
-/// equivalent of the native tailer's poll tick). `main_tail` is the bytes added
-/// to the main transcript since the last call; each entry in `subagents_json`
-/// carries a subagent's new transcript bytes (and its `meta` the first time it's
-/// seen). Folds onto the edge when following — a no-op if nothing parses.
+/// Feed newly-read bytes from a live-followed session as one batch (the wasm
+/// equivalent of the native tailer's poll tick): `[{path, text}]`, each the
+/// bytes added to that file since the last call, or a whole file seen for the
+/// first time. Folds onto the edge when following. Returns `{accepted}`, the
+/// whole-read files stated so far, so the page knows which ones to stop
+/// resending; a sidecar caught mid-write is not in it until it parses.
 #[wasm_bindgen]
-pub fn zoetrope_append(main_tail: String, subagents_json: String) {
-    let mut statements: Vec<Statement> = Vec::new();
-    let mut main = Stream::new(Source::Main);
-    statements.extend(main_tail.lines().filter_map(|l| main.push(l)));
-    for sub in parse_subs(&subagents_json) {
-        // A workflow journal carries no meta and folds under its own source —
-        // mirrors `Source::Ledger` in the native tailer. Skip one with no
-        // workflow id: there is nothing to attribute it to.
-        if sub.journal {
-            let Some(wf) = sub.workflow.clone() else {
-                continue;
-            };
-            let mut ledger = Stream::new(Source::Ledger(wf.clone()));
-            statements.extend(sub.transcript.lines().filter_map(|l| ledger.push(l)));
-            continue;
+pub fn zoetrope_append(files_json: String) -> String {
+    let owned = parse_files(&files_json);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|f| (f.path.as_str(), f.text.as_str()))
+        .collect();
+    let (statements, accepted) = BUNDLE.with(|cell| {
+        let mut b = cell.borrow_mut();
+        match b.as_mut() {
+            Some(b) => (b.append(&files), b.accepted()),
+            None => (Vec::new(), Vec::new()),
         }
-        if !sub.meta.trim().is_empty()
-            && let Ok(meta) = serde_json::from_str::<SubagentMeta>(&sub.meta)
-        {
-            statements.push(Stream::meta(
-                &sub.agent_id,
-                sub.workflow.as_deref(),
-                &meta,
-            ));
-        }
-        let mut agent = Stream::new(Source::Sub(sub.agent_id.clone()));
-        statements.extend(sub.transcript.lines().filter_map(|l| agent.push(l)));
-    }
-
+    });
+    let summary = serde_json::json!({ "accepted": accepted }).to_string();
     if statements.is_empty() {
-        return;
+        return summary;
     }
     APP.with(|cell| {
         if let Some(rc) = cell.borrow().as_ref() {
@@ -359,6 +338,29 @@ pub fn zoetrope_append(main_tail: String, subagents_json: String) {
             });
         }
     });
+    summary
+}
+
+/// What a file is, from the path it came with and its first line: the same
+/// answer the engine gives itself, so the page's session picker never
+/// re-implements a format's rules. Returns `{provider, session, root}` as
+/// JSON, or `{}` when no provider recognises the head.
+#[wasm_bindgen]
+pub fn zoetrope_session_file(path: String, head: String) -> String {
+    use zoetrope::provider::{FileRole, provider_of};
+    let Some(p) = provider_of(&head) else {
+        return "{}".to_string();
+    };
+    match p.session_file_from(std::path::Path::new(&path), &head) {
+        Some(f) => serde_json::json!({
+            "provider": p.name(),
+            "session": f.session,
+            "root": f.role == FileRole::Root,
+            "project": f.project_key,
+        })
+        .to_string(),
+        None => "{}".to_string(),
+    }
 }
 
 /// Map a browser key to an app action, mirroring the native handler: app-level

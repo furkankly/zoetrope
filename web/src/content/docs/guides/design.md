@@ -5,10 +5,10 @@ description: "How zoetrope stays correct: an event-sourced projection, two clock
 
 zoetrope has one hard job, and most of its design follows from it:
 
-> Reconstruct a faithful, navigable, live-or-replayed view of a Claude Code
-> session from a transcript that is **undocumented, append-only, only partly
-> timestamped, and split across files**, and in which **you often can't tell when
-> something finished.**
+> Reconstruct a faithful, navigable, live-or-replayed view of a coding agent's
+> session (Claude Code, Codex) from a transcript that is **undocumented,
+> append-only, only partly timestamped, and split across files**, and in which
+> **you often can't tell when something finished.**
 
 The shape of the answer is **event sourcing**: treat the transcript as an
 append-only event log, and derive everything else from it.
@@ -79,6 +79,28 @@ Everything computed (liveness windows, group rollups, the ordering of undated
 events) has to be a reversible function of the current facts that fills a real gap.
 Anything that overrides a fact already in the model is a bug.
 
+## One boundary per format
+
+Every transcript format enters through a **provider**, one for Claude Code and
+one for Codex. A provider turns its own records into **facts**, a small shared
+vocabulary (an agent exists, a tool call started, a tool call ended with this
+outcome, an agent's end was observed), and the core folds facts without knowing
+which format stated them. The rule that decides what belongs on which side:
+
+> A provider states what its records contain. The core decides what it means
+> when nothing was recorded.
+
+So a provider never concludes. It does not mark an agent done because a tool
+result came back, and it does not invent an outcome for a call whose end it never
+saw. Reasoning about absence, such as the difference between a spawn being
+acknowledged and finishing, or an agent that went quiet, lives in the core once
+and survives every format.
+
+The same rule holds one level up, for finding files: a provider states what a
+file is, and the core decides what a session is. That is why `zoe <file>` opens
+any file of a session from either agent, and tells the formats apart by content
+rather than by name.
+
 ## Time-travel over one timeline
 
 Live and replay are not two modes. They are one time-shifted model: a single
@@ -101,8 +123,9 @@ written).
 ## One core, two frontends
 
 At the bottom is the **portable core**: the domain model, the replay/live timeline,
-the flow-graph projection, the rendering, and the transcript parser. It does no IO
-and compiles for any target, WebAssembly included. Two deliberately thin frontends
+the flow-graph projection, the rendering, and the providers that read each
+transcript format. It does no IO and compiles for any target, WebAssembly
+included. Two deliberately thin frontends
 sit on top of it, one per crate.
 
 - **`zoetrope`** — the crate you install, and the one the core lives in. On top of

@@ -5,7 +5,7 @@
 <h1 align="center">zoetrope</h1>
 
 <p align="center">
-  <em>Watch a Claude Code session as a live flow graph, in your terminal or your browser.</em>
+  <em>Watch a Claude Code or Codex session as a live flow graph, in your terminal or your browser.</em>
 </p>
 
 <p align="center">
@@ -24,15 +24,28 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code writes a JSONL transcript for every session under `~/.claude/projects/`.
-zoetrope reads it and draws the session as a graph in your terminal: the main agent, the subagents and
-workflows it spawns, and the tools each one runs, updating live as it goes. Point it
-at a finished run and it replays, paced by the session's own timestamps. Point it at a
-running one and it follows along. It's read-only, and nothing leaves your machine.
+Claude Code and Codex, the CLI and the desktop app, each write a transcript for every
+session. zoetrope reads it and draws the session as a graph in your terminal: the main
+agent, the agents it spawns, and the tools each one runs, updating live as it goes.
+Point it at a finished run and it replays, paced by the session's own timestamps. Point
+it at a running one and it follows along. It's read-only, and nothing leaves your machine.
 
 Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkankly/rataflow).
 
 ![zoetrope replaying a Claude Code session as a flow graph](https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope-demo.gif)
+
+## Supported agents
+
+| Agent | Sessions live in | Replay | Follow live | Browser |
+| --- | --- | --- | --- | --- |
+| [Claude Code](https://claude.com/claude-code) | `~/.claude/projects/` | ✓ | ✓ | ✓ sessions and subagents |
+| [Codex](https://openai.com/codex/) CLI and desktop app | `~/.codex/sessions/` | ✓ | ✓ | ✓ sessions and subagents |
+
+zoetrope reads a session from any of its files and tells the formats apart by
+content, so `zoe <file>` works for either, and `zoe <id>` finds a session by id
+across both.
+
+![zoetrope replaying a Codex CLI session as a flow graph](https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope-codex.gif)
 
 ## Installation
 
@@ -70,10 +83,12 @@ Drop a transcript on the page and get the same graph.
 ```bash
 zoe                          # follow the current project's live session
 zoe <dir>                    # follow another project's session
-zoe <file.jsonl>             # replay a recording from the start
+zoe <file.jsonl>             # replay a recording from the start (any file of a session)
+zoe <id>                     # replay a session by id, or a unique prefix of one
 zoe <file.jsonl> --follow    # open a recording at its live edge
 zoe <file.jsonl> --speed N   # playback speed (default 8.0)
-zoe inspect <file.jsonl>     # print the session tree and exit (no TUI)
+zoe --provider codex ...     # force the format instead of detecting it from the file
+zoe inspect <file|id>        # print the session tree and exit (no TUI)
 ```
 
 Give it a file and it reads the whole transcript, then keeps watching for new lines.
@@ -115,7 +130,7 @@ session from disk, or drop a transcript on the page. It stays local there too.
 - Follows a running session live, or replays a finished one
 - Reads everything a session writes: the main transcript, its subagents, and
   workflows with their own children, so the graph is the whole picture
-- Keeps going when Claude Code writes something it hasn't seen: unfamiliar records
+- Keeps going when an agent writes something it hasn't seen: unfamiliar records
   are skipped, never fatal
 - Read-only, and no network at all (see below)
 
@@ -170,10 +185,11 @@ facts seen so far, so seeking backwards is exact.
 
 A few of the pieces that turn a log into a watchable session:
 
-- **Two clocks, kept apart.** Content time comes from the transcript's own timestamps;
-  presentation time is the playhead you control. Every pacing decision (speed, gap
-  compression, scrubbing) touches only the second one, so no display choice can ever
-  alter what the session says happened.
+- **Two clocks, kept apart.** The playhead runs on content time, the session's own
+  timestamps, and everything the model says is true is a function of where it sits.
+  Presentation time is how long you have been watching, and only animation reads it.
+  Speed, gap compression and scrubbing change how the playhead moves, never what the
+  session says happened.
 - **One timeline for live and replay.** Behind the live edge it paces forward; at the
   edge it pins and folds in new appends as they land. A live session and a saved
   recording differ only in where the playhead starts. Same engine, same controls.
@@ -198,15 +214,17 @@ and [`docs/ARCHITECTURE.md`](https://github.com/furkankly/zoetrope/blob/main/doc
 
 ## A note on the transcript format
 
-The JSONL format zoetrope reads is undocumented and internal to Claude Code, so it can
-change without warning. zoetrope is built to degrade rather than break: unrecognized
-records are skipped, missing fields fall back, and a malformed line never takes down
-the session. If a new Claude Code release makes something render oddly, please
-[open an issue](https://github.com/furkankly/zoetrope/issues).
+The transcript formats zoetrope reads are undocumented and internal to Claude Code and
+Codex, so they can change without warning. zoetrope is built to degrade rather than
+break: unrecognized records are skipped, missing fields fall back, and a malformed line
+never takes down the session. If a new release of either makes something render oddly,
+please [open an issue](https://github.com/furkankly/zoetrope/issues).
 
 ## Contributing
 
-Pull requests are welcome.
+Pull requests are welcome. Support for another agent is one provider directory
+under `src/provider/`; [`docs/DISCOVERY.md`](https://github.com/furkankly/zoetrope/blob/main/docs/DISCOVERY.md)
+says what one consists of and what proves it.
 
 - This project follows [Conventional Commits](https://www.conventionalcommits.org/) for all commit messages (e.g. `feat(timeline): index the playhead by event instead of wall-clock`, `fix(tailer): fold appends at the live edge without rebuilding`). The changelog is generated from them with [git-cliff](https://github.com/orhun/git-cliff), and non-conforming commits are dropped.
 - Run `cargo fmt`, `cargo clippy` and `cargo test` before opening a PR.

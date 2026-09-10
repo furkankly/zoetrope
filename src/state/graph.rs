@@ -42,8 +42,8 @@ pub fn new_flow() -> AgentFlow {
 }
 
 /// Title line for a node: the agent type the provider recorded, else the
-/// generic label for its kind. No provider name appears here — the root
-/// agent's is seeded on the model (see [`SessionModel::new`]).
+/// generic label for its kind. No provider name appears here; the root
+/// agent's is stated by its provider like any other agent's.
 fn node_title(info: &AgentInfo) -> String {
     info.agent_type
         .clone()
@@ -217,7 +217,7 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
 ///
 /// Keyed by the child alone: every agent has exactly one parent edge, and
 /// `sync` never removes edges — so the id must never change once created.
-/// Keying on `spawned_by_tool_use` or the parent would orphan a stale edge if
+/// Keying on `spawned_by` or the parent would orphan a stale edge if
 /// either field were filled in after the edge existed (latent today, armed by
 /// any future meta re-emission).
 fn edge_id(child: &str) -> String {
@@ -254,6 +254,19 @@ mod tests {
     /// A model with main + one direct subagent (running).
     fn model_with_subagent() -> SessionModel {
         let mut m = SessionModel::new("s1".into());
+        // The root's name is the provider's to state.
+        m.apply_fact(&crate::fact::Fact {
+            agent: Some(super::super::session::MAIN_ID.to_string()),
+            ts: None,
+            kind: crate::fact::FactKind::Agent {
+                kind: AgentKind::Main,
+                parent: None,
+                agent_type: Some("claude".into()),
+                description: None,
+                spawned_by: None,
+                interactive: true,
+            },
+        });
         let meta = SubagentMeta {
             agent_type: Some("guide".into()),
             description: Some("research".into()),

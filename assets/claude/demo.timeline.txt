@@ -1,4 +1,4 @@
-2026-06-21T10:00:00+00:00  Prompt@main
+2026-06-21T10:00:00+00:00  Agent@main Prompt@main
 2026-06-21T10:00:09+00:00  Model@main Tokens@main Reasoning@main Reasoning@main ToolStart@main Spawn@main ToolStart@main Spawn@main ToolStart@main Spawn@main ToolStart@main Spawn@main ToolStart@main Spawn@main
 2026-06-21T10:00:12+00:00  Label@wf_demo01 ToolEnd@main
 2026-06-21T10:00:14+00:00  Agent@a1000000000000001

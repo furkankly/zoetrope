@@ -18,9 +18,9 @@ panel opening and the timeline scrubbing instead of just replaying a graph.
 `TODO.md` originally proposed "VHS/asciinema" for this. VHS won on the
 keystroke-choreography point.
 
-## The three recordings
+## The four recordings
 
-Each answers a different question, and the landing page shows all three in this
+Each answers a different question, and the landing page shows them in this
 order with a caption under each:
 
 | GIF | Tape | Answers |
@@ -28,6 +28,7 @@ order with a caption under each:
 | `zoetrope-demo.gif` | `assets/demo.tape` | *What is this?* — the whole tree in Overview as the session builds |
 | `zoetrope-follow.gif` | `assets/follow.tape` | *What does watching a live run feel like?* — `f` hands the camera to the action |
 | `zoetrope-tour.gif` | `assets/tour.tape` | *What is it like to use?* — pan, zoom, inspect, scrub, driven by a pointer |
+| `zoetrope-codex.gif` | `assets/codex.tape` | *Does it do Codex?* The CLI capture (`assets/codex/cli-0.153.4/`), a subagent's panel, the info overlay |
 
 Everything goes through one script, so there is one list of recordings rather
 than one per tool. Adding a recording is a line in `DEMOS` inside it plus a
@@ -218,3 +219,27 @@ call with a retry, a workflow group with a journal, two prompt eras, and the
 session metadata behind the `i` overlay. Where real data has no better value —
 workflow subagents genuinely carry only `{"agentType":"workflow-subagent"}` —
 the fixture matches reality rather than inventing nicer labels.
+
+## The Codex fixtures are real captures
+
+`assets/codex/` is the other kind of fixture: three real sessions, as Codex
+wrote them, each a directory shaped like `~/.codex/sessions` so discovery
+finds it the way it finds a live one:
+
+| Fixture | Frontend, version | Shape |
+| --- | --- | --- |
+| `cli-0.153.4` | Codex CLI 0.153.4, run as `codex exec` (the same binary as the interactive TUI; the file says `codex_exec`) | root + 4 subagents on the dark-mode brief the Claude demo uses; the only capture with `token_usage_record`. **The demo-grade one.** |
+| `cli-0.149.1` | Codex CLI 0.149.1 (`codex-tui`) | root + 3 subagents; no `SubAgentActivity{completed}` anywhere, so the children end by time-derived liveness. Kept as evidence for that fallback. |
+| `desktop-0.150.0` | Codex Desktop 0.150.0-alpha.8 | root + 6 subagents, the dark-mode-toggle scenario; paired `started`/`completed`; web searches and file patches both |
+
+Real, not synthetic, on purpose: the format is undocumented and shifts between
+versions, and the three fixtures are the evidence for every claim the provider
+makes (`src/provider/codex/`). They are trimmed of what the provider never reads
+and anonymized, never restructured. Only `cli-0.153.4` doubles as a demo asset
+(`codex.tape` records it); the other two are test evidence and nothing else.
+
+`captures_conform` (`src/provider/codex/mod.rs`) runs every directory under
+`assets/codex/` through the same conformance check as the Claude demo, with
+goldens beside each fixture. Adding a capture is a directory and
+`UPDATE_GOLDEN=1`.
+

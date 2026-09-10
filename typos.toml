@@ -16,3 +16,8 @@ ratatui = "ratatui"
 # Playback jargon rather than a misspelling of "sought": the media event is
 # itself named `seeked`, and a seeked-to frame is the frame a seek landed on.
 seeked = "seeked"
+
+[files]
+# Real Codex captures: opaque call, response and thread ids are full of
+# three-letter "words". Nothing in them is prose we wrote.
+extend-exclude = ["assets/codex/**/*.jsonl"]

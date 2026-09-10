@@ -4,14 +4,6 @@
 //! per-workflow `journal.jsonl` ledgers. Pure path logic plus directory scans;
 //! nothing here reads a line.
 
-/// Session id from a transcript path: the file stem (`<uuid>.jsonl` → `<uuid>`),
-/// lossy, empty if the path has no stem. Single source for the id-from-path rule.
-pub fn session_id_from_path(path: &std::path::Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // Directory discovery / sanitization
 // ---------------------------------------------------------------------------
@@ -201,6 +193,238 @@ pub fn workflow_dir(subagents_dir: &std::path::Path, wf_id: &str) -> std::path::
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The provider primitives (see `provider/mod.rs` and docs/DISCOVERY.md)
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use crate::provider::{FileRole, Provider, ReadMode, Scope, SessionFile};
+
+/// Every `<uuid>.jsonl` under `~/.claude/projects/*/`, or under the one
+/// project directory when the scope names a working directory. Only roots:
+/// a session's other files are found from its root.
+pub fn all_paths(scope: &Scope) -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = match &scope.project {
+        Some(cwd) => project_dir(cwd).into_iter().collect(),
+        None => claude_projects_root()
+            .and_then(|root| std::fs::read_dir(root).ok())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !is_session_file(&path) {
+                continue;
+            }
+            if let Some(since) = scope.since
+                && crate::provider::modified(&path) < since
+            {
+                continue;
+            }
+            // The session id is the file stem: prune without reading.
+            if let Some(prefix) = &scope.id_prefix
+                && !path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with(prefix.as_str()))
+            {
+                continue;
+            }
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// What a path is, by where it sits in the project layout:
+///
+/// - `<key>/<uuid>.jsonl` is the root;
+/// - `<key>/<uuid>/subagents/agent-<id>.jsonl` and
+///   `<key>/<uuid>/subagents/workflows/<wf>/agent-<id>.jsonl` are agents;
+/// - their `.meta.json` sidecars and a workflow's `journal.jsonl` are sidecars,
+///   the meta read whole (one JSON document, no trailing newline), the
+///   journal tailed.
+pub fn session_file(path: &Path) -> Option<SessionFile> {
+    classify_path(path, crate::provider::modified(path))
+}
+
+/// [`session_file`] without the filesystem: pure path logic, so the browser
+/// can classify a dropped file by the path it came with. Scans keep to
+/// `<uuid>.jsonl` (see `all_paths`); a path handed over explicitly may be a
+/// fixture with any name, and the content already said it is Claude's.
+pub fn classify_path(path: &Path, modified: SystemTime) -> Option<SessionFile> {
+    let file = |session: &str, role, read, key: &str| SessionFile {
+        provider: Provider::Claude,
+        path: path.to_path_buf(),
+        session: session.to_string(),
+        role,
+        read,
+        project_key: key.to_string(),
+        modified,
+    };
+    let dir_name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+    // A transcript directly in a project directory is a root.
+    let under_subagents = path
+        .ancestors()
+        .skip(1)
+        .any(|d| d.file_name().is_some_and(|n| n == "subagents"));
+    if path.extension().is_some_and(|e| e == "jsonl") && !under_subagents {
+        let session = path.file_stem()?.to_str()?;
+        let key = path.parent().and_then(dir_name).unwrap_or_default();
+        return Some(file(session, FileRole::Root, ReadMode::Tail, &key));
+    }
+    // Walk up to a `subagents` directory whose parent is the session's
+    // `<uuid>` directory, inside the project directory.
+    let mut cursor = path.parent();
+    let mut subagents: Option<&Path> = None;
+    while let Some(dir) = cursor {
+        if dir.file_name().is_some_and(|n| n == "subagents") {
+            subagents = Some(dir);
+            break;
+        }
+        cursor = dir.parent();
+    }
+    let subagents = subagents?;
+    let session_dir = subagents.parent()?;
+    let session = session_dir.file_name()?.to_str()?;
+    let key = session_dir.parent().and_then(dir_name).unwrap_or_default();
+    let name = path.file_name()?.to_str()?;
+    if name == "journal.jsonl" {
+        return Some(file(session, FileRole::Sidecar, ReadMode::Tail, &key));
+    }
+    if let Some(agent) = name.strip_prefix("agent-") {
+        if agent.ends_with(".meta.json") {
+            return Some(file(session, FileRole::Sidecar, ReadMode::Whole, &key));
+        }
+        if agent.ends_with(".jsonl") {
+            return Some(file(
+                session,
+                FileRole::Agent {
+                    parent: session.to_string(),
+                },
+                ReadMode::Tail,
+                &key,
+            ));
+        }
+    }
+    None
+}
+
+/// The root transcript beside a `<uuid>` session directory, if there is one.
+/// Lets a fixture whose session id is not a uuid (`demo`) classify its files.
+fn session_file_of_dir(session_dir: &Path) -> Option<PathBuf> {
+    let stem = session_dir.file_name()?.to_str()?;
+    let root = session_dir.parent()?.join(format!("{stem}.jsonl"));
+    root.is_file().then_some(root)
+}
+
+/// Where the rest of a file's session is: the root beside the `<uuid>`
+/// directory, and everything under its `subagents/`: agent transcripts and
+/// metas, workflow journals and their agents.
+pub fn related_paths(file: &SessionFile) -> Vec<PathBuf> {
+    let root = match file.role {
+        FileRole::Root => file.path.clone(),
+        _ => match root_of(&file.path) {
+            Some(r) => r,
+            None => return Vec::new(),
+        },
+    };
+    let Some(subs) = subagents_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = vec![root];
+    for f in scan_subagent_files(&subs, None) {
+        out.push(f.transcript);
+        out.push(f.meta);
+    }
+    for wf in scan_workflow_ids(&subs) {
+        out.push(workflow_journal(&subs, &wf));
+        for f in scan_subagent_files(&workflow_dir(&subs, &wf), Some(&wf)) {
+            out.push(f.transcript);
+            out.push(f.meta);
+        }
+    }
+    out.retain(|p| p.is_file());
+    out
+}
+
+/// Claude names a project by its sanitized working directory.
+pub fn project_key(cwd: &Path) -> String {
+    sanitize_cwd(cwd)
+}
+
+/// The stream for one of the session's tailed files: which [`Source`](super::Source) it is
+/// comes off the path.
+pub fn stream_for(file: &SessionFile) -> super::Stream {
+    use super::{Source, Stream};
+    let source = match &file.role {
+        FileRole::Root => Source::Main,
+        FileRole::Agent { .. } => {
+            Source::Sub(agent_id_from_filename(&file.path).unwrap_or_else(|| file.session.clone()))
+        }
+        FileRole::Sidecar => Source::Ledger(workflow_of(&file.path).unwrap_or_default()),
+    };
+    Stream::new(source)
+}
+
+/// What a `meta.json` states, once it parses.
+pub fn sidecar(file: &SessionFile, text: &str) -> Option<crate::fact::Statement> {
+    let name = file.path.file_name()?.to_str()?;
+    let agent = name
+        .strip_prefix("agent-")?
+        .strip_suffix(".meta.json")?
+        .to_string();
+    let meta = super::wire::parse_meta(text)?;
+    Some(super::Stream::meta(
+        &agent,
+        workflow_of(&file.path).as_deref(),
+        &meta,
+    ))
+}
+
+/// The workflow id a path sits under (`subagents/workflows/<wf>/...`), if any.
+fn workflow_of(path: &Path) -> Option<String> {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        let parent = dir.parent()?;
+        if parent.file_name().is_some_and(|n| n == "workflows")
+            && parent
+                .parent()
+                .is_some_and(|s| s.file_name().is_some_and(|n| n == "subagents"))
+        {
+            return dir.file_name()?.to_str().map(str::to_owned);
+        }
+        cursor = Some(parent);
+    }
+    None
+}
+
+/// The root transcript of the session a non-root file belongs to:
+/// `<key>/<uuid>.jsonl` for anything under `<key>/<uuid>/subagents/`.
+fn root_of(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir.file_name().is_some_and(|n| n == "subagents") {
+            return session_file_of_dir(dir.parent()?);
+        }
+        cursor = dir.parent();
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {

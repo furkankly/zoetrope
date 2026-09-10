@@ -66,8 +66,10 @@ pub(crate) fn conform(provider: &str, fixture: &str, streams: impl Fn() -> Vec<V
     let mut items: Vec<ReplayItem> = streams()
         .into_iter()
         .flatten()
-        .filter(|st| !st.is_session_meta())
-        .map(ReplayItem::new)
+        .filter_map(|mut st| {
+            st.take_session_meta();
+            (!st.facts.is_empty()).then(|| ReplayItem::new(st))
+        })
         .collect();
     crate::tailer::date_and_sort(&mut items);
     let mut text = String::new();
@@ -161,7 +163,7 @@ fn snapshot(m: &SessionModel) -> Vec<String> {
                 a.kind,
                 a.status,
                 a.parent,
-                a.spawned_by_tool_use,
+                a.spawned_by,
                 tools.join(",")
             )
         })

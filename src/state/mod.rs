@@ -362,18 +362,17 @@ impl App {
                 if !self.is_current(&session_id) {
                     return;
                 }
-                // Route untimed session-level metadata to the info store; only
-                // real activity (timestamped / dated) goes on the timeline.
+                // Route session-level metadata to the info store, whichever
+                // record carried it; only real activity (timestamped / dated)
+                // goes on the timeline.
                 let mut activity = Vec::with_capacity(statements.len());
-                for statement in statements {
-                    if statement.is_session_meta() {
-                        statement
-                            .facts
-                            .iter()
-                            .for_each(|f| self.session_info.apply(f));
-                        continue;
+                for mut statement in statements {
+                    for f in statement.take_session_meta() {
+                        self.session_info.apply(&f);
                     }
-                    activity.push(statement);
+                    if !statement.facts.is_empty() {
+                        activity.push(statement);
+                    }
                 }
                 // Stamp freshness for the emergent "live" state.
                 self.last_batch_at = Some(web_time::Instant::now());
@@ -756,7 +755,7 @@ impl App {
         self.resync();
     }
 
-    /// Roll workflow-group status up from children, then project the model onto
+    /// Roll group status up from children, then project the model onto
     /// the flow. Every event arm that mutates the model funnels through here so
     /// the workflow rollup can never be skipped before a sync (a just-completed
     /// group would otherwise render Running with an animated edge until the next

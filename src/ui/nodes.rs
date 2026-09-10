@@ -33,7 +33,8 @@ pub const CELL_MIN_HEIGHT: u16 = 3;
 /// place during incremental sync (mirroring [`crate::state::session::AgentInfo`]).
 #[derive(Debug, Clone)]
 pub struct AgentNode {
-    /// Title line — agent type, or `"claude"` for the main agent.
+    /// Title line — the agent type, which for the main agent is the provider's
+    /// own name (`claude`, `codex`).
     pub title: String,
     /// Truncated description shown under the title.
     pub description: Option<String>,

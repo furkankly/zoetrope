@@ -9,7 +9,7 @@
 1. **No network IO, ever.** All IO is local filesystem. No reqwest/hyper/etc. in the dep tree (dev-deps included). "Your transcripts never leave your machine" goes in the README.
 2. **Defensive parsing.** The transcript format is undocumented/internal. Unknown entry types, missing fields, malformed lines: skip, never panic. Mirrors Claude Code's own resilience.
 3. **rwy's async architecture**, ported: single-task UI loop owns all state; background tokio tasks feed typed messages over bounded mpsc; no `Arc<Mutex>`.
-4. rataflow is a **path dep** (`../rataflow`). Its error type is `rataflow::Error` (NOT `FlowError` — that name doesn't exist).
+4. Dependencies live in `Cargo.toml`, with the reason for each beside it; the split that matters is the portable core versus the `native` feature (tokio, crossterm, the filesystem).
 
 ## CLI
 
@@ -17,14 +17,16 @@ One TUI command over the unified timeline engine (see the **Timeline** section) 
 
 ```
 zoe                      # follow the current project's live session
-zoe <file.jsonl>         # replay a recording, played from the start
+zoe <file.jsonl>         # replay a recording, played from the start (any provider's file)
+zoe <id>                 # replay a session by id, or a unique prefix, across providers
 zoe <dir>                # follow another project's live session
 zoe <file> --follow      # ride a file's live edge instead of replaying it
 zoe <file> --speed 8     # playback speed (default 8.0)
-zoe inspect <file.jsonl> # no TUI: print session info + parsed tree (smoke-test)
+zoe --provider codex ... # force the format instead of reading it off the content
+zoe inspect <file|id>    # no TUI: print session info + parsed tree (smoke-test)
 ```
 
-Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { file }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
+Resolution goes through `provider::open` (see [DISCOVERY.md](DISCOVERY.md)): a **file** is `Target::Path` and bulk-loads + tails (replay feeder), the provider read off its first record; an **id** is `Target::Id`, looked up across every provider's roots; a **dir** (or none → cwd) is `Target::Here` and follows the newest session of that project, any provider. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<String>, follow: bool, speed: f64, provider: Option<Provider> } | Inspect { file, provider }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
 
 ## Workspace layout
 
@@ -91,12 +93,16 @@ src/
 ├── autopilot.rs   # native-only: the scripted pointer/keystroke pilot behind ZOETROPE_DEMO=1 (see DEMO-ASSETS.md)
 ├── fact.rs        # the provider boundary: Fact + FactKind, the vocabulary every provider speaks and the model folds
 ├── provider/
-│   ├── mod.rs     # what a provider is and how to add one; one directory per transcript format
+│   ├── mod.rs     # the input side: Provider enum, SessionFile, Session, the Stream enum, open / sweep / assemble (DISCOVERY.md)
 │   ├── harness.rs # (test) the conformance check: fold a fixture in shuffled orders and diff the result against its goldens
-│   └── claude/
-│       ├── mod.rs       # the Claude provider: Entry → Facts (`facts`, `Record`) and the per-file `Stream`; the tool-summary lexicon
-│       ├── wire.rs      # Claude's serde model for JSONL entries + meta.json sidecars
-│       └── discovery.rs # the ~/.claude/projects layout: cwd sanitization, session / subagent / journal scans
+│   ├── claude/
+│   │   ├── mod.rs       # the Claude provider: Entry → Facts (`facts`, `Record`) and the per-file `Stream`; the tool-summary lexicon
+│   │   ├── wire.rs      # Claude's serde model for JSONL entries + meta.json sidecars
+│   │   └── discovery.rs # the ~/.claude/projects layout: cwd sanitization, session / subagent / journal scans, the primitives
+│   └── codex/
+│       ├── mod.rs       # the Codex provider: rollout lines → Facts through a `Stream` that learns its thread from its first line
+│       ├── wire.rs      # Codex's serde model: the envelope, `response_item`, `event_msg` and its `item_completed` items
+│       └── discovery.rs # the ~/.codex/sessions/YYYY/MM/DD layout: rollouts, the head read that classifies them, the primitives
 ├── state/
 │   ├── mod.rs     # App: owns the Flow + SessionModel + Timeline + SessionInfo + UI state; handle_ui_event, seek, camera
 │   ├── session.rs # SessionModel: the pure domain model (agents, statuses, tool calls) folded from Facts — knows no format
@@ -105,10 +111,10 @@ src/
 │   ├── info.rs    # SessionInfo: untimed session metadata, folded off the timeline (i overlay + inspect header)
 │   └── render.rs  # the headless text view: what `inspect` prints, and what a provider's golden test compares
 ├── tailer/        # background FEEDER (pure: no pacing/seeking — the App owns the playhead)
-│   ├── mod.rs     # task entry + shared wire types (TailRequest / UiEvent); the wire carries Facts
+│   ├── mod.rs     # task entry + shared wire types (TailRequest / UiEvent); the wire carries Statements
 │   ├── live.rs    # live tailing — one poll loop per session, emits UiEvent::Batch
 │   ├── replay.rs  # replay assembly (native): parse all files up front, merge by ts, then keep tailing
-│   ├── item.rs    # portable replay-stream pieces — ReplayItem (a Fact + its Timing); dating reads the envelope; IO-free (wasm)
+│   ├── item.rs    # portable replay-stream pieces — ReplayItem (a statement + its Timing), dating, and Bundle (the browser's feeder: files as text in, streams kept for appends); IO-free (wasm)
 │   └── bytes.rs   # incremental byte reader: stat / read-appended / split-on-\n / buffer-partial (pure, testable)
 └── ui/
     ├── mod.rs     # draw: canvas + scrubber + status bar; help/info overlays
@@ -120,7 +126,7 @@ src/
 
 ## Claude Code transcript format (verified against real data, Claude Code 2.1.153–2.1.165)
 
-This is one provider's format, modelled in `provider/claude/wire.rs` and found on disk by `provider/claude/discovery.rs`. Nothing in the core (`fact`, `state`, `ui`) depends on any of it; the feeders name the provider directly until a second one turns that into a choice.
+This is one provider's format, modelled in `provider/claude/wire.rs` and found on disk by `provider/claude/discovery.rs`. Nothing in the core (`fact`, `state`, `ui`) depends on any of it; the feeders reach a provider only through `provider::open`, `sweep` and `provider_of`.
 
 ### Layout
 - Main: `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`. Sanitization: absolute cwd, every `/` → `-` (leading slash → leading dash). Only `<uuid>.jsonl` directly in that dir are transcripts.
@@ -173,7 +179,7 @@ pub struct AgentInfo {
     pub agent_type: Option<String>,      // "claude-code-guide", "workflow-subagent", "fork", …
     pub description: Option<String>,     // meta.description or Agent tool_use input.description
     pub parent: Option<String>,          // node id of parent (main or wf-id)
-    pub spawned_by_tool_use: Option<String>, // the spawning call id — the spawn/ack join key
+    pub spawned_by: Option<String>, // the spawning call id — the spawn/ack join key
     pub status: AgentStatus,             // Running | Idle | Done | Failed | Stopped
     pub(crate) terminal: bool,           // authoritative completion — pins against time-derived revival
     pub model: Option<String>,
@@ -184,13 +190,13 @@ pub struct AgentInfo {
 }
 ```
 
-**Untimed session metadata → `SessionInfo` (not the timeline).** A statement made entirely of session-level facts (`Title`, `Session { label, value }`, `Tally`) carries no timestamp and is not activity, so it would otherwise clump at the front of the sorted timeline. Feeders route it into `SessionInfo { title, fields: Vec<(label, value)>, tallies }` instead: the provider labels the rows (Claude: `mode`, `permission`, `last prompt`; tallies `queued`, `file edits`), values are latest-wins per label in first-seen order, and the `i` overlay and `inspect` render whatever rows arrived (`state::render`). Lives on `App` (not `SessionModel`), so it survives backward-seek rebuilds — it's session-constant. The title is on `SessionInfo`, NOT on `SessionModel`, so the model holds only timed, foldable state.
+**Untimed session metadata → `SessionInfo` (not the timeline).** Session-level facts (`Title`, `Session { label, value }`, `Tally`) carry no timestamp and are not activity, so they would otherwise clump at the front of the sorted timeline. Feeders route them into `SessionInfo { title, fields: Vec<(label, value)>, tallies }` instead, whichever record carried them (`Statement::take_session_meta`; a Codex root names itself and its app on one line): the provider labels the rows (Claude: `mode`, `permission`, `last prompt`; tallies `queued`, `file edits`; Codex: `app`, `version`, `cwd`), values are latest-wins per label in first-seen order, and the `i` overlay and `inspect` render whatever rows arrived (`state::render`). Lives on `App` (not `SessionModel`), so it survives backward-seek rebuilds — it's session-constant. The title is on `SessionInfo`, NOT on `SessionModel`, so the model holds only timed, foldable state.
 
-**Graph topology (v1): nodes are agents, not messages.** One node per agent + one group node per workflow run. Edges: `main → direct subagent` (edge id = toolUseId), `main → workflow node` (edge id = wf-id), `workflow → its subagents`. Sessions have 800+ lines — per-message nodes would be noise; agents are the story.
+**Graph topology (v1): nodes are agents, not messages.** One node per agent + one group node per workflow run. Edges: one parent edge per agent, id `e-<child id>` (`graph::edge_id`), `workflow → its subagents`. Sessions have 800+ lines — per-message nodes would be noise; agents are the story.
 
 **Status rules** — the concrete derivations; the *principles* they follow (ground-truth-over-heuristics, reversibility, the async completion model) are in [`ARCHITECTURE.md`](ARCHITECTURE.md) §2–4.
 
-- **The `Agent` tool result is a SPAWN ACK, not a completion** (`"Async agent launched successfully"`). A direct subagent is completed by the main-transcript `tool_result` (`tool_use_id == spawned_by_tool_use`, `is_error` → Failed) **only if the ack is not superseded** by the agent's own later activity — `resolve_spawn_status`: `last_ts > ack_ts` ⇒ still `Running`, non-terminal. A superseded (async) subagent stays `Running` and settles to `Done` at `end_of_stream`.
+- **The `Agent` tool result is a SPAWN ACK, not a completion** (`"Async agent launched successfully"`). A direct subagent is completed by the main-transcript `tool_result` (`tool_use_id == spawned_by`, `is_error` → Failed) **only if the ack is not superseded** by the agent's own later activity — `resolve_spawn_status`: `last_ts > ack_ts` ⇒ still `Running`, non-terminal. A superseded (async) subagent stays `Running` and settles to `Done` at `end_of_stream`.
 - **`<task-notification>` is the authoritative terminal report** for a background agent. The Claude provider states it as `Ended(Done | Stopped | Failed)`; the fold records it in the `ended` store, where it **outranks** the ack and time-derived liveness, and pins `terminal`. (`meta.stoppedByUser` is deliberately **not** applied — the meta folds at the agent's *first* activity, so applying it would strand the agent `Stopped` for the whole replay; only the timestamped notification is trusted.)
 - **Workflow subagent**: `Done` when `journal.jsonl` has a `result` naming its `agentId` (the provider states `Ended(Done)`; pins `terminal`). Group node (`recompute_group_status`): an all-children-**terminal** rollup (`Failed` if any child failed, else `Done`; `Done`/`Stopped` both count as terminal; a childless group stays `Running`; re-derived every call, so it reverts if a running child is discovered late). The Workflow tool_use's `tool_result` is a *launch ack* ("Workflow launched in background…"), NOT a completion — never complete groups from it.
 - **Liveness** (`recompute_liveness`, against the timeline's **`now` reference** — wall clock at a live edge, the playhead otherwise, so a scrubbed/paced view shows the as-of-then state with no wall-clock bleed): "active" = `now − last_ts ≤ INTERACTIVE_IDLE_SECS` (~2 min) **OR the agent holds a pending tool_call** (an unresolved tool is direct proof it's working — §2.2/§4). Interactive → `Running`/`Idle` (never claims completion); non-interactive non-terminal → `Running`/`Done`, **reversible**; non-interactive terminal → keeps its status. `end_of_stream` settles interactive agents to `Idle` and any still-`Running` async agent to `Done`.
@@ -201,7 +207,7 @@ pub struct AgentInfo {
 **Decision: poll-based, no `notify` dep** (poll is simpler, WASM-trait-friendly, 200ms is imperceptible). The tailer is a **pure feeder** — it no longer paces or seeks (that moved to the App's `Timeline`); it only produces an ordered update stream and keeps the files watched.
 
 ```rust
-pub enum TailRequest { Watch(PathBuf) }                  // switch session; only request now
+pub enum TailRequest { Watch(Target) }                   // switch session; only request now (a path, an id, or a directory to follow)
 pub enum UiEvent {
     ReplayLoaded { session_id, items: Vec<ReplayItem>, speed, info: SessionInfo }, // bulk hand-off
     Batch { session_id: String, statements: Vec<Statement> }, // per poll tick, one per record read
@@ -222,20 +228,22 @@ per record read, holding the record's own time plus the facts it stated. The
 two times differ on purpose — a record sits on the timeline where the file
 wrote it (the only moment a live viewer could have known it), while each fact
 keeps its own time for the fold (a completion record can also say when the
-call started). The Claude feeders hold a `provider::claude::Stream` per file
-(`Source::Main | Sub(agentId) | Ledger(wfId)` names which) and call
-`push(line)`; the stream owns the one piece of cross-line Claude state, the
-inherited timestamp for lines that carry none. Nothing above a feeder sees an
-`Entry`. `Timing` for an undated statement reads its facts' envelopes —
+call started). A feeder opens a session with `provider::open` and holds one
+`provider::Stream` per tailed file (the provider's own stream inside: Claude's
+carries the inherited timestamp for lines that lack one, Codex's the thread
+its file is by) and calls `push(line)`; whole-read sidecars (Claude's
+`meta.json`) are stated once through `Provider::sidecar`, and files that
+appear later come from `Session::rescan`. Nothing above a feeder sees a
+provider's record or path vocabulary. `Timing` for an undated statement reads its facts' envelopes —
 `Pending(agent)` if it is about an agent, else `Leader` — and dating joins a
 birth (`Agent`) to that agent's first dated activity and an ending (`Ended`)
 to its last.
 
 **Two load strategies, one tail loop.** Both feeders end in the shared `tail_loop`, so EVERY session keeps tailing for appends (a replayed file that grows just "goes live" on its own — completion is unknowable, so nothing is ever assumed finished):
-- **File target** (`run_replay`): `build_replay` parses every session file, dates undated statements — sidecar births, ledger endings — (`date_and_sort`), **routes session-level statements into `SessionInfo`** (off the timeline via `Statement::is_session_meta`), and merges the rest into a ts-sorted `Vec<ReplayItem>` → one `ReplayLoaded`. Then enter `tail_loop`, resuming each file's tail from the **byte offset the parse consumed** (a *snapshot seed* — not live EOF — so lines appended *during* the parse aren't dropped). Auto-switch disabled (`project_dir = None`; you asked for this file).
+- **File target** (`run_replay`): `build_replay` parses every session file, dates undated statements — sidecar births, ledger endings — (`date_and_sort`), **routes session-level statements into `SessionInfo`** (off the timeline via `Statement::is_session_meta`), and merges the rest into a ts-sorted `Vec<ReplayItem>` → one `ReplayLoaded`. Then enter `tail_loop`, resuming each file's tail from the **byte offset the parse consumed** (a *snapshot seed* — not live EOF — so lines appended *during* the parse aren't dropped). Auto-switch disabled (`follow = None`; you asked for this file).
 - **Dir/none target** (`run_live`): announce `SessionReset` (id adoption), then `tail_loop` — the first poll backfills the existing file (arrival order); subsequent polls emit appends; the project dir is re-scanned for a *newer* session (throttled auto-switch: `SWITCH_SCAN_EVERY`~2s, only after `SWITCH_IDLE_TICKS`~30s idle, dir targets only).
 
-Per-file tail state `{ offset, partial, overflowed, identity: (dev, ino) }`. Each tick: stat the file; a shrink (`len < offset`) **or an inode swap** (rotation — a different `(dev,ino)` even if not shorter) → reset + `SessionReset` and re-attach; grown → read appended bytes, split on `\n`, hand complete lines to the file's provider `Stream`, buffer the trailing partial (a runaway line past `MAX_PARTIAL`=8 MiB is dropped, not buffered forever). Scan `subagents/**` each tick for new files (cheap readdir; absent dirs are fine).
+Per-file tail state `{ offset, partial, overflowed, identity: (dev, ino) }`. Each tick: stat the file; a shrink (`len < offset`) **or an inode swap** (rotation — a different `(dev,ino)` even if not shorter) → reset + `SessionReset` and re-attach; grown → read appended bytes, split on `\n`, hand complete lines to the file's provider `Stream`, buffer the trailing partial (a runaway line past `MAX_PARTIAL`=8 MiB is dropped, not buffered forever). asks `Session::rescan` for files that appeared; absent dirs are fine).
 
 **Everything stamped with session_id; App drops events where `!is_current(session_id)`** (rwy's identity-stamping; stale buffered messages across a switch).
 
@@ -251,14 +259,14 @@ pub struct Timeline {
     pub folded: usize,            // items applied to the derived model so far
     pub follow_head: bool,        // pinned to the edge (playing/following) vs parked (scrubbed)
     pub speed: f64,
-    pub compress_gaps: bool,      // skip idle dead air (default on); `g` toggles faithful pacing
+    pub compress_gaps: bool,      // skip idle dead air (default on); `s` toggles faithful pacing
     // + cached head, gap-pacing anchor/elapsed, `undated_agents` (Pending-item join set), ended latch
 }
 ```
 
 - **Pin-vs-pace is decided by the edge, not the mode.** `advance`/`append_live` compare cursor-vs-head: behind the edge the cursor always **paces forward**; only at the edge does it **pin** (and live appends snap in). So `space` resumes from the playhead in *both* modes, and a scrubbed-back live session **catches up** to the edge then follows — there's no "play = jump to live." `End`/`go_live` is the explicit jump.
 - **`replay`** is the one surviving "mode" bit — the **launch intent**: are you replaying a recording, or following a live session? Set from the launch `Mode`, and **not runtime-derivable** (a quiet live session is byte-identical to a finished recording, so the flag can't be eliminated). It is NOT a claim the file is complete — a replay can grow and go live (the feeder always tails; nothing is assumed finished), which is why it's named for the intent, not a "bounded/complete" property. It does NOT gate pacing (the edge does); it gates only the `now` reference and the end-settle latch.
-- **Pacing** (`advance`, per 16ms frame): paces the cursor toward the next event, **compressing dead air** — but not with a flat cap. `compress_gap` is a **log-compression** curve (`GAP_FAITHFUL_KNEE`=0.8s, `GAP_COMPRESS_SCALE`=0.6): real-time below the knee, then `knee + scale·ln(1 + (t−knee)/knee)` above it — *graded*, so a 5-minute wait still reads longer than a 5-second one (an hour of dead air crosses in <10s). The `g` key sets `compress_gaps = false` for faithful real-time pacing. The App folds the prefix `items[0..fold_target()]` (`App::fold_to`); the live append and replay paths share it.
+- **Pacing** (`advance`, per 16ms frame): paces the cursor toward the next event, **compressing dead air** — but not with a flat cap. `compress_gap` is a **log-compression** curve (`GAP_FAITHFUL_KNEE`=0.8s, `GAP_COMPRESS_SCALE`=0.6): real-time below the knee, then `knee + scale·ln(1 + (t−knee)/knee)` above it — *graded*, so a 5-minute wait still reads longer than a 5-second one (an hour of dead air crosses in <10s). The `s` key sets `compress_gaps = false` for faithful real-time pacing. The App folds the prefix `items[0..fold_target()]` (`App::fold_to`); the live append and replay paths share it.
 - **`now` reference** = wall clock only at a *live* edge (`!replay && follow_head && at_edge`), the cursor otherwise (incl. live catch-up) — so a replay always judges liveness as-of-the-playhead (its timestamps are a past recording, unrelated to wall time). See Status rules.
 - **Seek / scrub** (`App::seek`, `seek_to_fraction`, `seek_prompt`, `go_live`): forward → fold in place (cheap); backward → `App::rebuild_to` re-folds the prefix into a fresh `SessionModel` and re-syncs, carrying view across by id (`graph::restore_positions` + `select_node`). A seek is discontinuous → ephemerals reset (chips re-baseline via `adopt_baseline`, then the per-frame `reconcile` reconstructs in-flight runs from state; glide cancels — see [`ARCHITECTURE.md`](ARCHITECTURE.md) §5). `space` is a unified play/pause that resumes from the current cursor; `End`/`go_live` re-pins to the edge.
 - **Scrubber position is event-indexed, not time-linear** — real sessions cluster work then sit idle (the rwy sample: ~11 min across 10.65 h), so a time-linear bar would bury all action in a sliver. `progress` / `fold_at_fraction` map the bar over `[floor, len]` where `floor` is the unavoidable start clump (same-timestamp ties + dated metadata that can only fold atomically), so the leftmost click reaches position 0. `gap_markers` (≥`GAP_MARKER_SECS`=60s) place the fast-forward `»` markers on the marker strip. Because the axis is event-indexed, a raw event-count would be flat — so the track is a **tool-activity sparkline** (per-column count of `ToolStart` facts over its item range) which peaks where the work happened; see UI.
@@ -310,24 +318,24 @@ The crossterm input channel is **unbounded** (input must never block); the **cap
 - **Detail panel** (ui/panel.rs): when `flow.selected_nodes().next()` is Some → a **30/70** horizontal split (orientation canvas 30% · panel 70%); panel shows the selected agent's description, model, status, timing, and a scrollable recent-tool-call list (name + summary, `⏳`/`✓`/`✗` + local time; path tools keep the basename). Data from `SessionModel`, keyed by node id. Copy the selected id out before borrowing app mutably elsewhere (borrow-checker note from rwy).
 - **Tool-call chips** (ui/chips.rs): ephemeral `⚒ read ×N` overlays anchored *below* agent cards (NOT graph nodes — no layout/minimap/hit-test), drawn in `render_canvas` after the flow. One reconcile pass per frame ages them in watch-time; pending persists as the in-flight indicator, completed fade (`CHIP_TTL` 2.5s, err 4s, ≤3/agent), width-gated like edge labels. This is where "current tool" lives now — edges carry no labels. Full model: [`ARCHITECTURE.md`](ARCHITECTURE.md) §5.
 - **Scrubber** (`render_scrubber`, shown when the timeline has a span): a **bordered panel** (rounded, subtle), 6 rows = border + marker strip (1) + bars (2) + info (1) + border. Markers and bars are on **separate rows** so neither can overwrite the other (a marker on a bar cell hid real activity; the gap seam was the worst offender).
-  - **Marker strip (1 row, on top)**: **fast-forward `»`** at idle-gap columns (≥`GAP_MARKER_SECS`, where playback compresses dead air; full-session; drawn only when gap-compression is on); **spawn `❋`** (the sunburst, in coral ≈ xterm 173 — an `Agent` birth, or a `Spawn` call whose agent never appeared) and **failure `✗`** (red, a failed `ToolEnd`), **past-only** (`c < head`) so they reveal as the playhead reaches them (in sync with the graph's chips).
+  - **Marker strip (1 row, on top)**: **fast-forward `»`** at idle-gap columns (≥`GAP_MARKER_SECS`, where playback compresses dead air; full-session; drawn only when gap-compression is on); **spawn** (an `Agent` birth, or a `Spawn` call whose agent never appeared) drawn as the session's provider's emblem — Claude's sunburst `❋` in coral ≈ xterm 173, Codex's circled star `❂` in green ≈ xterm 36, a plain `✦` in a neutral before the root is stated (`ui::spawn_mark`; the browser's font atlas drops the colour and shows the glyph alone) and **failure `✗`** (red, a failed `ToolEnd`), **past-only** (`c < head`) so they reveal as the playhead reaches them (in sync with the graph's chips).
   - **Activity bars (2 rows)**: a tool-call sparkline via ratatui's `Sparkline` — per-column height = tool calls in that slice (`ToolStart` facts counted over the column's item-index range, binned on the event-index axis). Counts normalized to the available eighths (`rows × 8` = 16) with a **floor of 1 for any nonzero column** (`ceil(count/max × levels)`) — else the busiest column scales the rest down and a low-activity tick rounds to 0 (invisible). Played/unplayed fill: bright accent left of the playhead, dim right.
   - **Playhead**: a gold vertical line `│` over a translucent (`muted`-bg) column, spanning the marker strip + both bar rows.
   - **Info row**: playhead date+time (left), transport tag (right). Full-width so changing labels can't reflow it; the whole row is the seekable area, so a click maps to the exact width the playhead is drawn over. Row 2 is an info line: the playhead's local date+time (left) and the emergent transport tag (right). `App.scrubber_area` is recorded each frame for hit-testing mouse drags.
 - **Status bar**: gold `zoetrope` wordmark, emergent transport badge (● LIVE / ▶ PLAY / ⏸ PAUSE / ⏮ PAST / ■ IDLE), session title, agent & tool counts, camera mode, last error, key hints. (`q` quit, `? `help.)
 - **Overlays**: `?` help (full key reference) and `i` session info (the untimed `SessionInfo`: mode, permission, last prompt, queued/file-edit counts) — both centered, `esc` closes.
 - **Companions**: `Background::new(&flow)` then `&mut flow` then `MiniMap::new(&flow)` (render order matters; Widget impl is on `&mut Flow`, companions take `&Flow` — separate render_widget calls avoid borrow conflicts).
-- Keys: `q`/`ctrl-c` quit; `space` play/pause (resume from cursor); `g` toggle gap-compression (faithful vs skip-idle pacing); `o`/`f` camera Overview/Follow; `r` relayout (tidy); `[`/`]` step prompt eras; `End` go-live; `?`/`i` overlays; `esc` closes overlay / detail panel. Detail-panel scroll: `j`/`k`/PgUp/PgDn. Remaining nav/zoom/pan → `flow.handle_key_event` / `handle_controls_key_event` (whitelisted — the graph is read-only, destructive library bindings are blocked). Scrubber-row mouse press/drag → `App::seek_to_fraction`; other mouse → `flow.handle_mouse_event`. Consume `into_events()`; any flow event drops Follow (`process_flow_events`).
+- Keys: `q`/`ctrl-c` quit; `space` play/pause (resume from cursor); `s` toggle gap-compression (faithful vs skip-idle pacing); `o`/`f` camera Overview/Follow; `r` relayout (tidy); `[`/`]` step prompt eras; `End` or `g` go-live; `?`/`i` overlays; `esc` closes overlay / detail panel. Detail-panel scroll: `j`/`k`/PgUp/PgDn. Remaining nav/zoom/pan → `flow.handle_key_event` / `handle_controls_key_event` (whitelisted — the graph is read-only, destructive library bindings are blocked). Scrubber-row mouse press/drag → `App::seek_to_fraction`; other mouse → `flow.handle_mouse_event`. Consume `into_events()`; any flow event drops Follow (`process_flow_events`).
 
 ## inspect subcommand
 
-`zoe inspect <file.jsonl>`: parse the session fully (transcript + subagents + journal) and print: session title, **session info** (mode · permission · queued · file edits · last prompt, via `read_session_info`), agent/tool totals, then the agent tree (type, description, status, #tools, tokens). Exit non-zero on unreadable file. **This is the headless smoke test** — CI-runnable end-to-end check of parser + session model + info extraction with no TTY.
+`zoe inspect <file|id>`: open the session (`provider::open`, any provider, any file of it, or an id), fold every file, and print: session title, **session info** (the provider's labelled rows: mode · permission · queued · file edits · last prompt for Claude; app · version · cwd for Codex), agent/tool totals, then the agent tree (type, description, status, #tools, tokens). Exit non-zero on an unreadable or unrecognised file. **This is the headless smoke test** — CI-runnable end-to-end check of parser + session model + info extraction with no TTY.
 
 ## Testing (inline #[cfg(test)], no tests/ dir)
 
 Worth testing: transcript line parsing against real-format fixture strings (every entry type incl. flat metadata, polymorphic content, missing is_error, Unknown), sanitization rule, partial-line buffering + truncation reset (tailer state machine over an in-memory/tempfile sequence), session model status transitions (spawn → running → done/failed; the async layer — spawn-ack supersession, `<task-notification>` terminal report, `end_of_stream`; workflow journal completion; pending-tool liveness), graph sync idempotency (same update twice = no duplicate nodes; selection preserved), and the chip reconcile behaviors (aggregation, afterglow, pending reconstruction). Not worth testing: render output, getters.
 
-**Order-independence is guarded by property tests** (the load-bearing invariant — ARCHITECTURE.md §1.1): `live_delivery_converges_to_bulk_ordering` (timeline.rs — 400 random per-file interleavings land the same ts sequence as the bulk sort, nothing left undated) and the model shuffle-invariance test (session.rs — final model state is a pure function of the fact set). ~164 tests, all inline; no `tests/` dir.
+**Order-independence is guarded by property tests** (the load-bearing invariant — ARCHITECTURE.md §1.1): `live_delivery_converges_to_bulk_ordering` (timeline.rs — 400 random per-file interleavings land the same ts sequence as the bulk sort, nothing left undated) and the model shuffle-invariance test (session.rs — final model state is a pure function of the fact set). the test suite, all inline; no `tests/` dir.
 
 ## Pitfalls checklist (from research — verify before calling done)
 

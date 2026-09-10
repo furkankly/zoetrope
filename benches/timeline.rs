@@ -21,7 +21,7 @@ use common::{Session, Spec};
 use zoetrope::provider::claude::wire;
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
-use zoetrope::tailer::{ReplayItem, UiEvent, replay_from_session};
+use zoetrope::tailer::{ReplayItem, UiEvent};
 
 /// The scales every group runs over.
 fn scales() -> Vec<(&'static str, Session)> {
@@ -35,13 +35,13 @@ fn scales() -> Vec<(&'static str, Session)> {
 /// Assemble the ts-ordered timeline for a session (the untimed setup step
 /// shared by the fold and seek benches).
 fn items_of(s: &Session) -> Vec<ReplayItem> {
-    replay_from_session(&s.main, &s.demo_subagents()).0
+    s.load().0
 }
 
 /// An App with the whole session loaded and the playhead at the live edge —
 /// the state a user is in when they grab the scrubber.
 fn app_at_edge(s: &Session) -> App {
-    let (items, info) = replay_from_session(&s.main, &s.demo_subagents());
+    let (items, info) = s.load();
     let mut app = App::new("bench".to_string(), Mode::Live);
     app.handle_ui_event(UiEvent::ReplayLoaded {
         session_id: "bench".to_string(),

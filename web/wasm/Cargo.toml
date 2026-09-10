@@ -16,7 +16,7 @@ name = "zoetrope-web"
 # (`zoetrope::VERSION`), not this one.
 version = "0.0.0"
 edition = "2024"
-description = "Browser frontend for zoetrope — the Claude Code session visualizer."
+description = "Browser frontend for zoetrope — the Claude Code and Codex session visualizer."
 license = "MIT"
 publish = false
 

@@ -1,22 +1,24 @@
-//! zoetrope — visualize Claude Code agent sessions as a live flow graph.
+//! zoetrope — visualize coding-agent sessions as a live flow graph.
 //!
 //! CLI (hand-rolled over `std::env::args`, no clap):
 //!
 //! ```text
 //! zoe                       follow the current project's live session
 //! zoe <file.jsonl>          replay a recording, played from the start
+//! zoe <id>                  replay a session by id (or a unique prefix)
 //! zoe <dir>                 follow another project's live session
 //! zoe <file> --follow       follow a file's live edge instead of replaying
 //! zoe <file> --speed N      playback speed multiplier (default 8.0)
-//! zoe inspect <file.jsonl>  headless: print the session tree + info
+//! zoe --provider <name> ... force the transcript format instead of detecting it
+//! zoe inspect <file|id|dir> headless: print the session tree + info
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
-use zoetrope::provider::claude::{self, Source, discovery, wire};
+use zoetrope::provider::{Provider, ReadMode, Target, open};
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{TailRequest, UiEvent};
@@ -34,30 +36,38 @@ const CHANNEL_CAP: usize = 32;
 #[derive(Debug, Clone)]
 pub enum Cli {
     /// View a session in the TUI. `target`: a session file (replay it from the
-    /// start), a project dir (follow its live session), or `None` (the current
-    /// project). `follow` starts at the live edge instead of replaying.
+    /// start), a project dir (follow its live session), a session id, or
+    /// `None` (the current project). `follow` starts at the live edge instead
+    /// of replaying. `provider` forces the format instead of detecting it.
     View {
-        target: Option<PathBuf>,
+        target: Option<String>,
         follow: bool,
         speed: f64,
+        provider: Option<Provider>,
     },
-    /// Headless: parse and print the session tree + info; no TUI.
-    Inspect { file: PathBuf },
+    /// Headless: parse and print the session tree + info; no TUI. The target
+    /// resolves like `View`'s: a file, a session id, or a project directory.
+    Inspect {
+        target: String,
+        provider: Option<Provider>,
+    },
 }
 
 /// Default replay speed multiplier.
 const DEFAULT_REPLAY_SPEED: f64 = 8.0;
 
 const USAGE: &str = "\
-zoetrope — visualize Claude Code agent sessions as a flow graph
+zoetrope — visualize coding-agent sessions as a flow graph
 
 USAGE:
     zoe                     follow the current project's live session
     zoe <file.jsonl>        replay a recording, played from the start
+    zoe <id>                replay a session by id, or a unique prefix of one
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
-    zoe inspect <file>      headless: print the session tree + info
+    zoe --provider <name>   force the format (claude, codex) instead of detecting it
+    zoe inspect <file|id>   headless: print the session tree + info
     zoe --version           print the version and exit
 
 Once open, scrub/follow/pause/go-live are available no matter how you launched.";
@@ -67,24 +77,43 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     // Skip argv[0].
     let mut args = args.skip(1).peekable();
 
+    let provider_flag = |args: &mut std::iter::Peekable<_>| -> Result<Option<Provider>> {
+        let v: String = args
+            .next()
+            .ok_or_else(|| anyhow!("--provider requires a name\n\n{USAGE}"))?;
+        Provider::parse(&v)
+            .map(Some)
+            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex"))
+    };
+
     // `inspect <file>` is the one distinct (headless) subcommand.
     if args.peek().map(String::as_str) == Some("inspect") {
         args.next();
-        let file = args
-            .next()
-            .ok_or_else(|| anyhow!("inspect requires a <file.jsonl>\n\n{USAGE}"))?;
-        if args.next().is_some() {
-            bail!("inspect takes a single file argument\n\n{USAGE}");
+        let mut target: Option<String> = None;
+        let mut provider = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--provider" => provider = provider_flag(&mut args)?,
+                other if other.starts_with('-') => bail!("unknown flag {other:?}\n\n{USAGE}"),
+                _ => {
+                    if target.is_some() {
+                        bail!("inspect takes a single target argument\n\n{USAGE}");
+                    }
+                    target = Some(arg);
+                }
+            }
         }
-        return Ok(Cli::Inspect {
-            file: PathBuf::from(file),
-        });
+        let target = target.ok_or_else(|| {
+            anyhow!("inspect requires a file, a session id or a directory\n\n{USAGE}")
+        })?;
+        return Ok(Cli::Inspect { target, provider });
     }
 
     // Otherwise: an optional positional target + flags.
-    let mut target: Option<PathBuf> = None;
+    let mut target: Option<String> = None;
     let mut follow = false;
     let mut speed = DEFAULT_REPLAY_SPEED;
+    let mut provider = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -109,14 +138,15 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                     bail!("--speed must be a positive number, got {v:?}");
                 }
             }
+            "--provider" => provider = provider_flag(&mut args)?,
             other if other.starts_with('-') => {
                 bail!("unknown flag {other:?}\n\n{USAGE}");
             }
             _ => {
                 if target.is_some() {
-                    bail!("expected a single path argument\n\n{USAGE}");
+                    bail!("expected a single target argument\n\n{USAGE}");
                 }
-                target = Some(PathBuf::from(arg));
+                target = Some(arg);
             }
         }
     }
@@ -125,77 +155,51 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         target,
         follow,
         speed,
+        provider,
     })
 }
 
-/// Read a transcript file fully and fold its lines into `model` under `source`.
-///
-/// Defensive: unreadable lines are skipped; only the file-open error propagates.
-fn fold_file(model: &mut SessionModel, path: &Path, source: Source) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading transcript {}", path.display()))?;
-    let mut stream = claude::Stream::new(source);
-    for statement in text.lines().filter_map(|l| stream.push(l)) {
-        for fact in &statement.facts {
-            model.apply_fact(fact);
+/// Fully parse a session, every file of it, into a [`SessionModel`] and its
+/// [`SessionInfo`](zoetrope::state::SessionInfo). Shared by `inspect`; the
+/// live/replay path uses the tailer instead.
+fn parse_session_fully(
+    target: &Target,
+    only: Option<Provider>,
+) -> Result<(SessionModel, zoetrope::state::SessionInfo)> {
+    let session = open(target, only)?;
+    let mut model = SessionModel::new(session.id.clone());
+    let mut info = zoetrope::state::SessionInfo::default();
+    let p = session.provider;
+    let mut apply = |mut statement: zoetrope::fact::Statement| {
+        for f in statement.take_session_meta() {
+            info.apply(&f);
         }
-    }
-    Ok(())
-}
-
-/// Read a `meta.json` sidecar and fold it into `model`. Missing/invalid sidecars
-/// are silently ignored — defensiveness over strictness.
-fn fold_meta(model: &mut SessionModel, path: &Path, agent_id: &str, workflow: Option<&str>) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
+        for f in &statement.facts {
+            model.apply_fact(f);
+        }
     };
-    if let Some(meta) = wire::parse_meta(&text) {
-        for fact in &claude::Stream::meta(agent_id, workflow, &meta).facts {
-            model.apply_fact(fact);
-        }
-    }
-}
-
-/// Fully parse a session (main + direct subagents + workflow subagents +
-/// journals) into a [`SessionModel`], reading every sidecar discovered next to
-/// the main transcript. Shared by `inspect`; the live/replay path uses the
-/// tailer instead.
-fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
-    let session_id = main_file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string();
-
-    let mut model = SessionModel::new(session_id.clone());
-
-    // Subagent sidecars live in `<main_file dir>/<session-uuid>/subagents/`.
-    // Parse subagent metas + transcripts first so agents exist before the main
-    // transcript's tool_results resolve their statuses. Order is not critical —
-    // the model is fold-order independent for completion — but this keeps the
-    // tree well-formed.
-    if let Some(subs) = discovery::subagents_dir(main_file) {
-        // Direct subagents: agent-<id>.jsonl + agent-<id>.meta.json
-        collect_subagents(&mut model, &subs, None);
-
-        // Workflow subagents: workflows/<wf-id>/agent-*.jsonl + journal.jsonl
-        for wf_id in discovery::scan_workflow_ids(&subs) {
-            let wf_path = discovery::workflow_dir(&subs, &wf_id);
-            collect_subagents(&mut model, &wf_path, Some(&wf_id));
-
-            // Journal ledger marks workflow-subagent completion.
-            let journal = discovery::workflow_journal(&subs, &wf_id);
-            if journal.is_file() {
-                let _ = fold_file(&mut model, &journal, Source::Ledger(wf_id.clone()));
+    // Order is not critical — the model is fold-order independent — so files
+    // go in as the session lists them, root first.
+    for f in session.every_file() {
+        let text = std::fs::read_to_string(&f.path)
+            .with_context(|| format!("reading {}", f.path.display()))?;
+        match f.read {
+            ReadMode::Tail => {
+                let mut stream = p.stream_for(f);
+                for statement in text.lines().filter_map(|l| stream.push(l)) {
+                    apply(statement);
+                }
+            }
+            ReadMode::Whole => {
+                if let Some(statement) = p.sidecar(f, &text) {
+                    apply(statement);
+                }
             }
         }
     }
 
-    // Finally the main transcript — its tool_results resolve subagent statuses.
-    fold_file(&mut model, main_file, Source::Main)?;
-
-    // Workflow group nodes have no direct completion signal — roll them up from
-    // their children once everything is folded.
+    // Group nodes have no direct completion signal — roll them up from their
+    // children once everything is folded.
     model.recompute_group_status();
 
     // Interactive agents (main, forks) have no completion signal: derive
@@ -203,101 +207,57 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
     // view, so a recently active session shows `running`, a long-quiet one `idle`.
     model.recompute_liveness(Some(chrono::Utc::now()));
 
-    Ok(model)
-}
-
-/// Discover and fold every `agent-<id>.jsonl` (+ `.meta.json`) in `dir`. Used
-/// for both direct subagents (`workflow == None`) and workflow subagents.
-fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str>) {
-    for file in discovery::scan_subagent_files(dir, workflow) {
-        // Fold the meta sidecar first so the node exists with type/desc.
-        if file.meta.is_file() {
-            fold_meta(model, &file.meta, &file.agent_id, workflow);
-        }
-        let _ = fold_file(model, &file.transcript, Source::Sub(file.agent_id));
-    }
+    Ok((model, info))
 }
 
 /// Run the `inspect` subcommand: fully parse the session and print a tree to
 /// stdout. Returns an error (non-zero exit) on an unreadable file. This is the
 /// headless smoke test — no TTY required.
-async fn run_inspect(file: PathBuf) -> Result<()> {
-    if !file.is_file() {
-        bail!("not a readable file: {}", file.display());
-    }
-    let model = parse_session_fully(&file)?;
-    let info = read_session_info(&file);
-
+async fn run_inspect(target: String, provider: Option<Provider>) -> Result<()> {
+    let target = resolve_target(target)?;
+    let (model, info) = parse_session_fully(&target, provider)?;
     print!("{}", zoetrope::state::render::report(&model, &info));
-
     Ok(())
 }
 
-/// Build `SessionInfo` from the main file's untimed flat-metadata (mirrors the
-/// timeline feeder's extraction, for the headless `inspect` path). Latest-wins by
-/// file order; counts accumulate.
-fn read_session_info(main_path: &Path) -> zoetrope::state::SessionInfo {
-    let mut info = zoetrope::state::SessionInfo::default();
-    if let Ok(text) = std::fs::read_to_string(main_path) {
-        let mut stream = claude::Stream::new(Source::Main);
-        for statement in text.lines().filter_map(|l| stream.push(l)) {
-            statement.facts.iter().for_each(|f| info.apply(f));
-        }
-    }
-    info
-}
-
-/// Resolve a `View` invocation into (session id, watch target, mode, feeder,
-/// speed), then spawn the tailer and run the TUI.
+/// Resolve a `View` invocation into (session id, target, mode, feeder, speed),
+/// then spawn the tailer and run the TUI.
 ///
-/// A **file** target bulk-loads + tails (`replay` feeder); `--follow` only
-/// changes the start position (head vs beginning) via the mode. A **dir** (or no
-/// target → the current project) discovers the latest session and live-tails.
+/// A **file** or an **id** bulk-loads + tails (`replay` feeder); `--follow`
+/// only changes the start position (head vs beginning) via the mode. A
+/// **dir** (or no target → the current project) discovers the newest session
+/// there, any provider, and live-tails it.
 async fn run_tui(cli: Cli) -> Result<()> {
     let Cli::View {
         target,
         follow,
         speed,
+        provider,
     } = cli
     else {
         unreachable!("inspect handled in main");
     };
 
-    let (session_id, watch_target, mode, replay, speed) = match target {
-        // A concrete file → bulk-load + tail. Paced from the start unless
-        // `--follow` asks to ride the (possibly still-growing) edge.
-        Some(file) if file.is_file() => {
-            let session_id = file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session")
-                .to_string();
+    let target = match target {
+        Some(t) => resolve_target(t)?,
+        None => Target::Here(std::env::current_dir().context("resolving current directory")?),
+    };
+    let (session_id, mode, replay, speed) = match &target {
+        // A concrete file, or a stored session by id → bulk-load + tail. Paced
+        // from the start unless `--follow` asks to ride the (possibly still
+        // growing) edge.
+        Target::Path(_) | Target::Id(_) => {
+            let session_id = open(&target, provider)?.id;
             let mode = if follow { Mode::Live } else { Mode::Replay };
-            (session_id, file, mode, true, speed)
+            (session_id, mode, true, speed)
         }
-        // A directory (or none → cwd) → live: discover the latest session and
-        // follow it. (The dir need not exist yet; the tailer waits.)
-        other => {
-            if let Some(p) = &other
-                && !p.is_dir()
-            {
-                bail!("not found: {}", p.display());
-            }
-            let cwd = match other {
-                Some(d) => d,
-                None => std::env::current_dir().context("resolving current directory")?,
-            };
-            let proj = discovery::project_dir(&cwd)
-                .ok_or_else(|| anyhow!("no Claude projects directory for {}", cwd.display()))?;
-            // Best-effort latest session id so stale events filter; the tailer
-            // re-discovers and may switch.
-            let session_id = discovery::latest_session_file(&proj)
-                .as_deref()
-                .and_then(Path::file_stem)
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            (session_id, proj, Mode::Live, false, DEFAULT_REPLAY_SPEED)
+        // A directory (or none → cwd) → live: discover the newest session of
+        // that project and follow it. (It need not exist yet; the tailer
+        // waits.) The id is best-effort so stale events filter; the tailer
+        // re-discovers and may switch.
+        Target::Here(_) => {
+            let session_id = open(&target, provider).map(|s| s.id).unwrap_or_default();
+            (session_id, Mode::Live, false, DEFAULT_REPLAY_SPEED)
         }
     };
 
@@ -307,19 +267,37 @@ async fn run_tui(cli: Cli) -> Result<()> {
 
     // Kick off the watch before the tailer task starts consuming.
     tail_tx
-        .send(TailRequest::Watch(watch_target))
+        .send(TailRequest::Watch(target))
         .await
         .map_err(|_| anyhow!("tailer channel closed before start"))?;
 
     // Spawn the tailer task — owns all files of the watched session.
     tokio::spawn(async move {
-        if let Err(e) = tailer::run(tail_rx, ui_tx.clone(), replay, speed).await {
+        if let Err(e) = tailer::run(tail_rx, ui_tx.clone(), replay, speed, provider).await {
             let _ = ui_tx.send(UiEvent::Error(e.to_string())).await;
         }
     });
 
     let app = App::new(session_id, mode);
     tui::run(app, tail_tx, ui_rx).await
+}
+
+/// What a positional argument means: an existing file is a session's file, an
+/// existing directory is a project to follow, anything shaped like a path
+/// that does not exist is a typo, and the rest is a session id or a prefix
+/// of one. Shared by `zoe <target>` and `zoe inspect <target>`.
+fn resolve_target(arg: String) -> Result<Target> {
+    let path = PathBuf::from(&arg);
+    if path.is_file() {
+        return Ok(Target::Path(path));
+    }
+    if path.is_dir() {
+        return Ok(Target::Here(path));
+    }
+    if path.components().count() > 1 || path.extension().is_some() {
+        bail!("not found: {}", path.display());
+    }
+    Ok(Target::Id(arg))
 }
 
 #[tokio::main]
@@ -335,7 +313,7 @@ async fn main() -> Result<()> {
 
     let cli = parse_cli(std::env::args())?;
     match cli {
-        Cli::Inspect { file } => run_inspect(file).await,
+        Cli::Inspect { target, provider } => run_inspect(target, provider).await,
         other => run_tui(other).await,
     }
 }
@@ -365,18 +343,18 @@ mod tests {
     }
 
     #[test]
-    fn positional_path_is_the_target() {
+    fn positional_argument_is_the_target() {
         match cli(&["/tmp/foo"]).unwrap() {
             Cli::View {
                 target: Some(p), ..
-            } => assert_eq!(p, PathBuf::from("/tmp/foo")),
+            } => assert_eq!(p, "/tmp/foo"),
             other => panic!("got {other:?}"),
         }
-        // Works for a session file too (file-vs-dir is resolved at run time).
-        match cli(&["s.jsonl"]).unwrap() {
+        // A session file, a directory or an id: told apart at run time.
+        match cli(&["01a03eb1"]).unwrap() {
             Cli::View {
                 target: Some(p), ..
-            } => assert_eq!(p, PathBuf::from("s.jsonl")),
+            } => assert_eq!(p, "01a03eb1"),
             other => panic!("got {other:?}"),
         }
     }
@@ -384,48 +362,60 @@ mod tests {
     #[test]
     fn default_speed_and_no_follow() {
         match cli(&["s.jsonl"]).unwrap() {
-            Cli::View { speed, follow, .. } => {
+            Cli::View {
+                speed,
+                follow,
+                provider,
+                ..
+            } => {
                 assert_eq!(speed, DEFAULT_REPLAY_SPEED);
                 assert!(!follow);
+                assert_eq!(provider, None);
             }
             other => panic!("got {other:?}"),
         }
     }
 
     #[test]
-    fn speed_and_follow_flags_in_any_order() {
-        match cli(&["s.jsonl", "--speed", "4", "--follow"]).unwrap() {
+    fn speed_follow_and_provider_flags_in_any_order() {
+        match cli(&["s.jsonl", "--speed", "4", "--follow", "--provider", "codex"]).unwrap() {
             Cli::View {
                 target: Some(p),
                 follow,
                 speed,
+                provider,
             } => {
-                assert_eq!(p, PathBuf::from("s.jsonl"));
+                assert_eq!(p, "s.jsonl");
                 assert_eq!(speed, 4.0);
                 assert!(follow);
+                assert_eq!(provider, Some(Provider::Codex));
             }
             other => panic!("got {other:?}"),
         }
         // Flags before the path, too.
-        match cli(&["--speed", "2.5", "s.jsonl"]).unwrap() {
+        match cli(&["--provider", "Claude", "--speed", "2.5", "s.jsonl"]).unwrap() {
             Cli::View {
                 target: Some(p),
                 speed,
+                provider,
                 ..
             } => {
-                assert_eq!(p, PathBuf::from("s.jsonl"));
+                assert_eq!(p, "s.jsonl");
                 assert_eq!(speed, 2.5);
+                assert_eq!(provider, Some(Provider::Claude));
             }
             other => panic!("got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_bad_speed() {
+    fn rejects_bad_speed_and_unknown_provider() {
         assert!(cli(&["s.jsonl", "--speed", "nope"]).is_err());
         assert!(cli(&["s.jsonl", "--speed", "0"]).is_err());
         assert!(cli(&["s.jsonl", "--speed", "-3"]).is_err());
         assert!(cli(&["s.jsonl", "--speed"]).is_err());
+        assert!(cli(&["s.jsonl", "--provider", "gemini"]).is_err());
+        assert!(cli(&["s.jsonl", "--provider"]).is_err());
     }
 
     #[test]
@@ -435,9 +425,21 @@ mod tests {
     }
 
     #[test]
-    fn inspect_takes_one_file() {
+    fn inspect_takes_one_target_and_a_provider() {
         match cli(&["inspect", "s.jsonl"]).unwrap() {
-            Cli::Inspect { file } => assert_eq!(file, PathBuf::from("s.jsonl")),
+            Cli::Inspect { target, provider } => {
+                assert_eq!(target, "s.jsonl");
+                assert_eq!(provider, None);
+            }
+            other => panic!("got {other:?}"),
+        }
+        // An id resolves for inspect the way it does for the TUI.
+        match cli(&["inspect", "01a03eb1"]).unwrap() {
+            Cli::Inspect { target, .. } => assert_eq!(target, "01a03eb1"),
+            other => panic!("got {other:?}"),
+        }
+        match cli(&["inspect", "--provider", "codex", "s.jsonl"]).unwrap() {
+            Cli::Inspect { provider, .. } => assert_eq!(provider, Some(Provider::Codex)),
             other => panic!("got {other:?}"),
         }
         assert!(cli(&["inspect"]).is_err());
@@ -445,33 +447,36 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_path_is_a_typo_and_a_bare_word_is_an_id() {
+        assert!(resolve_target("./nope.jsonl".into()).is_err());
+        assert!(resolve_target("nope.jsonl".into()).is_err());
+        assert!(
+            matches!(resolve_target("01a03eb1".into()), Ok(Target::Id(id)) if id == "01a03eb1")
+        );
+        assert!(matches!(resolve_target(".".into()), Ok(Target::Here(_))));
+    }
+
+    #[test]
     fn parse_session_fully_marks_quiet_main_idle() {
         // Inspect is a point-in-time view: a transcript whose last activity is
         // far in the past reports main as Idle (interactive agents never claim
         // completion — the format has no end marker to prove it).
-        let tmp = std::env::temp_dir().join(format!(
-            "zoetrope-fullparse-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = std::env::temp_dir().join(format!("zoetrope-fullparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("77777777-7777-7777-7777-777777777777.jsonl");
         std::fs::write(
             &tmp,
             b"{\"type\":\"user\",\"uuid\":\"u\",\"parentUuid\":null,\"timestamp\":\"2026-06-05T13:51:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
         )
         .unwrap();
 
-        let model = parse_session_fully(&tmp).expect("parses");
-        assert_eq!(
-            model
-                .agent(zoetrope::state::session::MAIN_ID)
-                .unwrap()
-                .status,
-            AgentStatus::Idle
-        );
+        let (model, _info) = parse_session_fully(&Target::Path(tmp.clone()), None).expect("parses");
+        let main = model.agent(zoetrope::state::session::MAIN_ID).unwrap();
+        assert_eq!(main.status, AgentStatus::Idle);
+        // The root's name comes from the provider now, not the model.
+        assert_eq!(main.agent_type.as_deref(), Some("claude"));
 
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
