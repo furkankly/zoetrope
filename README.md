@@ -98,6 +98,8 @@ a split and a tab as well, and the plugin's
 [README](https://github.com/furkankly/zoetrope/blob/main/herdr-plugin/README.md)
 covers both.
 
+![the zoetrope plugin opening a Claude Code pane's session as a graph inside Herdr](https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope-herdr.gif)
+
 ## Usage
 
 ```bash

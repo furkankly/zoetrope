@@ -36,6 +36,14 @@ DEMOS=(
   "tour:zoetrope-tour"
   "codex:zoetrope-codex"
 )
+# Recordings VHS cannot make. A Herdr pane runs the plugin inside a live
+# multiplexer with a real agent working in the next pane, which no tape can
+# script, so this one is captured by hand and only ever replaced by hand. It is
+# exempt from the orphan and MP4 checks below; the README links it directly.
+HAND=(
+  "zoetrope-herdr"
+)
+
 WEB_PUBLIC=web/public
 
 die() { echo "$*" >&2; exit 1; }
@@ -115,7 +123,9 @@ cmd_check() {
   for f in assets/*.gif assets/*.mp4; do
     [[ -e $f ]] || continue
     local n; n=$(basename "$f"); n=${n%.*}
-    outputs | grep -qx "$n" || { echo "  ORPHAN  $f is not in DEMOS"; bad=1; }
+    outputs | grep -qx "$n" && continue
+    printf '%s\n' "${HAND[@]}" | grep -qx "$n" ||
+      { echo "  ORPHAN  $f is not in DEMOS or HAND"; bad=1; }
   done
 
   [[ -f assets/og-shot.png ]] || { echo "  MISSING assets/og-shot.png (run: build.sh og)"; bad=1; }

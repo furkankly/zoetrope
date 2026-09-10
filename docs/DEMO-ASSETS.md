@@ -30,6 +30,18 @@ order with a caption under each:
 | `zoetrope-tour.gif` | `assets/tour.tape` | *What is it like to use?* — pan, zoom, inspect, scrub, driven by a pointer |
 | `zoetrope-codex.gif` | `assets/codex.tape` | *Does it do Codex?* The CLI capture (`assets/codex/cli-0.153.4/`), a subagent's panel, the info overlay |
 
+One more sits beside them, made a different way:
+
+| GIF | Made by | Answers |
+| --- | --- | --- |
+| `zoetrope-herdr.gif` | hand capture | *What is it like inside Herdr?* A key press in an agent pane, and that pane's session opens as a graph over it |
+
+VHS cannot record it. The plugin runs inside a live multiplexer with an agent
+working in the pane next door, which is a session no tape can script. So it is
+captured by hand, replaced by hand, and listed in `HAND` in `assets/build.sh`,
+which exempts it from the orphan and MP4 checks. The README links it directly;
+the landing page does not use it.
+
 Everything goes through one script, so there is one list of recordings rather
 than one per tool. Adding a recording is a line in `DEMOS` inside it plus a
 matching tape.
