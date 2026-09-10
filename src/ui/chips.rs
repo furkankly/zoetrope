@@ -141,7 +141,7 @@ fn within_gap(prev: Option<DateTime<Utc>>, next: Option<DateTime<Utc>>) -> bool 
 /// mark that separates new activity from already-seen history. Owned by `App`;
 /// driven every frame by the single `reconcile`(Self::reconcile) pass and
 /// re-baselined on attach/seek by [`adopt_baseline`](Self::adopt_baseline);
-/// drawn by [`render`].
+/// drawn by this module's `render`.
 #[derive(Default)]
 pub struct ChipTray {
     chips: Vec<Chip>,

@@ -18,10 +18,25 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use common::{Session, Spec};
-use zoetrope::provider::claude::wire;
+use zoetrope::provider::{FileRole, Provider, ReadMode, SessionFile};
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{ReplayItem, UiEvent};
+
+/// A parser for a session's root file, the way a feeder gets one: state what
+/// the file is, then ask its provider. Reading through `Stream` rather than the
+/// wire parser is what production does, and keeps the bench on the public API.
+fn root_stream() -> zoetrope::provider::Stream {
+    Provider::Claude.stream_for(&SessionFile {
+        provider: Provider::Claude,
+        path: std::path::PathBuf::from("bench.jsonl"),
+        session: "bench".to_string(),
+        role: FileRole::Root,
+        read: ReadMode::Tail,
+        project_key: "bench".to_string(),
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    })
+}
 
 /// The scales every group runs over.
 fn scales() -> Vec<(&'static str, Session)> {
@@ -64,16 +79,20 @@ fn bench_parse(c: &mut Criterion) {
             .collect();
         let bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
         g.throughput(Throughput::Bytes(bytes as u64));
-        g.bench_with_input(BenchmarkId::new("parse_line", name), &lines, |b, lines| {
-            b.iter(|| {
-                let mut n = 0usize;
-                for l in lines {
-                    if wire::parse_line(black_box(l)).is_some() {
-                        n += 1;
+        g.bench_with_input(BenchmarkId::new("stream_push", name), &lines, |b, lines| {
+            b.iter_batched(
+                root_stream,
+                |mut stream| {
+                    let mut n = 0usize;
+                    for l in lines {
+                        if stream.push(black_box(l)).is_some() {
+                            n += 1;
+                        }
                     }
-                }
-                n
-            })
+                    n
+                },
+                BatchSize::SmallInput,
+            )
         });
     }
     g.finish();

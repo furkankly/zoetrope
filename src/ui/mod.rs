@@ -6,10 +6,13 @@
 //! `&Flow`, so they are separate `render_widget` calls), and finally the status
 //! bar.
 
-pub mod chips;
-pub mod edges;
-pub mod nodes;
-pub mod panel;
+// Crate-private: the frontends call `ui::draw` and nothing else here. The
+// types these hold reach the outside through `state`'s re-exports, where they
+// are fields of `App`.
+pub(crate) mod chips;
+pub(crate) mod edges;
+pub(crate) mod nodes;
+pub(crate) mod panel;
 
 use crate::fact::{FactKind, Outcome};
 use rataflow::{Background, MiniMap, MiniMapPosition};

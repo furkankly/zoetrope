@@ -443,12 +443,6 @@ fn era_header_flags(
     (flags, agent.tool_calls.len() + headers)
 }
 
-/// Total rendered lines of an agent's tool list (rows + era headers) — the
-/// scroll ceiling the handler clamps against.
-pub fn tool_list_lines(agent: &AgentInfo, model: &crate::state::session::SessionModel) -> usize {
-    era_header_flags(agent, model).1
-}
-
 /// One row of the tool-call list: state glyph, name, summary, local time.
 fn tool_line(
     tc: &crate::state::session::ToolCallInfo,
@@ -580,7 +574,7 @@ mod tests {
         let agent = m.agent(crate::state::session::MAIN_ID).unwrap();
         // 3 tool rows + 2 era headers (eras 0 and 1) = 5 rendered lines —
         // the scroll ceiling the handler clamps against.
-        assert_eq!(tool_list_lines(agent, &m), 5);
+        assert_eq!(era_header_flags(agent, &m).1, 5);
     }
 
     use chrono::{TimeZone, Utc};
