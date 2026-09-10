@@ -1,0 +1,76 @@
+id = "furkankly.zoetrope"
+name = "zoetrope"
+# This versions the bridge in this directory, not zoetrope. The scripts here
+# launch `zoe`; the graph, and every improvement to it, arrives with the binary
+# through Homebrew and crates.io, on its own release schedule and without any
+# change here. So this number moves when these files move, and stays put
+# through a zoe release that leaves the command line alone.
+#
+# Herdr displays it and nothing reads it. Plugins that do keep it in step with
+# their tool have a reason to: their installer builds a release download URL
+# out of it. Nothing here downloads anything, so a mirrored number would be a
+# hand-edited label with no reader. The one version that gates an install is
+# min_herdr_version below; the one that describes what `zoe` must be able to do
+# lives in herdr/ensure-zoe.sh.
+version = "0.1.0"
+description = "Watch the focused agent's session as a live flow graph."
+platforms = ["macos", "linux"]
+
+# `agent_session` on pane.get / agent.get is what makes this plugin worth having:
+# Herdr already knows which agent occupies a pane and its native session id, which
+# is the pair zoetrope's own discovery would otherwise have to infer. 0.8.2 is the
+# release the field was read from (`herdr api schema --json`, protocol 20).
+min_herdr_version = "0.8.2"
+
+# `plugin install` runs this after the preview; `plugin link` does not. It only
+# checks for zoe, and installs it when missing.
+[[build]]
+command = ["bash", "herdr/ensure-zoe.sh"]
+
+# Overlay: a temporary zoomed pane that restores the previous focus and zoom when
+# it closes. Watching the graph is a peek, not a side-by-side workflow. Users who
+# want it persistent can open it as a split from the action below.
+[[panes]]
+id = "graph"
+title = "zoetrope"
+placement = "overlay"
+command = ["bash", "herdr/open.sh"]
+
+[[actions]]
+id = "open"
+title = "zoetrope: session graph (overlay)"
+description = "Open the focused agent's session as a flow graph, over the focused pane. Closing it restores your layout. This is what the default key does."
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "open"]
+
+# Beside the agent instead of over it: a persistent split, no zoom, no overlay.
+[[actions]]
+id = "open-split"
+title = "zoetrope: session graph (split)"
+description = "Open the focused agent's session as a flow graph, split beside the focused pane. Stays until you close it."
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "open", "split"]
+
+# Its own tab: full area, kept until closed, one tab switch away from the agent.
+[[actions]]
+id = "open-tab"
+title = "zoetrope: session graph (tab)"
+description = "Open the focused agent's session as a flow graph in its own tab. Full size, one tab switch from the agent."
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "open", "tab"]
+
+# Herdr binds keys only from the user's config, so the default key is installed
+# by an action: one marker-fenced block, removable by the sibling action.
+[[actions]]
+id = "setup-keys"
+title = "zoetrope: install the default keybinding"
+description = "Bind prefix+shift+z to the overlay, and write the split and tab placements beside it as comments. One block in your Herdr config, backed up first."
+contexts = ["workspace"]
+command = ["bash", "herdr/keys.sh", "setup"]
+
+[[actions]]
+id = "remove-keys"
+title = "zoetrope: remove the default keybinding"
+description = "Delete the block setup-keys wrote."
+contexts = ["workspace"]
+command = ["bash", "herdr/keys.sh", "remove"]
