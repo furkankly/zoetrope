@@ -23,7 +23,7 @@ cd web/wasm && cargo clippy   # its .cargo/config.toml defaults to wasm32
 
 ## Commits
 
-[Conventional Commits](https://www.conventionalcommits.org/), lowercase imperative subject. Scope is a module, not a file: `fact`, `provider`, `state`, `graph`, `timeline`, `tailer`, `ui`, `panel`, `cli`, `wasm`, `web`, `docs`. A change inside one provider is `provider` (e.g. `fix(provider): inherit the timestamp across progress records`).
+[Conventional Commits](https://www.conventionalcommits.org/), lowercase imperative subject. Scope is a module, not a file: `fact`, `provider`, `state`, `graph`, `timeline`, `tailer`, `ui`, `panel`, `cli`, `wasm`, `web`, `api`, `docs`. `api` is a change to what the crate exposes rather than to one module. A change inside one provider is `provider` (e.g. `fix(provider): inherit the timestamp across progress records`).
 
 ```
 feat(timeline): index the playhead by event instead of wall-clock

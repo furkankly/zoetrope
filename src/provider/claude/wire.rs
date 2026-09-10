@@ -215,8 +215,6 @@ pub struct AgentToolInput {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub prompt: Option<String>,
-    #[serde(default)]
     pub subagent_type: Option<String>,
 }
 

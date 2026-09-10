@@ -6,18 +6,23 @@
 //! [`App::handle_ui_event`] folds tailer events into the model and re-syncs the
 //! graph; events for stale sessions are dropped via [`App::is_current`].
 
-pub mod graph;
+// Two projections of the model. Crate-private: what the frontends need from
+// them is re-exported below, as the types of `App`'s fields.
+pub(crate) mod graph;
 pub mod info;
 pub mod render;
 pub mod session;
-pub mod timeline;
+pub(crate) mod timeline;
 
-use self::graph::AgentFlow;
+// `App`'s public fields, nameable from outside without exposing the module
+// layout they live in.
+pub use self::graph::AgentFlow;
 pub use self::info::SessionInfo;
+pub use self::timeline::Timeline;
+pub use crate::ui::chips::ChipTray;
+
 use self::session::SessionModel;
-use self::timeline::Timeline;
 use crate::tailer::UiEvent;
-use crate::ui::chips::ChipTray;
 
 /// Whether the app is watching a live session or replaying a finished one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +144,10 @@ struct Snapshot {
 }
 
 /// The central application state, owned by the single UI task.
+///
+/// Its fields are public for the two frontends that drive it, this crate's own
+/// [`tui`](crate::tui) loop and the browser crate. They are frontend plumbing
+/// rather than an interface to build on, and carry no stability promise.
 pub struct App {
     /// The rendered flow graph (agent cards + step edges).
     pub flow: AgentFlow,
@@ -278,7 +287,7 @@ impl App {
     }
 
     /// Seek to a fraction (`0.0..=1.0`) along the timeline — a scrubber
-    /// click/drag. Index-based (see [`Timeline::progress`]), so the playhead
+    /// click/drag. Index-based (see `Timeline::progress`), so the playhead
     /// lands under the cursor and activity is evenly reachable. No-op when empty.
     pub fn seek_to_fraction(&mut self, f: f64) {
         let len = self.timeline.items.len();

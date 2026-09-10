@@ -43,6 +43,11 @@ pub enum Source {
 
 /// One unit of Claude input: a parsed transcript line from a known file, or a
 /// discovered `meta.json` sidecar.
+///
+/// Test-only. Production reads a file through a [`Stream`], which is what the
+/// feeders do; this is the shape the tests find convenient for stating one
+/// record at a time.
+#[cfg(test)]
 #[derive(Debug)]
 pub enum Record {
     Entry {
@@ -56,6 +61,7 @@ pub enum Record {
     },
 }
 
+#[cfg(test)]
 impl Record {
     /// The facts this record states.
     pub fn facts(&self) -> Vec<Fact> {

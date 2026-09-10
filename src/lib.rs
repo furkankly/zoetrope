@@ -20,7 +20,7 @@
 //! features off).
 //!
 //! Portable everywhere: the domain [`state`] (model + unified replay/live
-//! [`timeline`](state::timeline) + flow-graph projection), the [`ui`] rendering,
+//! [`timeline`](state::Timeline) + flow-graph projection), the [`ui`] rendering,
 //! the [`fact`] vocabulary every transcript format is reduced to, and the
 //! [`provider`] providers that do the reducing. The wire types and pure replay
 //! assembly live in [`tailer`]; its live file-tailing + the terminal loop ([`tui`]) and input
@@ -34,6 +34,11 @@ pub mod tailer;
 pub mod ui;
 
 // The native frontend: terminal loop + crossterm input.
+//
+// Frontend plumbing, with no stability promise. These are public because the
+// `zoe` binary is a separate crate that links this one, not because they are an
+// interface to build on: they may change shape in any release. The parts meant
+// to be depended on are the domain and the vocabulary above.
 #[cfg(feature = "native")]
 pub mod autopilot;
 #[cfg(feature = "native")]

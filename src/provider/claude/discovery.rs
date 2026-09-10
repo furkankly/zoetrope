@@ -65,35 +65,6 @@ pub fn is_session_file(path: &std::path::Path) -> bool {
         .is_some_and(is_uuid)
 }
 
-/// Find the newest `<uuid>.jsonl` transcript directly inside `project_dir`
-/// (ignoring non-transcript files like `skill-injections.jsonl`,
-/// `sessions-index.json`, and subdirectories).
-pub fn latest_session_file(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(project_dir).ok()? {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !is_session_file(&path) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        // Newest wins; equal mtimes break ties on the (lexicographically greater)
-        // path so the choice is deterministic, not `read_dir` order.
-        let better = match &best {
-            None => true,
-            Some((bt, bp)) => mtime > *bt || (mtime == *bt && path > *bp),
-        };
-        if better {
-            best = Some((mtime, path));
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
 // ---------------------------------------------------------------------------
 // Subagent directory scanning
 // ---------------------------------------------------------------------------
@@ -559,34 +530,6 @@ mod tests {
         assert_eq!(found[1].agent_id, "a9dd56e1137830d9d");
         assert_eq!(found[0].workflow.as_deref(), Some("wf_x"));
         assert_eq!(found[0].meta, tmp.join("agent-a5301c73ab04591b2.meta.json"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn latest_session_file_picks_newest_uuid_jsonl() {
-        let tmp = std::env::temp_dir().join(format!(
-            "zoetrope-latest-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let older = tmp.join("11111111-1111-1111-1111-111111111111.jsonl");
-        let newer = tmp.join("22222222-2222-2222-2222-222222222222.jsonl");
-        // Non-transcript files must be ignored even if they are the newest.
-        std::fs::write(tmp.join("skill-injections.jsonl"), b"{}\n").unwrap();
-        std::fs::write(tmp.join("sessions-index.json"), b"{}\n").unwrap();
-        std::fs::write(&older, b"{}\n").unwrap();
-        // Ensure a real mtime gap across coarse-granularity filesystems, then
-        // write `newer` strictly after `older`.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&newer, b"{}\n").unwrap();
-
-        let latest = latest_session_file(&tmp).expect("finds one");
-        assert_eq!(latest, newer, "newest uuid .jsonl wins; sidecars ignored");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

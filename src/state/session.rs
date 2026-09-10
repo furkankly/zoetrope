@@ -1,6 +1,6 @@
 //! `SessionModel`: the pure domain model — agents, their statuses, and tool
 //! calls, folded solely from `Fact`s. No provider records and no rataflow types
-//! here; the graph layer ([`crate::state::graph`]) projects this onto a `Flow`.
+//! here; the graph layer ([`AgentFlow`](crate::state::AgentFlow)) projects this onto a `Flow`.
 //!
 //! Node ids are stable strings: `"main"` for the root agent, and otherwise
 //! whatever id the provider stated the agent under (Claude's 17-hex agent id,
@@ -344,6 +344,7 @@ impl SessionModel {
 
     /// Fold one Claude record through the provider. Test convenience: the
     /// production paths hand facts in directly.
+    #[cfg(test)]
     #[cfg(test)]
     pub(crate) fn apply_update(&mut self, record: &crate::provider::claude::Record) -> bool {
         record

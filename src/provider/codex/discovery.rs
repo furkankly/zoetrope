@@ -124,6 +124,10 @@ pub fn rollouts_from(root: &Path) -> Vec<PathBuf> {
 
 /// The rollouts that belong to the session whose root is `root`: the root
 /// itself, then every file whose own meta names that root as its session.
+///
+/// Test-only: the conformance harness reads a fixture session this way.
+/// Feeders go through [`related_paths`] and let the core assemble.
+#[cfg(test)]
 pub fn session_rollouts(root: &Path) -> Vec<(PathBuf, SessionMeta)> {
     let Some(root_meta) = read_meta(root) else {
         return Vec::new();
