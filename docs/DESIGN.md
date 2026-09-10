@@ -42,6 +42,7 @@ Two lockfiles means the two frontends can drift apart. Most of that drift is har
 Cargo.toml          # [workspace] exclude = ["web/wasm"]  — its own workspace, own lockfile
 src/                # the zoetrope library + the `zoe` bin (src/main.rs)
 web/wasm/           # the zoetrope-web crate: Cargo.toml, index.html (trunk entry), src/main.rs
+herdr-plugin/       # the Herdr plugin: a manifest and shell scripts that launch `zoe`; ships by git clone, not with the crate
 ```
 
 ## Dependencies (Cargo.toml)
