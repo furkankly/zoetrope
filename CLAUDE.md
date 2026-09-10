@@ -4,7 +4,7 @@ Terminal UI that visualizes Claude Code and Codex agent sessions as a live flow 
 
 Transcript formats enter through one boundary: `src/provider/` turns records into the facts in `src/fact.rs`, and nothing past it knows the format. See `docs/ARCHITECTURE.md` §0 before adding to either side.
 
-See `docs/ARCHITECTURE.md` for the invariants and principles, `docs/DESIGN.md` for the module map and transcript format, `TODO.md` for the roadmap, and `README.md` for usage.
+See `docs/ARCHITECTURE.md` for the invariants and principles, `docs/DESIGN.md` for the module map and transcript format, `docs/HERDR-PLUGIN.md` for the Herdr bridge in `herdr-plugin/`, `TODO.md` for the roadmap, and `README.md` for usage.
 
 ## Running
 

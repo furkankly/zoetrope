@@ -145,7 +145,8 @@ What used to be five feeder sites naming `claude::` are these calls. The live ta
 - **The browser** (`web/wasm`): no filesystem. The page reads files (a drop, an upload, or a directory it may keep re-reading) and passes `[{path, text}]` to `zoetrope_load`; `tailer::Bundle` does the rest through `session_file_from`, `stream_for` and `sidecar`, and `zoetrope_append` continues the same streams. The page's own job is finding files: Claude by the `<uuid>.jsonl` and `<uuid>/subagents/` layout, Codex by reading each rollout's first line, which is `session_file`'s logic written a second time in JavaScript because the page cannot call it before the files are read.
 - **The herdr plugin** (`herdr-plugin/`): asks Herdr which session the focused
   pane is running, hands `zoe` that id, and `open` does the rest. It is the
-  case `Target::Id` was written for: the id is known, the file is not.
+  case `Target::Id` was written for: the id is known, the file is not. See
+  [HERDR-PLUGIN.md](HERDR-PLUGIN.md).
 
 ---
 
