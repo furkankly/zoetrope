@@ -24,11 +24,11 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code and Codex, the CLI and the desktop app, each write a transcript for every
-session. zoetrope reads it and draws the session as a graph in your terminal: the main
-agent, the agents it spawns, and the tools each one runs, updating live as it goes.
-Point it at a finished run and it replays, paced by the session's own timestamps. Point
-it at a running one and it follows along. It's read-only, and nothing leaves your machine.
+Claude Code and Codex write a transcript for every session. zoetrope reads it and draws
+the session as a graph in your terminal: the main agent, the agents it spawns, and the
+tools each one runs, updating live as it goes. Point it at a finished run and it replays,
+paced by the session's own timestamps. Point it at a running one and it follows along.
+It's read-only, and nothing leaves your machine.
 
 Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkankly/rataflow).
 
