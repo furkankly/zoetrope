@@ -75,6 +75,19 @@ cargo build --release
   (`rustup` recommended).
 - A terminal that supports truecolor and mouse events (most modern terminals do).
 
+## Inside Herdr
+
+If you run your agents in [Herdr](https://herdr.dev), the plugin in
+`herdr-plugin/` is a third way in, and it installs zoetrope for you when it is
+missing:
+
+```bash
+herdr plugin install furkankly/zoetrope/herdr-plugin
+```
+
+It opens the focused pane's session as a graph on a key press. See
+[Usage](/guides/usage/#launching-inside-herdr).
+
 ## Build the browser app yourself
 
 The browser frontend isn't part of the published crate — it's a separate,
@@ -96,19 +109,6 @@ and `trunk` (`cargo install trunk`). `pnpm build:wasm` (that is,
 `bash scripts/build-wasm.sh`) builds only the wasm; lint it from the repo root
 with `cd web/wasm && cargo clippy` — that crate's `.cargo/config.toml` defaults the
 target to wasm32, so no flags are needed.
-
-## Inside Herdr
-
-If you run your agents in [Herdr](https://herdr.dev), the plugin in
-`herdr-plugin/` is a third way in, and it installs zoetrope for you when it is
-missing:
-
-```bash
-herdr plugin install furkankly/zoetrope/herdr-plugin
-```
-
-It opens the focused pane's session as a graph on a key press. See
-[Usage](/guides/usage/#launching-inside-herdr).
 
 ## Status
 

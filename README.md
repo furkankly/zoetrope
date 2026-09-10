@@ -78,6 +78,26 @@ cargo build --release
 No install at all: **[try it in your browser](https://zoetrope.furkankly.dev/app)**.
 Drop a transcript on the page and get the same graph.
 
+## In Herdr
+
+[Herdr](https://herdr.dev) is a terminal multiplexer built for running coding
+agents side by side. It knows which agent occupies a pane and the id of the
+session running there, so the plugin in
+[`herdr-plugin/`](https://github.com/furkankly/zoetrope/tree/main/herdr-plugin)
+opens that exact session in `zoe`, without you naming a file or an id.
+
+```bash
+herdr integration install claude          # and/or codex, so Herdr learns session ids
+herdr plugin install furkankly/zoetrope/herdr-plugin
+herdr plugin action invoke setup-keys --plugin furkankly.zoetrope
+```
+
+Focus an agent pane and press `prefix+shift+z`. The graph opens over the pane,
+follows the session live, and the same key closes it. There are placements for
+a split and a tab as well, and the plugin's
+[README](https://github.com/furkankly/zoetrope/blob/main/herdr-plugin/README.md)
+covers both.
+
 ## Usage
 
 ```bash
@@ -99,26 +119,6 @@ scrub, follow, pause, jump back to live.
 The same engine also runs [in the browser](https://zoetrope.furkankly.dev/app),
 compiled to WebAssembly via [ratzilla](https://github.com/ratatui/ratzilla). Open a
 session from disk, or drop a transcript on the page. It stays local there too.
-
-## In Herdr
-
-[Herdr](https://herdr.dev) is a terminal multiplexer built for running coding
-agents side by side. It knows which agent occupies a pane and the id of the
-session running there, so the plugin in
-[`herdr-plugin/`](https://github.com/furkankly/zoetrope/tree/main/herdr-plugin)
-opens that exact session in `zoe`, without you naming a file or an id.
-
-```bash
-herdr integration install claude          # and/or codex, so Herdr learns session ids
-herdr plugin install furkankly/zoetrope/herdr-plugin
-herdr plugin action invoke setup-keys --plugin furkankly.zoetrope
-```
-
-Focus an agent pane and press `prefix+shift+z`. The graph opens over the pane,
-follows the session live, and the same key closes it. There are placements for
-a split and a tab as well, and the plugin's
-[README](https://github.com/furkankly/zoetrope/blob/main/herdr-plugin/README.md)
-covers both.
 
 ## Features
 
