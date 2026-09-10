@@ -46,6 +46,23 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
   subagents' rollouts. Drop the root alone and you get the main agent only;
   zoetrope will say so rather than pretending the session had no subagents.
 
+## Launching (inside Herdr)
+
+[Herdr](https://herdr.dev) runs coding agents in panes and knows which session
+each one is. The plugin in `herdr-plugin/` asks it about the focused pane and
+launches `zoe` on that session, so nothing has to be discovered or named:
+
+```bash
+herdr integration install claude          # and/or codex, so Herdr learns session ids
+herdr plugin install furkankly/zoetrope/herdr-plugin
+herdr plugin action invoke setup-keys --plugin furkankly.zoetrope
+```
+
+Then `prefix+shift+z` in an agent pane opens the graph over it, following live,
+and closes it again. The session id comes from the agent's `SessionStart` hook,
+which is what `herdr integration install` adds, so a session that was already
+running when you installed it has to be started again before Herdr can name it.
+
 ## Keys
 
 | Key | Action |
