@@ -28,7 +28,18 @@ const wasmBase = '/wasm';
       title="zoetrope in the browser: replay Claude Code and Codex sessions"
       description="Run zoetrope in your browser: replay a Claude Code or Codex session transcript as a live flow graph, fully locally."
     />
+    {/* Google Search cannot read an SVG favicon — its supported list is BMP,
+        GIF, ICO, PNG, JPEG, PPM and TIFF — and with `/favicon.svg` the only
+        icon declared and no `/favicon.ico` at the root to fall back on, search
+        results showed the default globe. The .ico (16/32/48, rasterised from
+        the same mark by web/scripts/favicon.mjs) is what Google reads; the SVG
+        stays because browsers that understand it get an icon that is sharp at
+        any size. Order matters only in that the SVG must not be the sole
+        entry — a browser picks the best type it knows, a crawler does not. */}
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <!-- Same self-hosted brand fonts as the landing (Space Mono for the wordmark,
          JetBrains Mono for UI text), so the top bar reads identically across pages. -->
     <Font cssVariable="--font-mono" preload />
@@ -93,6 +104,17 @@ const wasmBase = '/wasm';
         background: var(--ink);
         border-bottom: 1px solid #2a2a2a;
         font-size: 0.8rem;
+      }
+      /* The wordmark is the page's <h1> — /app is a WebGl2 canvas, so without it
+         the document has no heading at all and a crawler falls back to whatever
+         prose it can find (see the mobile note below). It is a wrapper, not a
+         box: the UA's block/2em/bold/0.67em-margin would all shove the bar. */
+      .brand-h1 {
+        display: inline-flex;
+        margin: 0;
+        font-size: inherit;
+        font-weight: inherit;
+        line-height: inherit;
       }
       .brand {
         display: inline-flex;
@@ -228,7 +250,7 @@ const wasmBase = '/wasm';
         margin-bottom: 0.7rem;
       }
       .mnote-brand .glyph { color: var(--green); }
-      .mnote-card h2 {
+      .mnote-card .mnote-title {
         font-family: var(--display);
         font-size: 1.05rem;
         letter-spacing: -0.01em;
@@ -424,7 +446,8 @@ const wasmBase = '/wasm';
           size and goes. The live agent stays as the centre dot and keeps the
           pulse the bare `●` carried, so the bar still reads as running. Same
           treatment as the landing header. */}
-      <a class="brand" href="/">
+      <h1 class="brand-h1">
+        <a class="brand" href="/">
         <svg class="brand-mark" viewBox="0 0 32 32" width="18" height="18" aria-hidden="true">
           <g fill="none" stroke-width="3.5" stroke-dasharray="5.8 2.84">
             <path d="M16 5 A 11 11 0 1 1 16 27 A 11 11 0 1 1 16 5" stroke="var(--dim)"></path>
@@ -442,7 +465,8 @@ const wasmBase = '/wasm';
           <circle class="glyph" cx="16" cy="16" r="2.6" fill="var(--green)"></circle>
         </svg>
         zoetrope
-      </a>
+        </a>
+      </h1>
       <span id="status" class="statusbar">loading wasm…</span>
       <span class="spacer"></span>
 
@@ -460,13 +484,22 @@ const wasmBase = '/wasm';
 
     <div id="drop" class="drop">Drop a session here to replay it: a Claude Code &lt;uuid&gt;.jsonl (with its &lt;uuid&gt;/ folder for subagents), or a Codex rollout-*.jsonl (with its subagents’ rollouts). Or use “Sessions” to browse yours.</div>
 
-    <!-- Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
-         Dismissable, so a curious phone visitor can still watch the replay. -->
-    <div id="mobile-note" class="mnote">
+    {/* Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
+        Dismissable, so a curious phone visitor can still watch the replay.
+
+        `data-nosnippet` is load-bearing, not decoration. Googlebot crawls
+        mobile-first at a phone viewport, where this is a full-screen overlay
+        and (before the wordmark became the h1) the only heading on the page —
+        so Google quoted "Built for a bigger screen" as the description of /app
+        in search results. The attribute takes this block out of the running for
+        a snippet; the copy is also written to describe the app rather than only
+        turn a visitor away, and its title is a paragraph rather than a heading,
+        so the document outline has one heading and it is the wordmark. */}
+    <div id="mobile-note" class="mnote" data-nosnippet>
       <div class="mnote-card">
         <div class="mnote-brand"><span class="glyph">●</span> zoetrope</div>
-        <h2>Built for a bigger screen</h2>
-        <p>The flow graph is dense and made for a larger display. Open zoetrope on a desktop to scrub, zoom, and load your own sessions.</p>
+        <p class="mnote-title">Built for a bigger screen</p>
+        <p>zoetrope draws a whole Claude Code or Codex session — every agent, its subagents, and each tool call — as one flow graph, which wants more room than a phone has. Open it on a desktop to scrub the timeline, zoom around, and load your own sessions.</p>
         <button id="mobile-note-dismiss">Look around anyway</button>
       </div>
     </div>

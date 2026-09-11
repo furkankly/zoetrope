@@ -20,6 +20,13 @@ const IMAGE_ALT =
 <Analytics />
 <Schema />
 <Font cssVariable="--font-display" preload />
+{/* Starlight's `favicon` option emits the SVG and only the SVG. Google reads a
+    site's favicon off the home page, so the docs pages are not what fixed the
+    search result — these are here so a tab, a bookmark and an iOS home screen
+    get the same icon everywhere rather than only on the two bespoke pages. */}
+<link rel="icon" href="/favicon.ico" sizes="32x32" />
+<link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 {
   ogImage && (
     <>

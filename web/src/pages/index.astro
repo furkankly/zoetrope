@@ -31,7 +31,18 @@ const KEYS_URL = '/guides/usage/';
       title="zoetrope — watch your Claude Code and Codex agents work"
       description="A terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph — replay a finished transcript or follow a running one. Zero network IO; nothing leaves your machine."
     />
+    {/* Google Search cannot read an SVG favicon — its supported list is BMP,
+        GIF, ICO, PNG, JPEG, PPM and TIFF — and with `/favicon.svg` the only
+        icon declared and no `/favicon.ico` at the root to fall back on, search
+        results showed the default globe. The .ico (16/32/48, rasterised from
+        the same mark by web/scripts/favicon.mjs) is what Google reads; the SVG
+        stays because browsers that understand it get an icon that is sharp at
+        any size. Order matters only in that the SVG must not be the sole
+        entry — a browser picks the best type it knows, a crawler does not. */}
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <Font cssVariable="--font-mono" preload />
     <Font cssVariable="--font-display" preload />
   </head>
@@ -99,22 +110,22 @@ const KEYS_URL = '/guides/usage/';
       <section class="tiles">
         <article class="tile">
           <span class="g run">●</span>
-          <h3>the whole tree</h3>
+          <h2>the whole tree</h2>
           <p>Every agent and the subagents it spawns, on one graph. See who kicked off what, and what each is running now.</p>
         </article>
         <article class="tile">
           <span class="g gold">⚒</span>
-          <h3>live tool activity</h3>
+          <h2>live tool activity</h2>
           <p>See each tool call as an agent makes it, and whether it passed or failed.</p>
         </article>
         <article class="tile">
           <span class="g gold">◆</span>
-          <h3>time-travel any session</h3>
+          <h2>time-travel any session</h2>
           <p>Scrub back, pause, jump between prompts, or snap back to live. The timeline is spaced by how busy the session was, not by the clock.</p>
         </article>
         <article class="tile">
           <span class="g gold">↳</span>
-          <h3>full provenance</h3>
+          <h2>full provenance</h2>
           <p>Click any agent to see why it ran: the prompt that spawned it, and the reasoning behind it.</p>
         </article>
       </section>
@@ -383,7 +394,7 @@ const KEYS_URL = '/guides/usage/';
       .tile .g { font-size: 1.1rem; font-variant-emoji: text; }
       .tile .g.run { color: var(--green); }
       .tile .g.gold { color: var(--gold); }
-      .tile h3 {
+      .tile h2 {
         font-family: var(--display);
         font-size: 0.98rem;
         margin: 0.5rem 0 0.35rem;

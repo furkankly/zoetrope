@@ -15,6 +15,7 @@
     "og": "node scripts/og.mjs"
   },
   "dependencies": {
+    "@astrojs/sitemap": "^3.7.3",
     "@astrojs/starlight": "^0.41.7",
     "@vercel/analytics": "^2.0.1",
     "astro": "^7.2.2"

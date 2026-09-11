@@ -1,8 +1,68 @@
 // @ts-check
+import { execFileSync } from 'node:child_process';
 import { defineConfig, fontProviders } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import sitemap from '@astrojs/sitemap';
 
 import { REPO_URL, SITE_TITLE, SITE_TAGLINE } from './src/consts.ts';
+
+// ── <lastmod>, from git rather than from the clock ───────────────────────────
+//
+// The sitemap shipped bare <loc> entries, which gives a crawler no reason to
+// come back to a page it has already seen — the thing that matters after an
+// edit it needs to notice.
+//
+// The date is the last commit that touched the page's own source, NOT the build
+// time. `new Date()` at build time is the easy version and it is a lie: every
+// page would claim to have changed on every deploy, and Google's guidance is
+// that it uses lastmod when a site reports it consistently and accurately, so a
+// sitemap that cries wolf on all five URLs is worth less than no lastmod.
+//
+// The shared head components count too: Seo/Schema/Analytics inline into every
+// page's HTML, so editing one really does change what the crawler fetches.
+const SHARED = ['src/components'];
+
+const SOURCES = {
+  '/': ['src/pages/index.astro', ...SHARED],
+  '/app/': ['src/pages/app.astro', ...SHARED],
+  '/guides/install/': ['src/content/docs/guides/install.md', ...SHARED],
+  '/guides/usage/': ['src/content/docs/guides/usage.md', ...SHARED],
+  '/guides/design/': ['src/content/docs/guides/design.md', ...SHARED],
+};
+
+// A shallow clone (actions/checkout's default fetch-depth: 1) has one commit,
+// so every file would date to that commit and the answer would be the build
+// time wearing a disguise. The workflow asks for full history; if something
+// ever serves a shallow tree anyway, drop lastmod rather than emit a wrong one.
+const shallow = (() => {
+  try {
+    return execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+      cwd: import.meta.dirname,
+      encoding: 'utf8',
+    }).trim() === 'true';
+  } catch {
+    return true; // no git at all — same conclusion, no lastmod
+  }
+})();
+
+if (shallow) {
+  console.warn('[sitemap] shallow or missing git history — emitting no <lastmod>');
+}
+
+function lastmod(pathname) {
+  const paths = SOURCES[pathname];
+  if (!paths || shallow) return undefined;
+  try {
+    const iso = execFileSync(
+      'git',
+      ['log', '-1', '--format=%cI', '--', ...paths],
+      { cwd: import.meta.dirname, encoding: 'utf8' },
+    ).trim();
+    return iso ? new Date(iso) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // https://astro.build/config
 export default defineConfig({
@@ -35,6 +95,19 @@ export default defineConfig({
     },
   ],
   integrations: [
+    // Registered explicitly so it can carry `serialize`. Starlight adds its own
+    // copy of this integration only when one is not already present (see the
+    // `allIntegrations.find` guard in its index.ts), so this replaces it rather
+    // than racing it — which also means the i18n config Starlight would have
+    // passed is this site's to set, and a single-locale site has none.
+    sitemap({
+      serialize(item) {
+        const { pathname } = new URL(item.url);
+        const mod = lastmod(pathname);
+        if (mod) item.lastmod = mod.toISOString();
+        return item;
+      },
+    }),
     starlight({
       title: SITE_TITLE,
       tagline: SITE_TAGLINE,

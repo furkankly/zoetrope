@@ -32,7 +32,15 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
+      # Full history, not the default depth of 1: the sitemap dates each URL by
+      # the last commit that touched its source (see `lastmod` in
+      # web/astro.config.mjs), and a shallow clone knows only one commit, which
+      # would date every page to the build. The config detects that and drops
+      # lastmod rather than emit a wrong one, so getting this wrong costs the
+      # recrawl hint silently.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
