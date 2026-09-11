@@ -89,7 +89,17 @@ cmd_social() {
 }
 
 cmd_sync() {
-  cp assets/*.gif assets/*.mp4 "$WEB_PUBLIC/" 2>/dev/null || true
+  # The recordings the SITE uses, not every recording in assets/. assets/ is the
+  # whole repo's store and the README pulls from it over raw.githubusercontent,
+  # so a glob here put things into the deploy that no page ever loads — the
+  # HAND-captured herdr GIF went in at 1.1 MB and was fetched by nobody.
+  # Everything in DEMOS is on the landing page as an <video> with a GIF
+  # fallback; anything outside it has to earn its way in by name.
+  for name in $(outputs); do
+    for ext in gif mp4; do
+      [[ -f assets/$name.$ext ]] && cp "assets/$name.$ext" "$WEB_PUBLIC/"
+    done
+  done
   [[ -f assets/og.png ]] && cp assets/og.png "$WEB_PUBLIC/"
   # The favicon is the mark, so it is a copy of assets/icon.svg rather than its
   # own drawing. Synced here for the same reason og.png is: the site serves from
@@ -137,6 +147,17 @@ cmd_check() {
     if [[ -f assets/$name.gif && -f assets/$name.mp4 && assets/$name.gif -nt assets/$name.mp4 ]]; then
       echo "  STALE   assets/$name.mp4 is older than its GIF"; bad=1
     fi
+  done
+
+  # ...and the mirror of that rule, which is what a glob in sync used to break:
+  # media sitting in the deploy that no page loads. web/public is the site's
+  # payload, so anything here that DEMOS did not put here is weight the visitor
+  # downloads nothing for.
+  for f in "$WEB_PUBLIC"/*.gif "$WEB_PUBLIC"/*.mp4; do
+    [[ -e $f ]] || continue
+    local n; n=$(basename "$f"); n=${n%.*}
+    outputs | grep -qx "$n" ||
+      { echo "  UNUSED  $f is in the deploy but not in DEMOS"; bad=1; }
   done
 
   # Anything in assets/ that no tape produces.
