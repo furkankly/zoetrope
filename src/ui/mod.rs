@@ -280,6 +280,7 @@ fn spawn_mark(provider: Option<crate::provider::Provider>) -> (&'static str, Col
     match provider {
         Some(Provider::Claude) => ("❋ ", Color::Indexed(173)),
         Some(Provider::Codex) => ("❂ ", Color::Indexed(36)),
+        Some(Provider::Pi) => ("✺ ", Color::Indexed(141)),
         None => ("✦ ", Color::Indexed(252)),
     }
 }
