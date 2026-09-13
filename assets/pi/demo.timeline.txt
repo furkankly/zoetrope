@@ -1,0 +1,6 @@
+2026-01-01T00:00:00.100+00:00  Agent@main Model@main
+2026-01-01T00:00:00.200+00:00  Activity@main
+2026-01-01T00:00:01+00:00  Prompt@main
+2026-01-01T00:00:02+00:00  Model@main Tokens@main Reasoning@main ToolStart@main
+2026-01-01T00:00:02.500+00:00  ToolEnd@main
+2026-01-01T00:00:03+00:00  Model@main Tokens@main Reasoning@main

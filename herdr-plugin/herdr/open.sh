@@ -20,5 +20,13 @@ fi
 
 # The pane's agent is running, so ride the live edge; space and the scrubber
 # go back.
+#
+# Splitting `target` on the first space stays correct even though the second
+# field can be an absolute path (omp, pi), which this box's transcripts never
+# put a space in, but which is not guaranteed in general: the agent token
+# from resolve.sh never contains a space, so "%% *" (longest suffix match
+# from the first space on) yields exactly the agent, and "#* " (shortest
+# prefix match up to that same space) yields everything after it verbatim,
+# spaces and all.
 zoe --provider "${target%% *}" --follow "${target#* }" \
   || die "zoe exited with status $? (zoe --provider ${target%% *} --follow ${target#* })"

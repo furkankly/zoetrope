@@ -2,28 +2,29 @@
 
 [Herdr](https://herdr.dev) runs coding agents in panes and knows which session
 each pane is running. This plugin asks it, then opens that session in `zoe` as
-a live flow graph, without you naming a file or an id. Claude Code and Codex
-panes both work.
+a live flow graph, without you naming a file or an id. Claude Code, Codex, omp
+and pi panes all work.
 
 ## Installation
 
 ```bash
-herdr integration install claude          # and/or: herdr integration install codex
+herdr integration install claude          # and/or: codex, omp, pi
 herdr plugin install furkankly/zoetrope/herdr-plugin
 herdr plugin action invoke setup-keys --plugin furkankly.zoetrope
 ```
 
-**The integration** is what makes the rest possible. It adds a `SessionStart`
-hook to the agent, so Herdr learns the native session id of whatever runs in a
-pane. Without it Herdr knows a pane holds Claude Code but not which session,
-and the plugin has nothing to open. An agent already running when you install
-it never reports one, so start it again. `herdr integration status` lists what
-is installed.
+**The integration** is what makes the rest possible. It adds a hook or
+extension to the agent, so Herdr learns which session is running in a pane —
+the native id for Claude Code and Codex, the transcript path for omp and pi,
+since their own extension already knows it. Without it Herdr knows a pane
+holds an agent but not its session, and the plugin has nothing to open. An
+agent already running when you install it never reports one, so start it
+again. `herdr integration status` lists what is installed.
 
 **The plugin install** checks that a `zoe` new enough to open a session by id
-is on `PATH`, and installs one with Homebrew or cargo when it is missing. An
-older `zoe` is reported with the upgrade commands, never replaced. `jq` is
-needed as well.
+or path is on `PATH`, and installs one with Homebrew or cargo when it is
+missing. An older `zoe` is reported with the upgrade commands, never replaced.
+`jq` is needed as well.
 
 **The key step** writes one marked block into your Herdr config, since plugins
 cannot ship keys in their manifest. It backs the file up first, never takes a
@@ -71,8 +72,8 @@ The pane says why and waits for you to press enter, rather than closing on you:
 
 | Herdr reports | What you see |
 | --- | --- |
-| an id for a `claude` or `codex` pane | the graph |
-| an agent but no session id | how to install the integration, and why the agent has to be restarted |
+| an id or path for a `claude`, `codex`, `omp` or `pi` pane | the graph |
+| an agent but no session yet | how to install the integration, and why the agent has to be restarted |
 | no agent in the pane | a line saying to focus an agent pane |
 | an agent zoetrope does not read | the same, naming the agent |
 

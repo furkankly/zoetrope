@@ -1,0 +1,14 @@
+  ◌ [main] omp  (idle) — id=main
+      model: anthropic/claude-opus-5
+      tools: 1 (1✓ 0✗ 0⏳)   tokens: 54
+    ✓ [subagent] reviewer  (done) — id=Reviewer
+        model: anthropic/claude-opus-5
+        tools: 1 (1✓ 0✗ 0⏳)   tokens: 14
+        ↳ prompt: Please review the diff and check the tests.
+        ↳ thought: I should fan out a reviewer and a scout.
+    ■ [subagent] scout  (stopped) — id=Helper
+        model: anthropic/claude-sonnet-5
+        tools: 1 (1✓ 0✗ 0⏳)   tokens: 5
+    ✓ [subagent] __sidecar  (done) — id=__sidecar
+        model: anthropic/claude-haiku-5
+        tools: 0 (0✓ 0✗ 0⏳)   tokens: 4

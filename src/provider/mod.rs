@@ -55,7 +55,10 @@
 //!
 //! A provider's own shape follows its format: the Claude stream carries one
 //! inherited timestamp, the Codex stream learns whose file it is from the
-//! first line. Both are expected, not deviations.
+//! first line. Both are expected, not deviations. omp and pi go one step
+//! further: they write the same wire format, so `Provider::Omp` and
+//! `Provider::Pi` both point at one directory, `provider/pi/` — two roots
+//! and two `project_key` rules over one set of records, not two parsers.
 //!
 //! This contract covers agents that write one append-only file per thread.
 //! An agent that rewrites a document per turn would add a document push
@@ -73,6 +76,7 @@ use crate::fact::Statement;
 // browser frontend goes through `tailer::Bundle`.
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod pi;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -85,16 +89,20 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    Omp,
+    Pi,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 4] = [Provider::Claude, Provider::Codex, Provider::Omp, Provider::Pi];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Omp => "omp",
+            Provider::Pi => "pi",
         }
     }
 
@@ -116,6 +124,8 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    /// Serves both `Provider::Omp` and `Provider::Pi` (see `pi`'s module doc).
+    Pi(pi::Stream),
 }
 
 impl Stream {
@@ -125,13 +135,24 @@ impl Stream {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::Pi(s) => s.push(line),
         }
     }
 }
 
 /// Which provider wrote this text, from its first record. Content, never a
-/// path or an extension: a Codex line carries a `payload`, a Claude line a
-/// `type` at the top level and nothing else this looks at.
+/// path or an extension. Discriminators, measured against real transcripts
+/// and checked not to collide:
+///
+/// - Codex: `type: "session_meta"`, or any record with a `payload`.
+/// - omp: line 1 is always its own title header, `{type: "title", pad, ...}`.
+/// - pi: line 1 is its session header, `{type: "session", version, cwd}`.
+/// - Claude: a top-level `type` alongside `sessionId` or `uuid` — the fields
+///   every Claude entry envelope carries and omp/pi's `id`/`parentId` DAG
+///   never does.
+///
+/// A `type` alone is no longer enough for Claude: that fallback used to
+/// claim any omp/pi record too (see the regression test below).
 pub fn provider_of(head: &str) -> Option<Provider> {
     let line = head.lines().find(|l| !l.trim().is_empty())?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
@@ -140,9 +161,17 @@ pub fn provider_of(head: &str) -> Option<Provider> {
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
     }
-    kind.map(|_| Provider::Claude)
+    if kind == Some("title") && obj.contains_key("pad") {
+        return Some(Provider::Omp);
+    }
+    if kind == Some("session") && obj.contains_key("version") && obj.contains_key("cwd") {
+        return Some(Provider::Pi);
+    }
+    if kind.is_some() && (obj.contains_key("sessionId") || obj.contains_key("uuid")) {
+        return Some(Provider::Claude);
+    }
+    None
 }
-
 // ---------------------------------------------------------------------------
 // What a provider states about a file
 // ---------------------------------------------------------------------------
@@ -340,6 +369,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::Omp | Provider::Pi => pi::discovery::all_paths(self, scope),
         }
     }
 
@@ -348,6 +378,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::Omp | Provider::Pi => pi::discovery::session_file(self, path),
         }
     }
 
@@ -358,6 +389,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::Omp | Provider::Pi => pi::discovery::related_paths(file),
         }
     }
 
@@ -366,16 +398,22 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::Omp => pi::discovery::omp_project_key(cwd),
+            Provider::Pi => pi::discovery::pi_project_key(cwd),
         }
     }
 
     /// [`session_file`](Self::session_file) without a filesystem: the path a
     /// file came with and its first bytes. A Claude file is classified by its
-    /// path, a Codex file by its first line. The browser's way in.
+    /// path, a Codex file by its first line, omp/pi by path like Claude (see
+    /// `pi::discovery`). The browser's way in.
     pub fn session_file_from(self, path: &Path, head: &str) -> Option<SessionFile> {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::Omp | Provider::Pi => {
+                pi::discovery::classify_path(self, path, SystemTime::UNIX_EPOCH)
+            }
         }
     }
 
@@ -384,16 +422,17 @@ impl Provider {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::Omp | Provider::Pi => Stream::Pi(pi::discovery::stream_for(file)),
         }
     }
 
     /// What one of this provider's whole-read sidecars states, once its text
     /// parses. `None` while it does not (a mid-write read) or if the provider
-    /// has no such files.
+    /// has no such files (omp/pi never do — see `pi`'s module doc).
     pub fn sidecar(self, file: &SessionFile, text: &str) -> Option<Statement> {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
-            Provider::Codex => None,
+            Provider::Codex | Provider::Omp | Provider::Pi => None,
         }
     }
 }
@@ -582,6 +621,27 @@ mod tests {
                 r#"{"type":"user","uuid":"u","agentId":"a1","message":{"role":"user","content":"x"}}"#
             ),
             Some(Provider::Claude)
+        );
+        assert_eq!(
+            provider_of(r#"{"type":"title","v":1,"title":"","updatedAt":"t","pad":"   "}"#),
+            Some(Provider::Omp),
+            "omp: line 1 is its title header with `pad`"
+        );
+        assert_eq!(
+            provider_of(r#"{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/tmp"}"#),
+            Some(Provider::Pi),
+            "pi: line 1 is a session header with `version`/`cwd`, no `sessionId`/`uuid`"
+        );
+        // Regression: `type` alone used to fall back to Claude for anything
+        // Codex didn't claim, so an omp/pi record with no Claude envelope
+        // field (`sessionId`/`uuid`) was silently misread as Claude instead
+        // of being rejected. A bare `type` must now yield no provider.
+        assert_eq!(
+            provider_of(
+                r#"{"type":"custom","id":"x","parentId":null,"timestamp":"t","customType":"y","data":{}}"#
+            ),
+            None,
+            "a type with no provider-specific envelope field must not default to Claude"
         );
         assert_eq!(provider_of(r#"{"agentType":"guide"}"#), None);
         assert_eq!(provider_of("not json"), None);

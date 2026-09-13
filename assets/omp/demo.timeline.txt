@@ -1,0 +1,21 @@
+2026-01-01T00:00:00.200+00:00  Agent@main Model@main
+2026-01-01T00:00:00.300+00:00  Activity@main
+2026-01-01T00:00:01+00:00  Prompt@main
+2026-01-01T00:00:02+00:00  Model@main Tokens@main Reasoning@main ToolStart@main Spawn@main Agent@Reviewer
+2026-01-01T00:00:02.050+00:00  Activity@main
+2026-01-01T00:00:03.200+00:00  Agent@Reviewer Model@Reviewer
+2026-01-01T00:00:03.300+00:00  Activity@Reviewer
+2026-01-01T00:00:03.400+00:00  Agent@Reviewer
+2026-01-01T00:00:03.410+00:00  Agent@Helper Agent@Helper
+2026-01-01T00:00:03.500+00:00  Activity@Reviewer
+2026-01-01T00:00:10+00:00  Agent@__sidecar Model@__sidecar Tokens@__sidecar Reasoning@__sidecar
+2026-01-01T00:01:00+00:00  Model@Reviewer Tokens@Reviewer ToolStart@Reviewer
+2026-01-01T00:01:01+00:00  ToolEnd@Reviewer
+2026-01-01T00:02:00+00:00  Model@Helper Tokens@Helper ToolStart@Helper
+2026-01-01T00:02:01+00:00  ToolEnd@Helper
+2026-01-01T00:03:00+00:00  Ended@Helper
+2026-01-01T00:04:00+00:00  Model@Reviewer Tokens@Reviewer Reasoning@Reviewer
+2026-01-01T00:04:30+00:00  Ended@Reviewer
+2026-01-01T00:05:00+00:00  ToolEnd@main
+2026-01-01T00:05:02+00:00  Model@main Tokens@main Reasoning@main
+2026-01-01T00:05:03+00:00  Activity@main
