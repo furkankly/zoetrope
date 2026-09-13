@@ -1,0 +1,2 @@
+$ cargo test
+test result: ok. 4 passed

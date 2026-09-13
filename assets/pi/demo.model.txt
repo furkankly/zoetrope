@@ -1,0 +1,3 @@
+  ◌ [main] pi  (idle) — id=main
+      model: claude-opus-5
+      tools: 1 (1✓ 0✗ 0⏳)   tokens: 20

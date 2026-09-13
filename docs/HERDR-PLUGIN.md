@@ -17,15 +17,20 @@ Herdr's render loop, and nothing about the graph is written twice.
 
 [DISCOVERY.md](DISCOVERY.md) fixed the input side: a provider states what a file
 is, the core decides what a session is, and a feeder reaches it through `open`.
-The plugin is the case `Target::Id` was written for. The id is known, the file
-is not, and finding the file is the core's job across every provider's roots.
+The plugin is the case `Target::Id` was written for: an agent's own
+integration reports a session id, the file is not, and finding the file is
+the core's job across every provider's roots. omp and pi report a path
+instead, because their integration already knows the transcript file; that
+lands in `Target::Path`, the case the plain CLI uses for an explicit file.
+Either way the core already knows what to do with it, so the bridge never
+special-cases the kind.
 
 That is the whole reason the bridge stays small. It never reads a transcript,
 never learns a layout, and never guesses a project from a working directory. It
-resolves one pair, `(agent, session id)`, and spends it on one command:
+resolves one pair, `(agent, session id or path)`, and spends it on one command:
 
 ```
-zoe --provider <agent> --follow <id>
+zoe --provider <agent> --follow <id-or-path>
 ```
 
 `--provider` narrows the lookup to the agent Herdr named. `--follow` is right
@@ -37,7 +42,7 @@ by definition here, since the pane's agent is running.
 |---|---|
 | `herdr/pane.sh` | all three actions (`open`, `open-split`, `open-tab`), differing only in the placement they pass. Opens the graph pane, or closes it when the graph is the focused pane, which is what makes the key a toggle |
 | `herdr/open.sh` | the pane command. Resolves the session and execs `zoe` |
-| `herdr/resolve.sh` | asks `pane.get` about the focused pane, prints `<agent> <session-id>`, or exits with the reason |
+| `herdr/resolve.sh` | asks `pane.get` about the focused pane, prints `<agent> <session-id-or-path>`, or exits with the reason |
 | `herdr/keys.sh` | the `setup-keys` / `remove-keys` actions |
 | `herdr/ensure-zoe.sh` | the `[[build]]` step: is a usable `zoe` on `PATH` |
 
@@ -127,8 +132,10 @@ socket docs at v0.9.0, and live responses.
 - `AgentSessionInfo` is `{source, agent, kind, value}`, all required, and the
   whole object is absent until an integration reports a session.
 - `AgentSessionRefKind` is `"id"` or `"path"`. Herdr maps `herdr:claude` and
-  `herdr:codex` to an id, reported by each agent's `SessionStart` hook; `pi` and
-  `omp` store a path, and zoetrope does not read those agents.
+  `herdr:codex` to an id, reported by each agent's `SessionStart` hook;
+  `herdr:omp` and `herdr:pi` map to a path instead, since their own
+  integration extension already knows the transcript file and there is
+  nothing left to look up. `resolve.sh` hands either kind to `zoe` unchanged.
 - `PluginInvocationContext` is flat: `focused_pane_id`, `focused_pane_agent`,
   `focused_pane_cwd`, `focused_pane_status`, `workspace_cwd`, and so on.
 - Action `contexts` are `global`, `workspace`, `tab`, `pane`, `selection`,

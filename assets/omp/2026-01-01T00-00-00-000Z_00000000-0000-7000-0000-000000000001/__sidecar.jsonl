@@ -1,0 +1,3 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-01-01T00:00:03.020Z","pad":"   "}
+{"type":"session","version":3,"id":"00000000-0000-7000-0000-000000000097","timestamp":"2026-01-01T00:00:03.120Z","cwd":"/tmp/demo"}
+{"type":"message","id":"sa1","parentId":null,"timestamp":"2026-01-01T00:00:10.000Z","message":{"role":"assistant","api":"messages","provider":"anthropic","model":"anthropic/claude-haiku-5","content":[{"type":"text","text":"Reminder: two tasks are still open."}],"usage":{"output":4},"responseId":"resp-s1","stopReason":"stop","timestamp":"2026-01-01T00:00:10.000Z"}}

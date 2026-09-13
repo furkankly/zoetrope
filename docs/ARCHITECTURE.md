@@ -8,8 +8,9 @@ reasoning that governs how those pieces are allowed to behave.
 The whole program solves one hard problem:
 
 > Reconstruct a faithful, navigable, live-or-replayed picture of a coding-agent
-> session (Claude Code, Codex) from an **undocumented, append-only, partially-timestamped,
-> multi-file** transcript — in which **completion is frequently unknowable**.
+> session (Claude Code, Codex, omp, pi) from an **undocumented, append-only,
+> partially-timestamped, multi-file** transcript — in which **completion is
+> frequently unknowable**.
 
 Almost every design decision below is downstream of that one sentence.
 
