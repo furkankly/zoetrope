@@ -30,6 +30,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
+#[cfg(feature = "native")]
+pub mod db;
 pub mod discovery;
 pub mod wire;
 

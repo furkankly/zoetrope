@@ -20,6 +20,19 @@ use std::time::SystemTime;
 use super::wire::{TaskRow, is_root_head};
 use crate::provider::{FileRole, Provider, ReadMode, Scope, SessionFile};
 
+/// The Bob home: `~/.bob`. Only a feeder reads what is there.
+#[cfg(feature = "native")]
+pub fn bob_home() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".bob"))
+}
+
+/// The database under a Bob home.
+#[cfg(feature = "native")]
+pub fn db_path(home: &Path) -> PathBuf {
+    home.join("db").join("bob.db")
+}
+
 /// Nothing to walk: exports are kept wherever the user wrote them, and
 /// stored sessions are rows, listed by the row feeder.
 pub fn all_paths(_scope: &Scope) -> Vec<PathBuf> {

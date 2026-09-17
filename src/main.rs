@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use zoetrope::provider::{Provider, ReadMode, Target, open};
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
+use zoetrope::tailer::rows::RowSource;
 use zoetrope::tailer::{TailRequest, UiEvent};
 use zoetrope::{tailer, tui};
 
@@ -66,7 +67,7 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
-    zoe --provider <name>   force the format (claude, codex) instead of detecting it
+    zoe --provider <name>   force the format (claude, codex, bob) instead of detecting it
     zoe inspect <file|id>   headless: print the session tree + info
     zoe --version           print the version and exit
 
@@ -83,12 +84,13 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
             .ok_or_else(|| anyhow!("--provider requires a name\n\n{USAGE}"))?;
         Provider::parse(&v)
             .map(Some)
-            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex"))
+            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex, bob"))
     };
 
-    // `inspect <file>` is the one distinct (headless) subcommand.
-    if args.peek().map(String::as_str) == Some("inspect") {
-        args.next();
+    // `inspect` is the headless subcommand: one target, an optional provider.
+    let sub = args.peek().map(String::as_str);
+    if matches!(sub, Some("inspect")) {
+        let name = args.next().unwrap_or_default();
         let mut target: Option<String> = None;
         let mut provider = None;
         while let Some(arg) = args.next() {
@@ -97,14 +99,14 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                 other if other.starts_with('-') => bail!("unknown flag {other:?}\n\n{USAGE}"),
                 _ => {
                     if target.is_some() {
-                        bail!("inspect takes a single target argument\n\n{USAGE}");
+                        bail!("{name} takes a single target argument\n\n{USAGE}");
                     }
                     target = Some(arg);
                 }
             }
         }
         let target = target.ok_or_else(|| {
-            anyhow!("inspect requires a file, a session id or a directory\n\n{USAGE}")
+            anyhow!("{name} requires a file, a session id or a directory\n\n{USAGE}")
         })?;
         return Ok(Cli::Inspect { target, provider });
     }
@@ -181,9 +183,22 @@ fn parse_session_fully(
     // Order is not critical — the model is fold-order independent — so files
     // go in as the session lists them, root first.
     for f in session.every_file() {
+        // A stored session: its rows, as the lines the same stream reads.
+        if f.read == ReadMode::Rows {
+            let mut stream = p.stream_for(f);
+            for statement in RowSource::new(f)
+                .poll()
+                .iter()
+                .filter_map(|l| stream.push(l))
+            {
+                apply(statement);
+            }
+            continue;
+        }
         let text = std::fs::read_to_string(&f.path)
             .with_context(|| format!("reading {}", f.path.display()))?;
         match f.read {
+            ReadMode::Rows => unreachable!("handled above"),
             ReadMode::Tail => {
                 let mut stream = p.stream_for(f);
                 for statement in text.lines().filter_map(|l| stream.push(l)) {

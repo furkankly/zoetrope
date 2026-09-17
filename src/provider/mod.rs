@@ -57,10 +57,13 @@
 //! inherited timestamp, the Codex stream learns whose file it is from the
 //! first line. Both are expected, not deviations.
 //!
-//! This contract covers agents that write one append-only file per thread.
-//! An agent that rewrites a document per turn would add a document push
-//! beside `Stream::push`; one that keeps a database is a different kind of
-//! feeder, not a wider `SessionFile`.
+//! This contract covers agents that write one append-only file per thread,
+//! and one that keeps a database: Bob's rows reach the same `Stream::push`
+//! as JSON lines, one per row, read by a native row feeder
+//! (`provider/bob/db.rs`) instead of a file tailer. The feeder is the part
+//! that differs, and [`ReadMode::Rows`] is how a root says so. An agent that
+//! rewrites a document per turn would add a document push beside
+//! `Stream::push`; see `docs/DISCOVERY.md` §7.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -185,11 +188,17 @@ pub enum FileRole {
     Sidecar,
 }
 
-/// How a file is read: line by line as it grows, or whole, once it parses.
+/// How a file is read: line by line as it grows, whole once it parses, or
+/// as rows of a database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadMode {
     Tail,
     Whole,
+    /// The path is a database and the session is rows in it, keyed by
+    /// `session`. Only a root is read this way, and only the native row
+    /// feeder can: it presents the rows as lines to the same `Stream`. Never
+    /// produced without the `native` feature.
+    Rows,
 }
 
 /// What the core assembles from files. Never produced by a provider.
@@ -355,6 +364,24 @@ impl Provider {
         }
     }
 
+    /// Every session this provider keeps somewhere other than files, as the
+    /// root each is read from. Bob's database; nothing for the others, and
+    /// nothing without the `native` feature, since only a feeder reads rows.
+    pub fn stored_sessions(self, scope: &Scope) -> Vec<SessionFile> {
+        match self {
+            #[cfg(feature = "native")]
+            Provider::Bob => bob::discovery::bob_home()
+                .map(|home| bob::db::sessions(&bob::discovery::db_path(&home), scope))
+                .unwrap_or_default(),
+            #[cfg(not(feature = "native"))]
+            Provider::Bob => {
+                let _ = scope;
+                Vec::new()
+            }
+            Provider::Claude | Provider::Codex => Vec::new(),
+        }
+    }
+
     /// What is this file? Which session, which role, which project.
     pub fn session_file(self, path: &Path) -> Option<SessionFile> {
         match self {
@@ -474,6 +501,7 @@ pub fn sweep(scope: &Scope, only: Option<Provider>) -> Vec<Session> {
                 files.push(f);
             }
         }
+        files.extend(p.stored_sessions(scope));
     }
     assemble(files)
         .into_iter()
