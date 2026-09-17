@@ -71,6 +71,7 @@ use crate::fact::Statement;
 // the vocabulary in `fact`, and how it finds its files is the primitives on
 // `Provider` below. Nothing outside needs the parsers themselves, and the
 // browser frontend goes through `tailer::Bundle`.
+pub(crate) mod bob;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod summary;
@@ -85,16 +86,18 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    Bob,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Bob];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Bob => "bob",
         }
     }
 
@@ -116,6 +119,9 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    /// Boxed: its join tables make it several times the size of the others,
+    /// and one lives per tailed file.
+    Bob(Box<bob::Stream>),
 }
 
 impl Stream {
@@ -125,17 +131,22 @@ impl Stream {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::Bob(s) => s.push(line),
         }
     }
 }
 
 /// Which provider wrote this text, from its first record. Content, never a
-/// path or an extension: a Codex line carries a `payload`, a Claude line a
-/// `type` at the top level and nothing else this looks at.
+/// path or an extension: a Bob line is a database row (`table` and `row`),
+/// a Codex line carries a `payload`, a Claude line a `type` at the top level
+/// and nothing else this looks at.
 pub fn provider_of(head: &str) -> Option<Provider> {
     let line = head.lines().find(|l| !l.trim().is_empty())?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let obj = v.as_object()?;
+    if obj.get("table").is_some_and(|t| t.is_string()) && obj.contains_key("row") {
+        return Some(Provider::Bob);
+    }
     let kind = obj.get("type").and_then(|t| t.as_str());
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
@@ -340,6 +351,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::Bob => bob::discovery::all_paths(scope),
         }
     }
 
@@ -348,6 +360,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::Bob => bob::discovery::session_file(path),
         }
     }
 
@@ -358,6 +371,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::Bob => bob::discovery::related_paths(file),
         }
     }
 
@@ -366,16 +380,18 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::Bob => bob::discovery::project_key(cwd),
         }
     }
 
     /// [`session_file`](Self::session_file) without a filesystem: the path a
     /// file came with and its first bytes. A Claude file is classified by its
-    /// path, a Codex file by its first line. The browser's way in.
+    /// path, a Codex or Bob file by its first line. The browser's way in.
     pub fn session_file_from(self, path: &Path, head: &str) -> Option<SessionFile> {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::Bob => bob::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
         }
     }
 
@@ -384,6 +400,7 @@ impl Provider {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::Bob => Stream::Bob(Box::new(bob::Stream::new())),
         }
     }
 
@@ -393,7 +410,7 @@ impl Provider {
     pub fn sidecar(self, file: &SessionFile, text: &str) -> Option<Statement> {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
-            Provider::Codex => None,
+            Provider::Codex | Provider::Bob => None,
         }
     }
 }
@@ -536,7 +553,7 @@ fn expand(file: SessionFile) -> Result<Session, OpenError> {
 }
 
 /// The first non-blank line of a file, for [`provider_of`].
-fn read_head(path: &Path) -> Option<String> {
+pub(crate) fn read_head(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
@@ -582,6 +599,10 @@ mod tests {
                 r#"{"type":"user","uuid":"u","agentId":"a1","message":{"role":"user","content":"x"}}"#
             ),
             Some(Provider::Claude)
+        );
+        assert_eq!(
+            provider_of(r#"{"table":"tasks","seen":"created","row":{"id":"a","parent_id":null}}"#),
+            Some(Provider::Bob)
         );
         assert_eq!(provider_of(r#"{"agentType":"guide"}"#), None);
         assert_eq!(provider_of("not json"), None);

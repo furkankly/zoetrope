@@ -18,7 +18,7 @@ edition = "2024"
 # Inherited from ratatui 0.30, which is the floor: nothing in this crate's own
 # source needs anything newer. Verified by the `msrv` job in CI.
 rust-version = "1.88"
-description = "Terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph."
+description = "Terminal UI that visualizes Claude Code, Codex and IBM Bob agent sessions as a live flow graph."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/furkankly/zoetrope"
