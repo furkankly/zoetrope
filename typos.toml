@@ -18,6 +18,6 @@ ratatui = "ratatui"
 seeked = "seeked"
 
 [files]
-# Real Codex captures: opaque call, response and thread ids are full of
-# three-letter "words". Nothing in them is prose we wrote.
-extend-exclude = ["assets/codex/**/*.jsonl"]
+# Real Codex and Bob captures: opaque call, response and thread ids are full
+# of three-letter "words". Nothing in them is prose we wrote.
+extend-exclude = ["assets/codex/**/*.jsonl", "assets/bob/*.jsonl"]

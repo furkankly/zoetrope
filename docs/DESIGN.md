@@ -13,7 +13,7 @@
 
 ## CLI
 
-One TUI command over the unified timeline engine (see the **Timeline** section) plus the headless `inspect`. The launch only picks **defaults** — *what* to open and *where the playhead starts*; once open, scrub / follow / pause / go-live all work regardless.
+One TUI command over the unified timeline engine (see the **Timeline** section) plus the headless `inspect` and `export`. The launch only picks **defaults** — *what* to open and *where the playhead starts*; once open, scrub / follow / pause / go-live all work regardless.
 
 ```
 zoe                      # follow the current project's live session
@@ -24,9 +24,10 @@ zoe <file> --follow      # ride a file's live edge instead of replaying it
 zoe <file> --speed 8     # playback speed (default 8.0)
 zoe --provider codex ... # force the format instead of reading it off the content
 zoe inspect <file|id>    # no TUI: print session info + parsed tree (smoke-test)
+zoe export <id|dir>      # no TUI: a stored (Bob) session as its provider's JSON lines, to stdout
 ```
 
-Resolution goes through `provider::open` (see [DISCOVERY.md](DISCOVERY.md)): a **file** is `Target::Path` and bulk-loads + tails (replay feeder), the provider read off its first record; an **id** is `Target::Id`, looked up across every provider's roots; a **dir** (or none → cwd) is `Target::Here` and follows the newest session of that project, any provider. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<String>, follow: bool, speed: f64, provider: Option<Provider> } | Inspect { file, provider }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
+Resolution goes through `provider::open` (see [DISCOVERY.md](DISCOVERY.md)): a **file** is `Target::Path` and bulk-loads + tails (replay feeder), the provider read off its first record; an **id** is `Target::Id`, looked up across every provider's roots; a **dir** (or none → cwd) is `Target::Here` and follows the newest session of that project, any provider. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<String>, follow: bool, speed: f64, provider: Option<Provider> } | Inspect { target, provider } | Export { target, provider }`. A Bob session has no file to point at: it opens by id or by workspace directory, and `export` writes the file that opens anywhere else (the browser included). Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
 
 ## Workspace layout
 
@@ -88,7 +89,7 @@ getrandom (0.3) + getrandom_v04 (0.4)                      # both, wasm_js backe
 ```
 src/
 ├── lib.rs         # crate root — the portable core shared by the native + browser frontends
-├── main.rs        # native binary + CLI parsing; spawns the tailer task, runs the TUI; the `inspect` subcommand
+├── main.rs        # native binary + CLI parsing; spawns the tailer task, runs the TUI; the `inspect` and `export` subcommands
 ├── tui.rs         # terminal lifecycle + the central native event loop (tick_camera/tick_timeline/status_tick/draw)
 ├── handler.rs     # input routing: app-level keys → App, the rest → the flow; scrubber clicks; process_flow_events
 ├── autopilot.rs   # native-only: the scripted pointer/keystroke pilot behind ZOETROPE_DEMO=1 (see DEMO-ASSETS.md)
@@ -100,10 +101,15 @@ src/
 │   │   ├── mod.rs       # the Claude provider: Entry → Facts (`facts`, `Record`) and the per-file `Stream`; the tool-summary lexicon
 │   │   ├── wire.rs      # Claude's serde model for JSONL entries + meta.json sidecars
 │   │   └── discovery.rs # the ~/.claude/projects layout: cwd sanitization, session / subagent / journal scans, the primitives
-│   └── codex/
-│       ├── mod.rs       # the Codex provider: rollout lines → Facts through a `Stream` that learns its thread from its first line
-│       ├── wire.rs      # Codex's serde model: the envelope, `response_item`, `event_msg` and its `item_completed` items
-│       └── discovery.rs # the ~/.codex/sessions/YYYY/MM/DD layout: rollouts, the head read that classifies them, the primitives
+│   ├── codex/
+│   │   ├── mod.rs       # the Codex provider: rollout lines → Facts through a `Stream` that learns its thread from its first line
+│   │   ├── wire.rs      # Codex's serde model: the envelope, `response_item`, `event_msg` and its `item_completed` items
+│   │   └── discovery.rs # the ~/.codex/sessions/YYYY/MM/DD layout: rollouts, the head read that classifies them, the primitives
+│   └── bob/
+│       ├── mod.rs       # the Bob provider: database rows as JSON lines → Facts; the spawn-call ↔ child-task join, the tool lexicon
+│       ├── wire.rs      # Bob's serde model: a `tasks` or `messages` row per line, the turn's `data` blob (and the child turns a spawn result embeds), `created`/`updated` observations
+│       ├── discovery.rs # ~/.bob/db/bob.db and exports: an export is a root classified by its head; the database names no path
+│       └── db.rs        # (native) the read-only SQLite reader: `sessions` for sweep, `RowSource` for what changed since the last poll
 ├── state/
 │   ├── mod.rs     # App: owns the Flow + SessionModel + Timeline + SessionInfo + UI state; handle_ui_event, seek, camera
 │   ├── session.rs # SessionModel: the pure domain model (agents, statuses, tool calls) folded from Facts — knows no format
@@ -116,7 +122,8 @@ src/
 │   ├── live.rs    # live tailing — one poll loop per session, emits UiEvent::Batch
 │   ├── replay.rs  # replay assembly (native): parse all files up front, merge by ts, then keep tailing
 │   ├── item.rs    # portable replay-stream pieces — ReplayItem (a statement + its Timing), dating, and Bundle (the browser's feeder: files as text in, streams kept for appends); IO-free (wasm)
-│   └── bytes.rs   # incremental byte reader: stat / read-appended / split-on-\n / buffer-partial (pure, testable)
+│   ├── bytes.rs   # incremental byte reader: stat / read-appended / split-on-\n / buffer-partial (pure, testable)
+│   └── rows.rs    # incremental row reader (native): a `ReadMode::Rows` root polled through its provider's RowSource, lines out
 └── ui/
     ├── mod.rs     # draw: canvas + scrubber + status bar; help/info overlays
     ├── nodes.rs   # AgentNode: the agent-card NodeContent (semantic zoom: Card vs Cell)

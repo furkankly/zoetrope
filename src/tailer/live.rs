@@ -21,6 +21,7 @@ use crate::provider::{
 };
 
 use super::bytes::{ReadResult, TailState, read_appended};
+use super::rows::RowSource;
 use super::{Flow, TailRequest, UiEvent};
 
 /// Poll interval for live tailing.
@@ -54,6 +55,9 @@ pub(crate) struct LiveSession {
     /// Tail state for the root file, and the provider stream reading it.
     main_state: TailState,
     main_stream: Stream,
+    /// The root's rows, when the session is stored in a database rather
+    /// than files ([`ReadMode::Rows`]): polled in place of the root file.
+    rows: Option<RowSource>,
     /// Tail state per tracked non-root file, keyed by absolute path, with the
     /// stream reading it. One map (paths are unique) so no agent id can
     /// collide across a provider's directory trees.
@@ -86,6 +90,9 @@ pub(crate) struct SnapshotSeed {
     pub(crate) streams: HashMap<PathBuf, Stream>,
     /// Whole-read sidecars already stated in the bulk stream.
     pub(crate) seen_whole: HashSet<PathBuf>,
+    /// The row source the bulk read used, for a stored session: it knows
+    /// which rows it has emitted, which no byte offset could say.
+    pub(crate) rows: Option<RowSource>,
 }
 
 impl LiveSession {
@@ -93,12 +100,14 @@ impl LiveSession {
     /// following for newer sessions; `None` pins this one.
     pub(crate) fn new(session: Session, follow: Option<PathBuf>, only: Option<Provider>) -> Self {
         let main_stream = session.provider.stream_for(&session.root);
+        let rows = (session.root.read == ReadMode::Rows).then(|| RowSource::new(&session.root));
         Self {
             follow,
             only,
             session,
             main_state: TailState::default(),
             main_stream,
+            rows,
             tracked: HashMap::new(),
             seen_whole: HashSet::new(),
             ticks: 0,
@@ -128,6 +137,9 @@ impl LiveSession {
         if let Some(stream) = seed.streams.remove(self.root_path()) {
             self.main_stream = stream;
         }
+        if let Some(rows) = seed.rows.take() {
+            self.rows = Some(rows);
+        }
         self.seed_offsets = seed.offsets;
         self.seed_streams = seed.streams;
         self.seen_whole = seed.seen_whole;
@@ -152,7 +164,17 @@ impl LiveSession {
 
     /// The target that re-attaches this same session from scratch.
     fn reattach(&self) -> Target {
-        Target::Path(self.root_path().to_path_buf())
+        reopen(&self.session)
+    }
+}
+
+/// The target that opens `session` again from scratch: its root file, or
+/// its id for a session stored as rows, which has no path of its own (every
+/// stored session shares its database's path, which names none of them).
+fn reopen(session: &Session) -> Target {
+    match session.root.read {
+        ReadMode::Rows => Target::Id(session.id.clone()),
+        ReadMode::Tail | ReadMode::Whole => Target::Path(session.root.path.clone()),
     }
 }
 
@@ -172,11 +194,10 @@ async fn await_first_session(
         let since = SystemTime::now()
             .checked_sub(SWITCH_LOOKBACK)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        if let Some(root) = sweep(&Scope::project(cwd).since(since), only)
+        if let Some(newest) = sweep(&Scope::project(cwd).since(since), only)
             .into_iter()
             .next()
-            .map(|s| s.root)
-            && let Ok(session) = open(&Target::Path(root.path), only)
+            && let Ok(session) = open(&reopen(&newest), only)
         {
             return Ok(session);
         }
@@ -283,9 +304,14 @@ async fn poll_live(
 ) -> Option<Target> {
     let mut statements: Vec<Statement> = Vec::new();
 
-    // --- root file ---
+    // --- root: the file's appends, or the database's new rows ---
     let root_path = session.root_path().to_path_buf();
-    match read_appended(&root_path, &mut session.main_state) {
+    let root_read = if let Some(rows) = &mut session.rows {
+        ReadResult::Lines(rows.poll())
+    } else {
+        read_appended(&root_path, &mut session.main_state)
+    };
+    match root_read {
         ReadResult::Reset => {
             let _ = ui_tx
                 .send(UiEvent::SessionReset {
@@ -360,10 +386,10 @@ async fn poll_live(
             // session.
             let _ = ui_tx
                 .send(UiEvent::SessionReset {
-                    session_id: newer.id,
+                    session_id: newer.id.clone(),
                 })
                 .await;
-            return Some(Target::Path(newer.root.path));
+            return Some(reopen(&newer));
         }
     }
 
@@ -371,12 +397,13 @@ async fn poll_live(
 }
 
 /// The newest of `candidates` if it is a different session than `current`.
-/// Candidates come newest first from [`sweep`].
+/// Candidates come newest first from [`sweep`]. Compared by identity, not
+/// path: every stored session of a provider shares its database's path.
 fn newer_session(current: &Session, candidates: Vec<Session>) -> Option<Session> {
     candidates
         .into_iter()
         .next()
-        .filter(|s| s.root.path != current.root.path)
+        .filter(|s| (s.provider, &s.id) != (current.provider, &current.id))
 }
 
 /// Read appended bytes from each tracked non-root file through its stream.
@@ -413,6 +440,8 @@ fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) {
             ReadMode::Whole => {
                 emit_whole(provider, file, &mut session.seen_whole, statements);
             }
+            // Only a root is read as rows, and the root is polled above.
+            ReadMode::Rows => {}
         }
     }
 }
@@ -632,6 +661,70 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stored session: the bulk read takes every row through the stream,
+    /// the tail it hands over emits only rows that land after, and a
+    /// rewrite of the rows already read (same ids, new rowids) emits nothing.
+    #[tokio::test]
+    async fn stored_session_replays_then_tails_new_rows_only() {
+        use crate::fact::FactKind;
+        use crate::provider::bob::db::tests::fixture_db;
+        use crate::provider::{FileRole, SessionFile, assemble};
+
+        let db = fixture_db("tail");
+        let root = SessionFile {
+            provider: Provider::Bob,
+            path: db.clone(),
+            session: "root1".into(),
+            role: FileRole::Root,
+            read: ReadMode::Rows,
+            project_key: "/p".into(),
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        let session = assemble(vec![root]).remove(0);
+        let (items, _info, seed) = crate::tailer::replay::build_replay(&session);
+        assert!(seed.rows.is_some(), "the bulk read keeps its row source");
+        assert!(
+            items
+                .iter()
+                .any(|i| i.any(|f| f.agent.as_deref() == Some("child1")
+                    && matches!(f.kind, FactKind::Ended(_)))),
+            "the child's row is read through to its ending"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.any(|f| matches!(f.kind, FactKind::Prompt(_))))
+        );
+
+        let mut live = LiveSession::new(session, None, None);
+        live.seed(seed);
+        assert_eq!(live.reattach(), Target::Id("root1".into()));
+        let (tx, mut rx) = mpsc::channel(32);
+        assert!(poll_live(&mut live, "root1", &tx).await.is_none());
+        assert!(rx.try_recv().is_err(), "nothing new: no batch");
+
+        // A turn lands, and Bob rewrites the earlier rows around it.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DELETE FROM messages WHERE id = 'u1'; \
+             INSERT INTO messages VALUES ('u1', 'root1', 'user', '{\"role\":\"user\",\"content\":\"do it\",\"_meta\":{\"timestamp\":1001}}', 9900); \
+             INSERT INTO messages VALUES ('a2', 'root1', 'assistant', '{\"role\":\"assistant\",\"content\":\"after the replay\",\"_meta\":{\"timestamp\":4000}}', 9900);",
+        )
+        .unwrap();
+        poll_live(&mut live, "root1", &tx).await;
+        let mut said = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let UiEvent::Batch { statements, .. } = ev {
+                said.extend(statements);
+            }
+        }
+        assert_eq!(said.len(), 1, "exactly the new turn is stated");
+        assert!(
+            matches!(&said[0].facts[0].kind, FactKind::Reasoning(t) if t == "after the replay")
+        );
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 
     #[tokio::test]

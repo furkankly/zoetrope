@@ -14,6 +14,7 @@ use crate::provider::{Provider, ReadMode, Session, Stream, Target, open};
 
 use super::item::{ReplayItem, date_and_sort};
 use super::live::{LiveSession, SnapshotSeed, tail_loop};
+use super::rows::RowSource;
 use super::{Flow, TailRequest, UiEvent};
 
 /// Replay feeder: open the session, parse everything on disk, merge by
@@ -108,6 +109,22 @@ pub(crate) fn build_replay(
                 let consumed = parse_file_into(&file.path, &mut stream, &mut items);
                 seed.offsets.insert(file.path.clone(), consumed);
                 seed.streams.insert(file.path.clone(), stream);
+            }
+            // A stored session: every row it has now, through the same
+            // stream. The source remembers what it read, so the follow-up
+            // tail emits only what lands after.
+            ReadMode::Rows => {
+                let mut stream = p.stream_for(file);
+                let mut source = RowSource::new(file);
+                items.extend(
+                    source
+                        .poll()
+                        .iter()
+                        .filter_map(|l| stream.push(l))
+                        .map(ReplayItem::new),
+                );
+                seed.streams.insert(file.path.clone(), stream);
+                seed.rows = Some(source);
             }
             // A whole-read sidecar states its facts once it parses; one that
             // does not yet (mid-write) is left for the follow-up tail to retry.

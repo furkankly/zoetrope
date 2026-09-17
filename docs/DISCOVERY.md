@@ -1,6 +1,6 @@
 # Discovery: how a feeder finds a session
 
-The input side of the provider boundary. [ARCHITECTURE.md](ARCHITECTURE.md) §0 fixed the output side: a provider turns records into `Fact`s and nothing past `src/fact.rs` knows the format. This document fixes the other direction, how a feeder gets from what the user pointed at to a set of files with a stream each, and how a session list gets from the disk to sessions. It was written with two providers in hand, Claude Code and Codex, and checked against the storage of the other agents we know of (§7). The code is `src/provider/mod.rs`.
+The input side of the provider boundary. [ARCHITECTURE.md](ARCHITECTURE.md) §0 fixed the output side: a provider turns records into `Fact`s and nothing past `src/fact.rs` knows the format. This document fixes the other direction, how a feeder gets from what the user pointed at to a set of files with a stream each, and how a session list gets from the disk to sessions. It was written with two providers in hand, Claude Code and Codex, and checked against the storage of the other agents we know of (§7); Bob, whose sessions are rows in a database, was added afterwards along the path §7 laid out. The code is `src/provider/mod.rs`.
 
 The rule, one level above the fact rule:
 
@@ -30,7 +30,7 @@ The browser build has no filesystem and uses neither. It receives every file of 
 ```rust
 // src/provider/mod.rs
 
-pub enum Provider { Claude, Codex }
+pub enum Provider { Claude, Codex, Bob }
 
 /// What a provider states about one path. The input-side analogue of `Fact`.
 pub struct SessionFile {
@@ -38,7 +38,7 @@ pub struct SessionFile {
     pub path: PathBuf,
     pub session: String,        // the session it belongs to
     pub role: FileRole,
-    pub read: ReadMode,         // Tail (line by line as it grows) or Whole (once it parses)
+    pub read: ReadMode,         // Tail (line by line as it grows), Whole (once it parses), or Rows (a database, keyed by `session`)
     pub project_key: String,    // compare with Provider::project_key(cwd), never as a path
     pub modified: SystemTime,
 }
@@ -60,7 +60,7 @@ pub struct Session {
 }
 
 /// One per-file parser. `push` is the whole reading contract.
-pub enum Stream { Claude(claude::Stream), Codex(codex::Stream) }
+pub enum Stream { Claude(claude::Stream), Codex(codex::Stream), Bob(bob::Stream) }
 impl Stream {
     pub fn push(&mut self, line: &str) -> Option<Statement>;
 }
@@ -71,7 +71,7 @@ pub struct Scope { pub project: Option<PathBuf>, pub since: Option<SystemTime>, 
 
 Enums, not traits. Providers arrive by pull request, never from outside the crate, and an exhaustive `match` makes the compiler list every site a new provider must touch. There is no `dyn` anywhere on this path.
 
-`session` is known from any file. Every format seen names the root from every file of a session: Claude by directory, Codex by `session_meta.session_id` on a child's first line. So `assemble` groups by `(provider, session)` and never walks a parent chain. `FileRole::Agent { parent }` keeps the spawner for information; the fact stream states it again with more detail.
+`session` is known from any file. Every format seen names the root from every file of a session: Claude by directory, Codex by `session_meta.session_id` on a child's first line, Bob by the root task row that heads an export or by the task id a stored session is read under. So `assemble` groups by `(provider, session)` and never walks a parent chain. `FileRole::Agent { parent }` keeps the spawner for information; the fact stream states it again with more detail.
 
 ---
 
@@ -79,22 +79,23 @@ Enums, not traits. Providers arrive by pull request, never from outside the crat
 
 Each provider implements these in `src/provider/<name>/discovery.rs`, about its own layout only. The core calls them through `impl Provider`, one `match` per method.
 
-| Primitive | Question it answers | Claude Code | Codex |
-|---|---|---|---|
-| `provider_of(head: &str) -> Option<Provider>` (free function) | Which provider wrote this text? Reads the first record. | a top-level `type` and no `payload` | first record is `type: "session_meta"`, or any record with a `payload` |
-| `all_paths(scope) -> Vec<PathBuf>` | Every path that could be a session file, across the provider's roots. Prunes by the scope where the layout lets it. | `~/.claude/projects/*/<uuid>.jsonl`, roots only; a project scope narrows to one directory, `since` filters by mtime, an id prefix by file stem | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, roots and children; `since` drops whole day directories, an id prefix keeps the rollouts whose name ends in a matching thread id (the root's name carries the session id); a project scope cannot prune, the project is inside the file |
-| `session_file(path) -> Option<SessionFile>` | What is this file? Which session, which role, which project, how is it read. | by path: a `.jsonl` in a project directory is `Root`; `<uuid>/subagents/agent-*.jsonl` and `subagents/workflows/<wf>/agent-*.jsonl` are `Agent`; `*.meta.json` is `Sidecar` read `Whole`; `workflows/<wf>/journal.jsonl` is `Sidecar` read `Tail` | by content: the file's own `session_meta`. `thread_source: "user"` is `Root`; `"subagent"` is `Agent { parent: source.subagent.thread_spawn.parent_thread_id }` with `session = session_id` |
-| `related_paths(file) -> Vec<PathBuf>` | Where can the rest of this file's session be, root included when `file` is not it? | the root beside the `<uuid>` directory and everything under `<uuid>/subagents/` | from a root: rollouts between its day and the day of its last write, since a child is spawned while the root runs and the root writes after every spawn; from a child: every rollout in the tree, the root may be in an earlier day |
-| `project_key(cwd) -> String` | How does this provider name a project? | `sanitize_cwd(cwd)`, the directory name under `projects/` | the path itself, as `session_meta.cwd` records it |
-| `stream_for(file) -> Stream` | A parser for a tailed file, with whatever cross-line state the format needs | `claude::Stream` over `Source::Main`, `Sub(agent)`, or `Ledger(wf)`, derived from the path; state: the inherited timestamp, and whether the root has been stated | `codex::Stream`; state: the thread id, the root id, the ordinal below which the file is replayed parent history |
-| `sidecar(file, text) -> Option<Statement>` | What does a whole-read sidecar state, once its text parses? | `agent-<id>.meta.json`: the agent's birth, `Stream::meta` | none |
-| `session_file_from(path, head) -> Option<SessionFile>` | `session_file` without a filesystem: the path a file came with and its first bytes | by path, as `session_file` | by the first line, as `session_file` |
+| Primitive | Question it answers | Claude Code | Codex | Bob |
+|---|---|---|---|---|
+| `provider_of(head: &str) -> Option<Provider>` (free function) | Which provider wrote this text? Reads the first record. | a top-level `type` and no `payload` | first record is `type: "session_meta"`, or any record with a `payload` | a `table` and a `row`: a database row as a line |
+| `all_paths(scope) -> Vec<PathBuf>` | Every path that could be a session file, across the provider's roots. Prunes by the scope where the layout lets it. | `~/.claude/projects/*/<uuid>.jsonl`, roots only; a project scope narrows to one directory, `since` filters by mtime, an id prefix by file stem | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, roots and children; `since` drops whole day directories, an id prefix keeps the rollouts whose name ends in a matching thread id (the root's name carries the session id); a project scope cannot prune, the project is inside the file | none: exports are wherever the user wrote them |
+| `stored_sessions(scope) -> Vec<SessionFile>` | Every session kept somewhere other than files, as the root it is read from. Native only: a feeder reads rows. | none | none | one `Root` read `Rows` per top-level task in `~/.bob/db/bob.db`; an id prefix and `since` prune in the query, `modified` is the latest `updated_at` of the task and its direct children (the feeder itself reads the tree to any depth) |
+| `session_file(path) -> Option<SessionFile>` | What is this file? Which session, which role, which project, how is it read. | by path: a `.jsonl` in a project directory is `Root`; `<uuid>/subagents/agent-*.jsonl` and `subagents/workflows/<wf>/agent-*.jsonl` are `Agent`; `*.meta.json` is `Sidecar` read `Whole`; `workflows/<wf>/journal.jsonl` is `Sidecar` read `Tail` | by content: the file's own `session_meta`. `thread_source: "user"` is `Root`; `"subagent"` is `Agent { parent: source.subagent.thread_spawn.parent_thread_id }` with `session = session_id` | by content: a `.jsonl` whose first line is a root task row (`table: "tasks"`, `parent_id` null) is that session's `Root`, read `Tail`. The database is not a session file: it names no session |
+| `related_paths(file) -> Vec<PathBuf>` | Where can the rest of this file's session be, root included when `file` is not it? | the root beside the `<uuid>` directory and everything under `<uuid>/subagents/` | from a root: rollouts between its day and the day of its last write, since a child is spawned while the root runs and the root writes after every spawn; from a child: every rollout in the tree, the root may be in an earlier day | none: an export is one file, a stored session one set of rows |
+| `project_key(cwd) -> String` | How does this provider name a project? | `sanitize_cwd(cwd)`, the directory name under `projects/` | the path itself, as `session_meta.cwd` records it | the path itself, as `env.workspace` records it |
+| `stream_for(file) -> Stream` | A parser for a tailed file, with whatever cross-line state the format needs | `claude::Stream` over `Source::Main`, `Sub(agent)`, or `Ledger(wf)`, derived from the path; state: the inherited timestamp, and whether the root has been stated | `codex::Stream`; state: the thread id, the root id, the ordinal below which the file is replayed parent history | `bob::Stream`; state: the root task id, the spawning calls by id and by prompt, the child rows by title, results waiting for a child row (a spawn's result names its child; the feeder lifts the transcript it carries out as the child's own turns, and a result without the name keeps it nested and is joined by prompt), each child's last token total |
+| `sidecar(file, text) -> Option<Statement>` | What does a whole-read sidecar state, once its text parses? | `agent-<id>.meta.json`: the agent's birth, `Stream::meta` | none | none |
+| `session_file_from(path, head) -> Option<SessionFile>` | `session_file` without a filesystem: the path a file came with and its first bytes | by path, as `session_file` | by the first line, as `session_file` | by the first line, as `session_file` |
 
 Three things these answers show:
 
 - **`project_key` is opaque.** Claude stores a lossy sanitized path, Codex the path, other agents a hash. The core never compares a key to a directory; it compares a key to `project_key(cwd)`.
 - **`related_paths` may over-include.** A Codex date directory holds every session of that day; `session_file` on each path sorts them out. Over-include on layout, let content decide.
-- **`ReadMode` exists because Claude's `meta.json` is one JSON document with no trailing newline.** A line tailer never sees a complete line of it. Whole-read files are read in full each tick until they parse (a mid-write read fails and is retried), then stated once.
+- **`ReadMode` exists because Claude's `meta.json` is one JSON document with no trailing newline.** A line tailer never sees a complete line of it. Whole-read files are read in full each tick until they parse (a mid-write read fails and is retried), then stated once. `Rows` is the third way to read: the path is a database, the session is the rows under `session`, and the native row feeder (`tailer/rows.rs` over the provider's `db.rs`) turns what changed since the last tick into lines for the same stream an export goes through. The database rewrites a session's message rows when it ends or is reopened (new rowids, every `created_at` restamped), so the reader keys messages by id, task rows by `(status, updated_at, costs)`, and takes a turn's time from inside its blob.
 
 ---
 
@@ -108,7 +109,7 @@ Four functions, provider-agnostic, in `src/provider/mod.rs`:
 pub fn assemble(files: Vec<SessionFile>) -> Vec<Session>
 
 pub fn sweep(scope: &Scope, only: Option<Provider>) -> Vec<Session> {
-    // every provider (or `only`): all_paths(scope) → session_file → assemble → scope.admits
+    // every provider (or `only`): all_paths(scope) → session_file, plus stored_sessions(scope) → assemble → scope.admits
 }
 
 pub fn open(target: &Target, only: Option<Provider>) -> Result<Session, OpenError> {
@@ -140,9 +141,10 @@ What used to be five feeder sites naming `claude::` are these calls. The live ta
 
 ## 5. The feeders after this
 
-- **Replay and follow** (`tailer/replay.rs`, `tailer/live.rs`): `open`, then one `Stream` per tailed file and one `sidecar` statement per whole-read file. Every tick: read appended bytes through each stream, `rescan` for files that appeared, state sidecars that now parse. `Flow::Switch { target, follow }` carries the working directory being followed, so a re-attach after truncation keeps following and a named file or id stays pinned.
+- **Replay and follow** (`tailer/replay.rs`, `tailer/live.rs`): `open`, then one `Stream` per tailed file and one `sidecar` statement per whole-read file. Every tick: read appended bytes through each stream, `rescan` for files that appeared, state sidecars that now parse. A root read `Rows` is polled through its `RowSource` (`tailer/rows.rs`) in place of the byte reader, the source remembering which rows it has emitted; it re-attaches and auto-switches by id, since every stored session shares the database's path. `Flow::Switch { target, follow }` carries the working directory being followed, so a re-attach after truncation keeps following and a named file or id stays pinned.
+- **`export`** (`main.rs`): `open`, then the root's `RowSource` polled once, its lines to stdout. The file it writes is what the browser and the fixture read; a session kept as files needs none.
 - **`inspect`** (`main.rs`): `open`, read every file, fold. Session-level facts go to the info header whichever record carried them (a Codex root names itself and its app on one line; `Statement::take_session_meta` splits it).
-- **The browser** (`web/wasm`): no filesystem. The page reads files (a drop, an upload, or a directory it may keep re-reading) and passes `[{path, text}]` to `zoetrope_load`; `tailer::Bundle` does the rest through `session_file_from`, `stream_for` and `sidecar`, and `zoetrope_append` continues the same streams. The page's own job is finding files: Claude by the `<uuid>.jsonl` and `<uuid>/subagents/` layout, Codex by reading each rollout's first line, which is `session_file`'s logic written a second time in JavaScript because the page cannot call it before the files are read.
+- **The browser** (`web/wasm`): no filesystem. The page reads files (a drop, an upload, or a directory it may keep re-reading) and passes `[{path, text}]` to `zoetrope_load`; `tailer::Bundle` does the rest through `session_file_from`, `stream_for` and `sidecar`, and `zoetrope_append` continues the same streams. A Bob session reaches it as the file `zoe export` wrote; the database itself never does. The page's own job is finding files: Claude by the `<uuid>.jsonl` and `<uuid>/subagents/` layout, Codex by reading each rollout's first line, which is `session_file`'s logic written a second time in JavaScript because the page cannot call it before the files are read.
 - **The herdr plugin** (`herdr-plugin/`): asks Herdr which session the focused
   pane is running, hands `zoe` that id, and `open` does the rest. It is the
   case `Target::Id` was written for: the id is known, the file is not. See
@@ -160,6 +162,7 @@ What used to be five feeder sites naming `claude::` are these calls. The live ta
 | `zoe <dir>` | `open(Here(dir))`: the same for another project. |
 | `zoe --provider codex ...` | Forces the provider for a path when `provider_of` cannot tell, or restricts an id or directory lookup to one provider. Never the default route. |
 | `zoe inspect <file>` | `open(Path)` rendered as text. |
+| `zoe export <id>` | `open(Id)` (or `Here`), the stored session's rows written as its provider's lines. A path to the database is not a target: it names no session. |
 
 Later, with the rail: `zoe sessions` as `sweep` rendered as a table.
 
@@ -171,7 +174,7 @@ The agents whose storage we know fall into three classes:
 
 1. **Append-only JSONL per session.** Claude Code, Codex, Copilot CLI, older Goose. This document covers them fully.
 2. **One JSON document rewritten per turn.** Gemini CLI, Cline and its forks, Amp. Discovery covers them (`related_paths` is empty or a sibling document, `Sidecar` read `Whole` holds the second document where there is one); reading does not, since there is no line to push. Support would add `Stream::push_document`, diffing against the last document, beside `push`. An addition, not a change.
-3. **A database.** OpenCode, Cursor, current Goose. No file per session, nothing to tail. Out of scope. That is a different kind of feeder reading rows, not a wider `SessionFile`.
+3. **A database.** IBM Bob, OpenCode, Cursor, current Goose. No file per session, nothing to tail. Bob is supported, and it went in the way this class predicted: a different kind of feeder reading rows (`tailer/rows.rs` over `provider/bob/db.rs`), not a wider `SessionFile`. The one addition to the shared types is `ReadMode::Rows` on the root, and one primitive, `stored_sessions`, for listing what has no path. The provider itself stays a line provider: rows go in as JSON lines, so an export of the session is a file like any other, the conformance fixture is such a file, and the browser reads it. Another agent of this class would add its own `db.rs` and a `RowSource` arm.
 
 Aider keeps many sessions in one markdown file per project and fits none of the above. Not designed for.
 

@@ -5,7 +5,7 @@
 <h1 align="center">zoetrope</h1>
 
 <p align="center">
-  <em>Watch a Claude Code or Codex session as a live flow graph, in your terminal or your browser.</em>
+  <em>Watch a Claude Code, Codex or IBM Bob session as a live flow graph, in your terminal or your browser.</em>
 </p>
 
 <p align="center">
@@ -24,9 +24,9 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code and Codex write a transcript for every session. zoetrope reads it and draws
-the session as a graph in your terminal: the main agent, the agents it spawns, and the
-tools each one runs, updating live as it goes. Point it at a finished run and it replays,
+Claude Code, Codex and IBM Bob keep a transcript of every session. zoetrope reads it
+and draws the session as a graph in your terminal: the main agent, the agents it
+spawns, and the tools each one runs, updating live as it goes. Point it at a finished run and it replays,
 paced by the session's own timestamps. Point it at a running one and it follows along.
 It's read-only, and nothing leaves your machine.
 
@@ -40,10 +40,14 @@ Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkank
 | --- | --- | --- | --- | --- |
 | [Claude Code](https://claude.com/claude-code) | `~/.claude/projects/` | ✓ | ✓ | ✓ sessions and subagents |
 | [Codex](https://openai.com/codex/) CLI and desktop app | `~/.codex/sessions/` | ✓ | ✓ | ✓ sessions and subagents |
+| [IBM Bob](https://bob.ibm.com/) IDE and `bob` shell | `~/.bob/db/bob.db`, a SQLite database | ✓ | ✓ | ✓ via `zoe export` |
 
 zoetrope reads a session from any of its files and tells the formats apart by
-content, so `zoe <file>` works for either, and `zoe <id>` finds a session by id
-across both.
+content, so `zoe <file>` works for any of them, and `zoe <id>` finds a session by
+id across all three. Bob keeps its sessions as rows rather than files, so a Bob
+session opens by id or from its workspace directory, and `zoe export <id>` writes
+it as a file for the browser or for sharing. The database is only ever opened
+read-only.
 
 ![zoetrope replaying a Codex CLI session as a flow graph](https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope-codex.gif)
 
@@ -111,6 +115,7 @@ zoe <file.jsonl> --follow    # open a recording at its live edge
 zoe <file.jsonl> --speed N   # playback speed (default 8.0)
 zoe --provider codex ...     # force the format instead of detecting it from the file
 zoe inspect <file|id>        # print the session tree and exit (no TUI)
+zoe export <id>              # write a Bob session as JSON lines to stdout (no TUI)
 ```
 
 Give it a file and it reads the whole transcript, then keeps watching for new lines.

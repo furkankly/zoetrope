@@ -8,8 +8,9 @@ reasoning that governs how those pieces are allowed to behave.
 The whole program solves one hard problem:
 
 > Reconstruct a faithful, navigable, live-or-replayed picture of a coding-agent
-> session (Claude Code, Codex) from an **undocumented, append-only, partially-timestamped,
-> multi-file** transcript — in which **completion is frequently unknowable**.
+> session (Claude Code, Codex, IBM Bob) from an **undocumented, append-only, partially-timestamped,
+> multi-file** transcript — or a database of rows that gets rewritten — in which
+> **completion is frequently unknowable**.
 
 Almost every design decision below is downstream of that one sentence.
 
@@ -69,6 +70,16 @@ seen names the root from every file of it.
 Adding a provider is one directory and no decisions: `src/provider/mod.rs`
 spells out the three files, the primitives, where fixtures go, and the one
 test to pass.
+
+The seam holds for an agent that keeps no files. Bob stores a session as rows
+of one SQLite database, and its provider reads those rows as JSON lines, one
+per row, through the same `Stream::push` an export of the session goes
+through. What differs is the feeder: a root read as `ReadMode::Rows` is polled
+by `tailer/rows.rs` instead of a file tailer, and the provider's `db.rs` is
+the one place that speaks SQL. Everything above, the fold, the timeline, the
+conformance fixture, is the same code as for a file. A row that records two
+moments (a child's `created_at` and the `updated_at` it ended at) is presented
+as two lines, so the fold never learns an ending at a birth (§1.2).
 
 ---
 
@@ -347,6 +358,17 @@ Honest ledger of what's derived-but-imperfect, for whoever touches this next:
 - **Aggregate chip error-coloring.** A settled run shows a single aggregate
   ✓/✗; a run of N where only one call failed still reads as an error run. Cosmetic
   over-alarm, noted for a future pass.
+- **An ending cannot be retracted.** `Ended` is recorded in the `ended` store
+  and pins `terminal`; the vocabulary has no fact that un-ends an agent. Bob
+  can reopen a finished task, whose row then reads `active` again; the
+  provider states nothing for that (an `active` row is not an ending), so a
+  reopened child stays `Done`. No reopened child has been observed. A
+  retraction fact would be the principled fix.
+- **A tool end that arrives before its start stays pending.** `completed_calls`
+  records the end, but a later `ToolStart` does not consult it. No provider
+  produces that order (every feeder keeps a thread's turns in time order), so
+  the §1.1 guarantee holds for the fact sets that occur, not for every
+  permutation of them.
 
 ---
 

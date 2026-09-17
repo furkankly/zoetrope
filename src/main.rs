@@ -11,6 +11,7 @@
 //! zoe <file> --speed N      playback speed multiplier (default 8.0)
 //! zoe --provider <name> ... force the transcript format instead of detecting it
 //! zoe inspect <file|id|dir> headless: print the session tree + info
+//! zoe export <id|dir>       headless: write a stored (bob) session as JSON lines
 //! ```
 
 use std::path::PathBuf;
@@ -18,9 +19,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
-use zoetrope::provider::{Provider, ReadMode, Target, open};
+use zoetrope::provider::{Provider, ReadMode, Scope, Target, open, sweep};
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
+use zoetrope::tailer::rows::RowSource;
 use zoetrope::tailer::{TailRequest, UiEvent};
 use zoetrope::{tailer, tui};
 
@@ -51,6 +53,13 @@ pub enum Cli {
         target: String,
         provider: Option<Provider>,
     },
+    /// Headless: write a session kept in a database (Bob's) to stdout as the
+    /// JSON lines its provider reads, one file per session. That file opens
+    /// like any recording, in the terminal or the browser.
+    Export {
+        target: String,
+        provider: Option<Provider>,
+    },
 }
 
 /// Default replay speed multiplier.
@@ -66,8 +75,9 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
-    zoe --provider <name>   force the format (claude, codex) instead of detecting it
+    zoe --provider <name>   force the format (claude, codex, bob) instead of detecting it
     zoe inspect <file|id>   headless: print the session tree + info
+    zoe export <id|dir>     headless: write a stored (bob) session as JSON lines to stdout
     zoe --version           print the version and exit
 
 Once open, scrub/follow/pause/go-live are available no matter how you launched.";
@@ -83,12 +93,14 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
             .ok_or_else(|| anyhow!("--provider requires a name\n\n{USAGE}"))?;
         Provider::parse(&v)
             .map(Some)
-            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex"))
+            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex, bob"))
     };
 
-    // `inspect <file>` is the one distinct (headless) subcommand.
-    if args.peek().map(String::as_str) == Some("inspect") {
-        args.next();
+    // `inspect` and `export` are the headless subcommands: one target, an
+    // optional provider.
+    let sub = args.peek().map(String::as_str);
+    if matches!(sub, Some("inspect" | "export")) {
+        let name = args.next().unwrap_or_default();
         let mut target: Option<String> = None;
         let mut provider = None;
         while let Some(arg) = args.next() {
@@ -97,16 +109,20 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                 other if other.starts_with('-') => bail!("unknown flag {other:?}\n\n{USAGE}"),
                 _ => {
                     if target.is_some() {
-                        bail!("inspect takes a single target argument\n\n{USAGE}");
+                        bail!("{name} takes a single target argument\n\n{USAGE}");
                     }
                     target = Some(arg);
                 }
             }
         }
         let target = target.ok_or_else(|| {
-            anyhow!("inspect requires a file, a session id or a directory\n\n{USAGE}")
+            anyhow!("{name} requires a file, a session id or a directory\n\n{USAGE}")
         })?;
-        return Ok(Cli::Inspect { target, provider });
+        return Ok(if name == "inspect" {
+            Cli::Inspect { target, provider }
+        } else {
+            Cli::Export { target, provider }
+        });
     }
 
     // Otherwise: an optional positional target + flags.
@@ -181,9 +197,22 @@ fn parse_session_fully(
     // Order is not critical — the model is fold-order independent — so files
     // go in as the session lists them, root first.
     for f in session.every_file() {
+        // A stored session: its rows, as the lines the same stream reads.
+        if f.read == ReadMode::Rows {
+            let mut stream = p.stream_for(f);
+            for statement in RowSource::new(f)
+                .poll()
+                .iter()
+                .filter_map(|l| stream.push(l))
+            {
+                apply(statement);
+            }
+            continue;
+        }
         let text = std::fs::read_to_string(&f.path)
             .with_context(|| format!("reading {}", f.path.display()))?;
         match f.read {
+            ReadMode::Rows => unreachable!("handled above"),
             ReadMode::Tail => {
                 let mut stream = p.stream_for(f);
                 for statement in text.lines().filter_map(|l| stream.push(l)) {
@@ -217,6 +246,39 @@ async fn run_inspect(target: String, provider: Option<Provider>) -> Result<()> {
     let target = resolve_target(target)?;
     let (model, info) = parse_session_fully(&target, provider)?;
     print!("{}", zoetrope::state::render::report(&model, &info));
+    Ok(())
+}
+
+/// Run the `export` subcommand: a stored session's rows, as its provider's
+/// JSON lines, to stdout. A session kept as files needs no export: its files
+/// already are the recording. A directory means its newest stored session,
+/// not its newest session of any kind, since that is what there is to export.
+async fn run_export(target: String, provider: Option<Provider>) -> Result<()> {
+    use std::io::Write;
+    let target = resolve_target(target)?;
+    let session = match &target {
+        Target::Here(cwd) => sweep(&Scope::project(cwd), provider)
+            .into_iter()
+            .find(|s| s.root.read == ReadMode::Rows)
+            .ok_or_else(|| anyhow!("no stored (bob) session for {}", cwd.display()))?,
+        _ => open(&target, provider)?,
+    };
+    if session.root.read != ReadMode::Rows {
+        let files: Vec<String> = session
+            .every_file()
+            .map(|f| format!("  {}", f.path.display()))
+            .collect();
+        bail!(
+            "session {} is kept as files, which open directly; export is for a session stored in a database (try --provider bob)\n{}",
+            session.id,
+            files.join("\n")
+        );
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in RowSource::new(&session.root).poll() {
+        writeln!(out, "{line}")?;
+    }
     Ok(())
 }
 
@@ -314,6 +376,7 @@ async fn main() -> Result<()> {
     let cli = parse_cli(std::env::args())?;
     match cli {
         Cli::Inspect { target, provider } => run_inspect(target, provider).await,
+        Cli::Export { target, provider } => run_export(target, provider).await,
         other => run_tui(other).await,
     }
 }
@@ -422,6 +485,19 @@ mod tests {
     fn rejects_extra_positional_and_unknown_flags() {
         assert!(cli(&["a.jsonl", "b.jsonl"]).is_err());
         assert!(cli(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn export_parses_like_inspect() {
+        match cli(&["export", "ad9d265c", "--provider", "bob"]).unwrap() {
+            Cli::Export { target, provider } => {
+                assert_eq!(target, "ad9d265c");
+                assert_eq!(provider, Some(Provider::Bob));
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
+        assert!(cli(&["export"]).is_err());
+        assert!(cli(&["export", "a", "b"]).is_err());
     }
 
     #[test]

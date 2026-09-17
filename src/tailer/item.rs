@@ -285,6 +285,9 @@ impl Bundle {
                 self.streams.insert(key, stream);
                 out
             }
+            // A database is not text anyone can hand over; only the native
+            // row feeder reads one.
+            ReadMode::Rows => Vec::new(),
             ReadMode::Whole => {
                 if self.seen.contains(&key) {
                     return Vec::new();

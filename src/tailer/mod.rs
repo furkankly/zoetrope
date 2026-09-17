@@ -18,7 +18,8 @@
 //!
 //! Layout: this module holds the task entry (`run`) and the shared wire types
 //! ([`TailRequest`] / [`UiEvent`]); `bytes` is the
-//! pure incremental reader, `live` the live poll loop, `replay` the up-front
+//! pure incremental reader, `rows` its counterpart for a session stored as
+//! database rows, `live` the live poll loop, `replay` the up-front
 //! assembly. Both feeders converge on `live::tail_loop` so every session keeps
 //! tailing.
 
@@ -51,6 +52,8 @@ mod bytes;
 mod live;
 #[cfg(feature = "native")]
 mod replay;
+#[cfg(feature = "native")]
+pub mod rows;
 
 #[cfg(feature = "native")]
 use live::run_live;

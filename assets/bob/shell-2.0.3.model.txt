@@ -1,0 +1,17 @@
+  ◌ [main] bob  (idle) — id=main
+      tools: 4 (4✓ 0✗ 0⏳)   tokens: 397
+    ✓ [subagent] general  (done) — id=198ac0168b77f696d566dbba70adbf15
+        Read the file main.rs and count the total number of lines in it. Report back the exact line count as a number.
+        tools: 1 (1✓ 0✗ 0⏳)   tokens: 77
+        ↳ prompt: You are testing sub-agent spawning. Spawn two sub-agents in parallel with spawn_subagent: one must read main.rs and report its line count, the other must read NOTES.md and report its words. Wait for both. Then run 'wc -l main.rs NOTES.md' …
+        ↳ thought: I'll spawn two subagents in parallel, then execute a command myself, then spawn a third subagent, and provide a summary.
+    ✓ [subagent] general  (done) — id=b1853eaa5a68ad11d5be0ec1ea663fdb
+        Read the file NOTES.md and count the total number of words in it. Report back the exact word count as a number.
+        tools: 2 (2✓ 0✗ 0⏳)   tokens: 195
+        ↳ prompt: You are testing sub-agent spawning. Spawn two sub-agents in parallel with spawn_subagent: one must read main.rs and report its line count, the other must read NOTES.md and report its words. Wait for both. Then run 'wc -l main.rs NOTES.md' …
+        ↳ thought: I'll spawn two subagents in parallel, then execute a command myself, then spawn a third subagent, and provide a summary.
+    ✓ [subagent] general  (done) — id=c8f168ad3b1524e57c3e6340d176575c
+        Run the command 'date' and report back the exact output it produces.
+        tools: 1 (1✓ 0✗ 0⏳)   tokens: 79
+        ↳ prompt: You are testing sub-agent spawning. Spawn two sub-agents in parallel with spawn_subagent: one must read main.rs and report its line count, the other must read NOTES.md and report its words. Wait for both. Then run 'wc -l main.rs NOTES.md' …
+        ↳ thought: Now I'll spawn the third subagent:

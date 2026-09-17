@@ -144,8 +144,10 @@ pub(crate) fn assert_order_invariant(streams: impl Fn() -> Vec<Vec<Fact>>) -> Ve
 }
 
 /// Comparable snapshot of the model (spawn order is presentation — creation
-/// order legitimately varies — so agents are compared by sorted id).
-fn snapshot(m: &SessionModel) -> Vec<String> {
+/// order legitimately varies — so agents are compared by sorted id). Covers
+/// what a provider states about an agent, tokens and labels included, not
+/// only its structure.
+pub(crate) fn snapshot(m: &SessionModel) -> Vec<String> {
     m.agents
         .iter()
         .map(|(id, a)| {
@@ -159,11 +161,14 @@ fn snapshot(m: &SessionModel) -> Vec<String> {
                 .map(|c| format!("{:?}/{:?}", m.provenance_prompt(c), c.reasoning))
                 .unwrap_or_default();
             format!(
-                "{id}|{:?}|{:?}|{:?}|{:?}|{}|{prov}",
+                "{id}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{prov}",
                 a.kind,
                 a.status,
                 a.parent,
                 a.spawned_by,
+                a.agent_type,
+                a.description,
+                a.output_tokens,
                 tools.join(",")
             )
         })
