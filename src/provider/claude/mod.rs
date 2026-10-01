@@ -454,6 +454,7 @@ pub(crate) fn summarize_tool(
         }
         "WebFetch" => pick("url"),
         "ToolSearch" => pick("query"),
+        "Skill" => pick("skill"),
         _ => pick("description").or_else(|| pick("query")),
     }
 }
