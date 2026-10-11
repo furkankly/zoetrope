@@ -110,6 +110,7 @@ zoe <id>                     # replay a session by id, or a unique prefix of one
 zoe <file.jsonl> --follow    # open a recording at its live edge
 zoe <file.jsonl> --speed N   # playback speed (default 8.0)
 zoe --provider codex ...     # force the format instead of detecting it from the file
+zoe --theme <name>           # zoetrope-gold, titanium or light (this run only)
 zoe inspect <file|id>        # print the session tree and exit (no TUI)
 ```
 
@@ -121,6 +122,23 @@ scrub, follow, pause, jump back to live.
 The same engine also runs [in the browser](https://zoetrope.furkankly.dev/app),
 compiled to WebAssembly via [ratzilla](https://github.com/ratatui/ratzilla). Open a
 session from disk, or drop a transcript on the page. It stays local there too.
+
+## Themes
+
+Three built-in themes: `zoetrope-gold` (the default), `titanium` (graphite with an
+electric-blue accent) and `light`. Press `t` / `T` to cycle them, or start with one:
+
+```bash
+zoe --theme titanium
+```
+
+`--theme` applies to that run only. Pressing `t` saves the choice to
+`$XDG_CONFIG_HOME/zoetrope/theme.json` (`~/.config/zoetrope/theme.json`, or
+`%APPDATA%` on Windows) and later runs start with it; a missing or invalid file falls
+back to the default, and an unknown `--theme` name is an error. In the browser the
+toolbar has a theme selector (and `t` / `T` work on the graph); the choice is kept in
+`localStorage` under `zoetrope-theme`. Switching only repaints: the session, camera,
+selection and playhead stay put.
 
 ## Features
 
@@ -181,6 +199,7 @@ bar to seek · `?` for everything else.
 | `j` / `k` / `PgUp` / `PgDn` | scroll the detail panel |
 | `i` | session info overlay |
 | `?` | help overlay |
+| `t` / `T` | next / previous theme (saved) |
 | `esc` | close an overlay / clear the selection |
 | `q` / `ctrl-c` | quit |
 
@@ -258,7 +277,9 @@ says what one consists of and what proves it.
 
 ## License
 
-[MIT](https://github.com/furkankly/zoetrope/blob/main/LICENSE).
+[MIT](https://github.com/furkankly/zoetrope/blob/main/LICENSE). The Titanium theme's
+palette follows [oh-my-pi](https://github.com/can1357/oh-my-pi) (MIT); see
+[`NOTICE`](NOTICE) and [`OMP-THEME-LICENSE`](OMP-THEME-LICENSE).
 
 ## Acknowledgements
 

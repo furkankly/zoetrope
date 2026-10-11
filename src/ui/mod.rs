@@ -97,7 +97,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     render_status_bar(frame, status_area, app);
 
     if app.show_help {
-        render_help(frame, area, &app.flow.theme.palette());
+        render_help(frame, area, &app.flow.theme.palette(), app.theme.label());
     }
     if app.show_info {
         render_info(frame, area, app);
@@ -275,12 +275,17 @@ pub(crate) fn compute_scrubber_tally(
 /// other marks. Dingbats on purpose: every terminal and the browser's font
 /// atlas render them, the hexagon block is not. The browser's atlas drops the
 /// colour and shows the glyph alone, which still tells the providers apart.
-fn spawn_mark(provider: Option<crate::provider::Provider>) -> (&'static str, Color) {
+fn spawn_mark(
+    provider: Option<crate::provider::Provider>,
+    palette: &rataflow::Palette,
+) -> (&'static str, Color) {
     use crate::provider::Provider;
     match provider {
+        // Brand colours are intentional and theme-independent.
         Some(Provider::Claude) => ("❋ ", Color::Indexed(173)),
         Some(Provider::Codex) => ("❂ ", Color::Indexed(36)),
-        None => ("✦ ", Color::Indexed(252)),
+        // The neutral follows the theme: a fixed light grey vanishes on Light.
+        None => ("✦ ", palette.subtle),
     }
 }
 
@@ -403,7 +408,7 @@ fn render_scrubber(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         // Event markers, PAST only (reveal as the playhead reaches them — in sync
         // with the graph's chips): spawns, then failures (more urgent → on top).
-        let (spawn_glyph, spawn_color) = spawn_mark(app.session.provider());
+        let (spawn_glyph, spawn_color) = spawn_mark(app.session.provider(), &palette);
         for c in (0..head).filter(|&c| spawn_at[c]) {
             buf[(x(c), marker_y)]
                 .set_symbol(spawn_glyph)
@@ -543,7 +548,7 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
         .with_timezone(&chrono::Local)
         .format("%H:%M:%S")
         .to_string();
-    let (spawn_glyph, spawn_color) = spawn_mark(app.session.provider());
+    let (spawn_glyph, spawn_color) = spawn_mark(app.session.provider(), &palette);
     let (icon, icon_style) = match ev.kind {
         LogKind::Prompt => ("◆ ", bg.fg(palette.accent).add_modifier(Modifier::BOLD)),
         // The same mark as the spawn on the scrubber's marker strip.
@@ -564,7 +569,7 @@ fn render_log_line(frame: &mut Frame, row: Rect, app: &App) {
 }
 
 /// Centered help overlay: full key reference + status-glyph legend.
-fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
+fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette, theme_label: &str) {
     let w = area.width.min(60);
     let h = area.height.min(18);
     if w < 24 || h < 9 {
@@ -626,6 +631,11 @@ fn render_help(frame: &mut Frame, area: Rect, palette: &rataflow::Palette) {
         Line::from(vec![
             Span::styled(" info      ", key),
             Span::styled("i session details (mode, prompts, …)", txt),
+        ]),
+        Line::from(vec![
+            Span::styled(" theme     ", key),
+            Span::styled("t/T cycle · now ", txt),
+            Span::styled(theme_label, txt.add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled(" replay    ", key),
@@ -776,9 +786,9 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         "q quit · "
     };
     let hints = if app.mode == Mode::Replay {
-        format!("{quit}? help · space pause")
+        format!("{quit}? help · t theme · space pause")
     } else {
-        format!("{quit}? help")
+        format!("{quit}? help · t theme")
     };
 
     // Reserve the hint area in terminal CELLS, not bytes: the hints contain

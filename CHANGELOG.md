@@ -2,6 +2,17 @@
 
 [**zoetrope**](https://zoetrope.furkankly.dev): Watch a Claude Code or Codex session as a live flow graph, in your terminal — or your browser.
 
+## Unreleased
+
+### 🚀 Features
+
+- *(theme)* Add a theme registry with `zoetrope-gold` (default), `titanium` and `light`, selectable with `--theme`, the `t` / `T` keys (native choice saved under the `zoetrope` config directory) and a browser selector stored in `localStorage`
+
+### 🐛 Bug Fixes
+
+- *(web)* Notify the page of a keyboard theme change only after the app state is released, so the selector cannot re-enter the engine
+- *(web)* Keep the canvas padding strip on the active theme's background
+
 ## 0.2.0 - 2026-09-10
 
 ### 🚀 Features

@@ -21,8 +21,11 @@ pub use self::info::SessionInfo;
 pub use self::timeline::Timeline;
 pub use crate::ui::chips::ChipTray;
 
+use rataflow::Theme;
+
 use self::session::SessionModel;
 use crate::tailer::UiEvent;
+use crate::theme::ThemeId;
 
 /// Whether the app is watching a live session or replaying a finished one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +229,12 @@ pub struct App {
     /// Ladder of folded-model snapshots, ascending by `folded`, used to start a
     /// backward seek near its target instead of re-folding from item zero.
     snapshots: Vec<Snapshot>,
+    /// The active colour theme. Kept here (not only in `flow.theme`) so a
+    /// session reset, which rebuilds the flow, re-applies it.
+    pub theme: ThemeId,
+    /// Set when the user picks a theme interactively; the native loop saves it
+    /// and clears the flag. `App` itself does no IO.
+    pub theme_dirty: bool,
 }
 
 impl App {
@@ -256,8 +265,18 @@ impl App {
             show_info: false,
             pending_center: None,
             pending_seek: None,
+            theme: ThemeId::DEFAULT,
+            theme_dirty: false,
             snapshots: Vec::new(),
         }
+    }
+
+    /// Switch the colour theme in place. Only `flow.theme` changes: the model,
+    /// camera, selection, playhead and caches are untouched, and the next
+    /// frame repaints with the new palette. Idempotent.
+    pub fn set_theme(&mut self, theme: ThemeId) {
+        self.theme = theme;
+        self.flow.theme = Theme::Custom(theme.palette());
     }
 
     /// Derive the emergent transport state for display (status badge + scrubber
@@ -468,6 +487,7 @@ impl App {
                 self.current_session_id = session_id.clone();
                 self.session = SessionModel::new(session_id);
                 self.flow = graph::new_flow();
+                self.flow.theme = Theme::Custom(self.theme.palette());
                 // A different session (or a truncated one) shares nothing with
                 // the rungs we hold, and a fresh `Timeline` restarts the
                 // generation counter — so they cannot be told apart by it.
@@ -1868,5 +1888,52 @@ mod tests {
         let mut want = got.clone();
         want.sort();
         assert_eq!(got, want);
+    }
+
+    /// Theme switching repaints only: model, camera, selection and playhead
+    /// survive, and a later session reset keeps the chosen theme.
+    #[test]
+    fn set_theme_preserves_state_and_survives_reset() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-06-05T10:00:00.000Z".parse().unwrap();
+        let mut app = App::new("s".to_string(), Mode::Live);
+        app.handle_ui_event(UiEvent::ReplayLoaded {
+            session_id: "s".into(),
+            items: (0..8)
+                .map(|i| {
+                    crate::tailer::ReplayItem::at(
+                        Some(t0 + chrono::Duration::seconds(i as i64)),
+                        meta_update(&format!("sub{i}")).facts,
+                    )
+                })
+                .collect(),
+            speed: 8.0,
+            info: Default::default(),
+        });
+        app.go_live();
+        let id = app.flow.nodes().next().expect("a node").id.clone();
+        app.flow.select_node(&id);
+        app.camera = Camera::Manual;
+        let (folded, cursor, agents) = (
+            app.timeline.folded,
+            app.timeline.cursor,
+            app.flow.nodes().count(),
+        );
+        assert!(
+            agents > 0 && folded > 0 && cursor.is_some(),
+            "fixture is non-trivial"
+        );
+        app.set_theme(ThemeId::Light);
+
+        assert_eq!(app.flow.theme, Theme::Custom(ThemeId::Light.palette()));
+        assert_eq!(app.selected_agent_id(), Some(id));
+        assert_eq!(app.camera, Camera::Manual);
+        assert_eq!(app.timeline.folded, folded);
+        assert_eq!(app.timeline.cursor, cursor);
+        assert_eq!(app.flow.nodes().count(), agents);
+
+        app.handle_ui_event(UiEvent::SessionReset {
+            session_id: "other".into(),
+        });
+        assert_eq!(app.flow.theme, Theme::Custom(ThemeId::Light.palette()));
     }
 }

@@ -17,6 +17,7 @@ zoe <id>                     replay a session by id, or a unique prefix of one
 zoe <file.jsonl> --follow    open a recording at its live edge instead
 zoe <file.jsonl> --speed N   playback speed multiplier (default 8.0)
 zoe --provider codex ...     force the format instead of detecting it from the file
+zoe --theme <name>           native only: zoetrope-gold, titanium or light for this run (`t` in the app cycles and saves; the browser has a toolbar selector instead)
 zoe inspect <file|id>        print the session tree and exit (no TUI)
 ```
 
@@ -82,6 +83,7 @@ running when you installed it has to be started again before Herdr can name it.
 | <kbd>j</kbd> / <kbd>k</kbd> / <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | scroll the detail panel |
 | <kbd>i</kbd> | session info overlay |
 | <kbd>?</kbd> | help overlay |
+| <kbd>t</kbd> / <kbd>T</kbd> | next / previous theme (zoetrope-gold, titanium, light). Native saves it to `zoetrope/theme.json` in the config directory; the browser keeps it in `localStorage` (`zoetrope-theme`) |
 | <kbd>esc</kbd> | close an overlay / clear the selection |
 | <kbd>q</kbd> / <kbd>ctrl-c</kbd> | quit (native) |
 

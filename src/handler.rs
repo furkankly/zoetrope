@@ -144,6 +144,14 @@ fn handle_key(key: &KeyEvent, app: &mut App) -> bool {
             return false;
         }
 
+        // Theme: `t` next, `T` previous. The native loop saves the choice.
+        KeyCode::Char(c @ ('t' | 'T')) => {
+            let theme = app.theme.next(c == 'T');
+            app.set_theme(theme);
+            app.theme_dirty = true;
+            return false;
+        }
+
         // Help overlay.
         KeyCode::Char('?') => {
             app.show_help = !app.show_help;

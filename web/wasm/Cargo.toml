@@ -55,6 +55,10 @@ web-sys = { version = "0.3", features = [
   "Element",
   "EventTarget",
   "WheelEvent",
+  "Storage",
+  "HtmlCanvasElement",
+  "WebGl2RenderingContext",
+  "Event",
 ] }
 # ratzilla force-enables ratatui's `layout-cache`, whose global cache is guarded
 # by `critical-section`. wasm32-unknown-unknown has no default impl, so linking

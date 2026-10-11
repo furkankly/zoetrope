@@ -29,6 +29,11 @@ use web_time::Instant;
 
 use zoetrope::state::{App, Camera, Mode};
 use zoetrope::tailer::{Bundle, UiEvent};
+use zoetrope::theme::ThemeId;
+
+/// `localStorage` key the theme selection is saved under (the page's boot
+/// script in `app.astro` reads the same key).
+const WEB_STORAGE_KEY: &str = "zoetrope-theme";
 
 /// Default replay speed (matches the native default).
 const DEMO_SPEED: f64 = 8.0;
@@ -128,8 +133,11 @@ fn main() -> io::Result<()> {
     console_error_panic_hook::set_once();
 
     // Build the App from the bundled session, the way a dropped one is built.
+    let boot_theme = stored_theme();
+    ACTIVE_THEME.with(|c| c.set(boot_theme));
     let (bundle, items, info) = Bundle::load(DEMO_FILES).expect("the bundled demo is a session");
     let mut app = App::new("demo".to_string(), Mode::Replay);
+    app.set_theme(boot_theme);
     app.handle_ui_event(UiEvent::ReplayLoaded {
         session_id: "demo".to_string(),
         items,
@@ -164,22 +172,29 @@ fn main() -> io::Result<()> {
         "monospace",
     ];
     // The grid is a whole number of cells, so the container's last partial cell
-    // on the right/bottom edge is left as padding. ratzilla clears that strip to
-    // black by default, which shows against zoetrope's backdrop as the window
-    // resizes (the strip is `container_size % cell_size`). Match it to the flow's
-    // canvas background (`Palette::DARK.canvas_bg` = indexed 233, #121212) so the
-    // same indexed color resolves to the identical RGB and the strip disappears.
+    // on the right/bottom edge is left as padding, cleared to the backend's
+    // `canvas_padding_color`. That colour is fixed at creation, so the boot
+    // theme's is set here and `paint_padding` follows later theme switches.
+    let [pr, pg, pb] = boot_theme.canvas_rgb();
     let backend = WebGl2Backend::new_with_options(
         WebGl2BackendOptions::new()
             .grid_id(CONTAINER)
             .font_atlas_config(FontAtlasConfig::dynamic(MONO, 16.0))
-            .canvas_padding_color(ratatui::style::Color::Indexed(233)),
+            .canvas_padding_color(ratatui::style::Color::Rgb(pr, pg, pb)),
     )?;
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let _ = terminal.on_key_event({
         let app = app.clone();
-        move |key: RKeyEvent| handle_key(key, &mut app.borrow_mut())
+        move |key: RKeyEvent| {
+            let before = current_theme();
+            handle_key(key, &mut app.borrow_mut());
+            // The `App` borrow is released: now the page may react. Notifying
+            // while it was held re-entered the wasm export and panicked.
+            if current_theme() != before {
+                notify_theme();
+            }
+        }
     });
 
     let _ = terminal.on_mouse_event({
@@ -216,6 +231,7 @@ fn main() -> io::Result<()> {
             *last_tick.borrow_mut() = now;
 
             let mut app = app.borrow_mut();
+            paint_padding(app.theme);
             let _ = app.flow.tick_auto_pan(elapsed);
             app.flow.tick_animation(elapsed);
             app.tick_camera(elapsed);
@@ -288,6 +304,7 @@ pub fn zoetrope_load(files_json: String, live: bool) -> String {
 
     let mode = if live { Mode::Live } else { Mode::Replay };
     let mut next = App::new(LOADED_SESSION_ID.to_string(), mode);
+    next.set_theme(current_theme());
     next.handle_ui_event(UiEvent::ReplayLoaded {
         session_id: LOADED_SESSION_ID.to_string(),
         items,
@@ -363,6 +380,121 @@ pub fn zoetrope_session_file(path: String, head: String) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Theme
+//
+// The page owns the `<select>`; the engine owns the palette. The selection
+// lives in `localStorage` under `WEB_STORAGE_KEY`, read here at boot and by the
+// page's own boot script. A switch swaps only `flow.theme`: session, camera,
+// selection and playhead are untouched. The canvas padding strip (the partial
+// cell at the right/bottom edge) is cleared by the backend to a colour fixed at
+// creation; `paint_padding` re-asserts the live theme's colour each frame on
+// the same GL context.
+// ---------------------------------------------------------------------------
+
+/// The theme saved in `localStorage`, or the default when absent, unreadable
+/// or not a registered id.
+fn stored_theme() -> ThemeId {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(WEB_STORAGE_KEY).ok().flatten())
+        .and_then(|v| ThemeId::parse(&v))
+        .unwrap_or_default()
+}
+
+fn store_theme(theme: ThemeId) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = s.set_item(WEB_STORAGE_KEY, theme.id());
+    }
+}
+
+thread_local! {
+    /// The grid canvas's WebGL2 context, looked up once.
+    static GL: RefCell<Option<web_sys::WebGl2RenderingContext>> = const { RefCell::new(None) };
+    /// The theme the page and the canvas show. The one source JS-facing reads
+    /// use, so `zoetrope_themes` never borrows the `App`: it runs from inside
+    /// the `zoetrope-theme` event, which a key handler fires after releasing
+    /// the `App`, and must stay safe even if that ever changes.
+    static ACTIVE_THEME: Cell<ThemeId> = const { Cell::new(ThemeId::DEFAULT) };
+}
+
+/// The theme the running page shows.
+fn current_theme() -> ThemeId {
+    ACTIVE_THEME.with(Cell::get)
+}
+
+/// Set the GL clear colour to `theme`'s canvas background so the padding strip
+/// follows a live theme switch. Called each frame, before ratzilla flushes.
+///
+/// Why raw GL is safe: beamterm caches the clear colour and only issues
+/// `glClearColor` when the requested colour differs from its cache. Its request
+/// is always the boot colour, which equals its cache, so it never overwrites
+/// ours. After a context restore the cache resets and its first frame re-issues
+/// the boot colour once (a one-frame flash of a strip under one cell wide).
+fn paint_padding(theme: ThemeId) {
+    GL.with(|cell| {
+        let mut gl = cell.borrow_mut();
+        if gl.is_none() {
+            *gl = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.query_selector("#terminal-container canvas").ok().flatten())
+                .and_then(|c| c.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+                .and_then(|c| c.get_context("webgl2").ok().flatten())
+                .and_then(|o| o.dyn_into::<web_sys::WebGl2RenderingContext>().ok());
+        }
+        if let Some(gl) = gl.as_ref() {
+            let [r, g, b] = theme.canvas_rgb();
+            gl.clear_color(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+        }
+    });
+}
+
+/// Apply `theme` to `app`, record it as active and save it. Does not notify
+/// the page: callers do that with [`notify_theme`] once no `App` borrow is held.
+fn apply_theme(app: &mut App, theme: ThemeId) {
+    app.set_theme(theme);
+    ACTIVE_THEME.with(|c| c.set(theme));
+    store_theme(theme);
+}
+
+/// Tell the page (a `zoetrope-theme` event on `window`) so its `<select>` and
+/// CSS follow. Listeners run synchronously and read only [`current_theme`].
+fn notify_theme() {
+    if let Some(w) = web_sys::window()
+        && let Ok(ev) = web_sys::Event::new("zoetrope-theme")
+    {
+        let _ = w.dispatch_event(&ev);
+    }
+}
+
+/// Switch theme by registered id. Returns `{theme}` on success or
+/// `{error, known}` for an unknown name (the selection is left unchanged).
+#[wasm_bindgen]
+pub fn zoetrope_set_theme(name: String) -> String {
+    let Some(theme) = ThemeId::parse(&name) else {
+        return serde_json::json!({ "error": format!("unknown theme {name:?}"), "known": ThemeId::known() })
+            .to_string();
+    };
+    // Clone the handle so no thread-local borrow is held while the page reacts.
+    let rc = APP.with(|cell| cell.borrow().clone());
+    if let Some(rc) = rc {
+        apply_theme(&mut rc.borrow_mut(), theme);
+        notify_theme();
+    }
+    serde_json::json!({ "theme": theme.id() }).to_string()
+}
+
+/// The active theme id plus the registry, as `{theme, themes:[{id,label}]}`,
+/// so the page builds its `<select>` from the engine instead of a copy.
+#[wasm_bindgen]
+pub fn zoetrope_themes() -> String {
+    let themes: Vec<_> = ThemeId::ALL
+        .iter()
+        .map(|t| serde_json::json!({ "id": t.id(), "label": t.label() }))
+        .collect();
+    serde_json::json!({ "theme": current_theme().id(), "themes": themes }).to_string()
+}
+
 /// Map a browser key to an app action, mirroring the native handler: app-level
 /// transport/camera/overlay keys act directly; navigation/viewport keys forward
 /// to the flow.
@@ -395,6 +527,13 @@ fn handle_key(key: RKeyEvent, app: &mut App) {
             return;
         }
         RKeyCode::Char('r') | RKeyCode::Char('R') => return app.relayout_now(),
+
+        // Theme: `t` next, `T` previous (mirrors native). The page is notified
+        // by the key callback, after this `App` borrow ends.
+        RKeyCode::Char(c @ ('t' | 'T')) => {
+            let theme = app.theme.next(c == 'T');
+            return apply_theme(app, theme);
+        }
 
         // Overlays.
         RKeyCode::Char('i') | RKeyCode::Char('I') => {

@@ -10,6 +10,7 @@
 //! zoe <file> --follow       follow a file's live edge instead of replaying
 //! zoe <file> --speed N      playback speed multiplier (default 8.0)
 //! zoe --provider <name> ... force the transcript format instead of detecting it
+//! zoe --theme <name>        zoetrope-gold, titanium or light (`t` in the app cycles and saves)
 //! zoe inspect <file|id|dir> headless: print the session tree + info
 //! ```
 
@@ -22,10 +23,14 @@ use zoetrope::provider::{Provider, ReadMode, Target, open};
 use zoetrope::state::session::SessionModel;
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{TailRequest, UiEvent};
+use zoetrope::theme::ThemeId;
 use zoetrope::{tailer, tui};
 
 /// Channel capacity for the bounded request/event channels.
 const CHANNEL_CAP: usize = 32;
+
+/// Config subdirectory of the saved theme: `<config dir>/zoetrope/theme.json`.
+const THEME_DIR: &str = "zoetrope";
 
 /// Parsed CLI invocation.
 ///
@@ -44,6 +49,8 @@ pub enum Cli {
         follow: bool,
         speed: f64,
         provider: Option<Provider>,
+        /// `--theme`, when given; else the saved selection, else the default.
+        theme: Option<ThemeId>,
     },
     /// Headless: parse and print the session tree + info; no TUI. The target
     /// resolves like `View`'s: a file, a session id, or a project directory.
@@ -67,6 +74,7 @@ USAGE:
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
     zoe --provider <name>   force the format (claude, codex) instead of detecting it
+    zoe --theme <name>      zoetrope-gold, titanium or light (this run; `t` in the app cycles and saves)
     zoe inspect <file|id>   headless: print the session tree + info
     zoe --version           print the version and exit
 
@@ -114,6 +122,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     let mut follow = false;
     let mut speed = DEFAULT_REPLAY_SPEED;
     let mut provider = None;
+    let mut theme: Option<ThemeId> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -139,6 +148,15 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                 }
             }
             "--provider" => provider = provider_flag(&mut args)?,
+            "--theme" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--theme requires a name\n\n{USAGE}"))?;
+                theme =
+                    Some(ThemeId::parse(&v).ok_or_else(|| {
+                        anyhow!("unknown theme {v:?}; known: {}", ThemeId::known())
+                    })?);
+            }
             other if other.starts_with('-') => {
                 bail!("unknown flag {other:?}\n\n{USAGE}");
             }
@@ -156,6 +174,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         follow,
         speed,
         provider,
+        theme,
     })
 }
 
@@ -233,6 +252,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         follow,
         speed,
         provider,
+        theme,
     } = cli
     else {
         unreachable!("inspect handled in main");
@@ -278,8 +298,13 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     });
 
-    let app = App::new(session_id, mode);
-    tui::run(app, tail_tx, ui_rx).await
+    // Precedence: --theme (this run only), then the saved choice, then the
+    // default. Only an interactive change in the app is saved.
+    let path = zoetrope::theme::config_path(THEME_DIR);
+    let saved = path.as_deref().and_then(zoetrope::theme::load);
+    let mut app = App::new(session_id, mode);
+    app.set_theme(theme.or(saved).unwrap_or_default());
+    tui::run(app, tail_tx, ui_rx, path).await
 }
 
 /// What a positional argument means: an existing file is a session's file, an
@@ -384,6 +409,7 @@ mod tests {
                 follow,
                 speed,
                 provider,
+                ..
             } => {
                 assert_eq!(p, "s.jsonl");
                 assert_eq!(speed, 4.0);
@@ -406,6 +432,17 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn theme_flag_is_validated_not_ignored() {
+        match cli(&["--theme", "light"]).unwrap() {
+            Cli::View { theme, .. } => assert_eq!(theme, Some(ThemeId::Light)),
+            other => panic!("got {other:?}"),
+        }
+        assert!(cli(&["--theme", "Light"]).is_err(), "ids are exact");
+        assert!(cli(&["--theme", "neon"]).is_err());
+        assert!(cli(&["--theme"]).is_err());
     }
 
     #[test]

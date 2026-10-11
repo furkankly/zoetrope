@@ -1,0 +1,7 @@
+zoetrope is MIT licensed; see LICENSE.
+
+The Titanium theme palette (src/theme.rs, web/src/pages/app.astro) follows
+the colors of oh-my-pi by can1357, MIT.
+Source: https://github.com/can1357/oh-my-pi
+The MIT license of that source is retained in OMP-THEME-LICENSE.
+No OMP logo or font is copied.

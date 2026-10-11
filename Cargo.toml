@@ -33,7 +33,7 @@ categories = ["command-line-utilities", "development-tools", "visualization"]
 # and the browser frontend (which is what `include_str!`s the demo fixture), and
 # the GIFs and tapes are ~5MB of recordings this crate never reads.
 # Cargo adds Cargo.toml and Cargo.lock on its own.
-include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE", "/NOTICE", "/OMP-THEME-LICENSE"]
 
 [features]
 default = ["native"]

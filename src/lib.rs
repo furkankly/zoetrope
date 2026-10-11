@@ -31,6 +31,7 @@ pub mod fact;
 pub mod provider;
 pub mod state;
 pub mod tailer;
+pub mod theme;
 pub mod ui;
 
 // The native frontend: terminal loop + crossterm input.

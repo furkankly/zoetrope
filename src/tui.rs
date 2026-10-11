@@ -36,6 +36,8 @@ pub async fn run(
     // input path sends on it (auto-switch is internal to the tailer).
     _tail_tx: mpsc::Sender<TailRequest>,
     mut ui_rx: mpsc::Receiver<UiEvent>,
+    // Where an interactive theme change is saved (`None` = don't).
+    theme_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
@@ -124,6 +126,17 @@ pub async fn run(
             if route(&ev, &mut app, &mut pilot, demo) {
                 quit = true;
                 break;
+            }
+        }
+
+        if app.theme_dirty {
+            app.theme_dirty = false;
+            // A read-only config dir must not disturb the session, but the
+            // user should know the choice was not saved.
+            if let Some(p) = &theme_path
+                && let Err(e) = crate::theme::save(p, app.theme)
+            {
+                app.last_error = Some(format!("theme not saved: {e}"));
             }
         }
         while let Ok(ev) = ui_rx.try_recv() {

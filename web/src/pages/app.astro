@@ -49,15 +49,64 @@ const wasmBase = '/wasm';
     <script type="importmap" is:inline>
       { "imports": { "env": "/wasm/env.js" } }
     </script>
+    <!-- Apply the saved theme before first paint so there is no flash. The wasm
+         engine re-validates it (unknown names fall back to the default) and
+         the page then mirrors the engine's answer. -->
+    <script is:inline>
+      try {
+        const t = localStorage.getItem('zoetrope-theme');
+        if (t && /^[a-z-]{1,24}$/.test(t)) document.documentElement.dataset.theme = t;
+      } catch {}
+    </script>
     <style is:inline>
-      :root {
+      /* Page palette, one block per engine theme (`ThemeId::palette()` in
+         src/theme.rs). Keep the hexes in sync by hand: --ink canvas_bg,
+         --panel surface, --dim muted, --gold accent, --bright text, --green
+         success, --err error. Zoetrope gold is also the unthemed default. */
+      :root,
+      html[data-theme="zoetrope-gold"] {
+        color-scheme: dark;
         --gold: #d7af00;
         --gold-bright: #f0d56a;
+        --on-accent: #1a1500;
         --green: #87d787;
+        --err: #f0a0a0;
         --ink: #121212;
         --panel: #1c1c1c;
         --dim: #585858;
         --bright: #e6e6e6;
+        --line: #343434;
+        --soft: #b6b6b6;
+      }
+      html[data-theme="titanium"] {
+        color-scheme: dark;
+        --gold: #00b4ff;
+        --gold-bright: #00b4ff;
+        --on-accent: #0f1216;
+        --green: #00ff88;
+        --err: #ff4757;
+        --ink: #151820;
+        --panel: #0f1216;
+        --dim: #6b7280;
+        --bright: #e8ecf4;
+        --line: #2a3038;
+        --soft: #9ca3b0;
+      }
+      html[data-theme="light"] {
+        color-scheme: light;
+        --gold: #0066cc;
+        --gold-bright: #0066cc;
+        --on-accent: #ffffff;
+        --green: #0a7a3c;
+        --err: #c62828;
+        --ink: #eef0f4;
+        --panel: #ffffff;
+        --dim: #6b7280;
+        --bright: #111827;
+        --line: #c9ced8;
+        --soft: #4b5563;
+      }
+      :root {
         --mono: var(--font-mono), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
         --display: var(--font-display), var(--font-mono), ui-monospace, monospace;
       }
@@ -102,7 +151,7 @@ const wasmBase = '/wasm';
         gap: 0.75rem;
         padding: 0.5rem 0.75rem;
         background: var(--ink);
-        border-bottom: 1px solid #2a2a2a;
+        border-bottom: 1px solid var(--line);
         font-size: 0.8rem;
       }
       /* The wordmark is the page's <h1> — /app is a WebGl2 canvas, so without it
@@ -149,7 +198,7 @@ const wasmBase = '/wasm';
         font-size: 0.78rem;
         color: var(--bright);
         background: var(--panel);
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-radius: 6px;
         padding: 0.32rem 0.7rem;
         cursor: pointer;
@@ -163,7 +212,7 @@ const wasmBase = '/wasm';
       }
       button.act.primary {
         border-color: var(--gold);
-        color: #1a1500;
+        color: var(--on-accent);
         background: var(--gold);
         font-weight: 600;
       }
@@ -174,7 +223,7 @@ const wasmBase = '/wasm';
       button.act:disabled {
         opacity: 0.4;
         cursor: not-allowed;
-        border-color: #343434;
+        border-color: var(--line);
         color: var(--dim);
       }
       .link {
@@ -183,6 +232,29 @@ const wasmBase = '/wasm';
       }
       .link:hover {
         color: var(--bright);
+      }
+      /* The theme <select> wears the toolbar-button look; the browser's own
+         arrow stays, themed through color-scheme. */
+      select.act {
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--bright);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.3rem 0.5rem;
+        cursor: pointer;
+      }
+      select.act:hover { border-color: var(--gold); }
+      button.act:focus-visible,
+      label.act:focus-visible,
+      select.act:focus-visible,
+      .link:focus-visible {
+        outline: 2px solid var(--gold);
+        outline-offset: 2px;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .brand .glyph { animation: none; }
       }
 
       /* ── Status text (lives in the top bar, next to the wordmark) ──────── */
@@ -198,7 +270,7 @@ const wasmBase = '/wasm';
         color: var(--green);
       }
       .statusbar.err {
-        color: #f0a0a0;
+        color: var(--err);
       }
       @media (max-width: 860px) {
         .statusbar { display: none; }
@@ -239,7 +311,7 @@ const wasmBase = '/wasm';
       .mnote-card {
         max-width: 22rem;
         background: var(--ink);
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-radius: 12px;
         padding: 1.3rem 1.35rem 1.4rem;
       }
@@ -261,7 +333,7 @@ const wasmBase = '/wasm';
         margin: 0 0 1.1rem;
         font-size: 0.86rem;
         line-height: 1.55;
-        color: #b6b6b6;
+        color: var(--soft);
       }
       .mnote-card button {
         width: 100%;
@@ -269,7 +341,7 @@ const wasmBase = '/wasm';
         font-size: 0.82rem;
         color: var(--bright);
         background: var(--panel);
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-radius: 7px;
         padding: 0.55rem 0.9rem;
         cursor: pointer;
@@ -296,7 +368,7 @@ const wasmBase = '/wasm';
         display: flex;
         flex-direction: column;
         background: var(--ink);
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-radius: 10px;
         overflow: hidden;
         box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
@@ -306,7 +378,7 @@ const wasmBase = '/wasm';
         align-items: center;
         justify-content: space-between;
         padding: 0.7rem 0.9rem;
-        border-bottom: 1px solid #2a2a2a;
+        border-bottom: 1px solid var(--line);
         font-size: 0.85rem;
         color: var(--gold-bright);
       }
@@ -351,14 +423,14 @@ const wasmBase = '/wasm';
         padding: 0.55rem 0.7rem;
         border: 1px solid var(--line);
         border-radius: 6px;
-        background: rgba(215, 175, 0, 0.05);
+        background: color-mix(in srgb, var(--gold) 5%, transparent);
         color: var(--dim);
         font-size: 0.78rem;
         line-height: 1.5;
       }
       .help-body code {
         background: var(--panel);
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-radius: 5px;
         padding: 0.1rem 0.42rem;
         color: var(--gold-bright);
@@ -369,7 +441,7 @@ const wasmBase = '/wasm';
         font-size: 0.72rem;
         color: var(--dim);
         background: none;
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-radius: 5px;
         padding: 0.05rem 0.42rem;
         cursor: pointer;
@@ -384,7 +456,7 @@ const wasmBase = '/wasm';
       .help-steps li { margin: 0.3rem 0; }
       .help-body kbd {
         background: var(--panel);
-        border: 1px solid #343434;
+        border: 1px solid var(--line);
         border-bottom-width: 2px;
         border-radius: 4px;
         padding: 0.02rem 0.34rem;
@@ -413,7 +485,7 @@ const wasmBase = '/wasm';
       }
       .session-row:hover {
         background: var(--panel);
-        border-color: #343434;
+        border-color: var(--line);
       }
       .session-row.live:hover {
         border-color: var(--green);
@@ -476,6 +548,12 @@ const wasmBase = '/wasm';
       <input id="dir-input" type="file" webkitdirectory hidden />
 
       <button id="reset" class="act" title="Reload the bundled demo session">Demo</button>
+
+      <select id="theme" class="act" aria-label="Color theme" title="Color theme (t / T on the graph)">
+        <option value="zoetrope-gold">Zoetrope gold</option>
+        <option value="titanium">Titanium</option>
+        <option value="light">Light</option>
+      </select>
 
       <a class="link" href={REPO_URL} target="_blank" rel="noopener">GitHub ↗</a>
     </div>
@@ -551,7 +629,7 @@ const wasmBase = '/wasm';
     </div>
 
     <script is:inline type="module">
-      import init, { zoetrope_load, zoetrope_append, zoetrope_session_file } from '/wasm/web.js';
+      import init, { zoetrope_load, zoetrope_append, zoetrope_session_file, zoetrope_set_theme, zoetrope_themes } from '/wasm/web.js';
 
       const statusEl = document.getElementById('status');
       const dropEl = document.getElementById('drop');
@@ -1437,10 +1515,46 @@ const wasmBase = '/wasm';
         if (files.length) loadFiles(files);
       });
 
+      // ── Theme ────────────────────────────────────────────────────────────
+      // The engine owns the registry and the palette (localStorage key
+      // `zoetrope-theme`); the page only mirrors it into CSS and the <select>.
+      // Switching never reloads: session, camera, selection and playhead stay.
+      // `t`/`T` on the canvas change the theme inside the engine, which then
+      // fires `zoetrope-theme` after releasing its own state, so this handler
+      // may call back into the engine.
+      const themeSel = document.getElementById('theme');
+      function syncTheme() {
+        let state;
+        try {
+          state = JSON.parse(zoetrope_themes());
+        } catch (e) {
+          setStatus('Theme selector unavailable: ' + (e?.message ?? e), true);
+          return;
+        }
+        const { theme, themes } = state;
+        if (themeSel.options.length !== themes.length) {
+          themeSel.replaceChildren(...themes.map((t) => new Option(t.label, t.id)));
+        }
+        themeSel.value = theme;
+        document.documentElement.dataset.theme = theme;
+      }
+      themeSel.addEventListener('change', () => {
+        if (!ready) return;
+        try {
+          const r = JSON.parse(zoetrope_set_theme(themeSel.value));
+          if (r.error) setStatus(r.error + '; known: ' + r.known, true);
+        } catch (e) {
+          setStatus('Could not switch theme: ' + (e?.message ?? e), true);
+        }
+        syncTheme(); // also reverts the <select> after a rejected name
+      });
+      window.addEventListener('zoetrope-theme', syncTheme);
+
       // ── Boot ─────────────────────────────────────────────────────────────
       try {
         await init();
         ready = true;
+        syncTheme();
         setStatus('demo · use “Sessions” to browse your sessions, or drop a transcript');
       } catch (e) {
         setStatus('Failed to load the wasm app: ' + (e?.message ?? e), true);

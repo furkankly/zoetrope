@@ -7,7 +7,6 @@
 //! survives because node ids are stable and we never clear-and-re-add.
 
 use rataflow::{Edge, Flow, Handle, HandlePosition, Node, Reconnectable, Sugiyama, Theme};
-use ratatui::style::Color;
 
 use super::session::{AgentInfo, AgentKind, AgentStatus, SessionModel};
 use crate::ui::edges::AgentEdge;
@@ -23,12 +22,10 @@ pub type AgentFlow = Flow<AgentNode, AgentEdge>;
 /// (detail panel persists), `with_min_zoom(0.1)` (Sugiyama trees outgrow the
 /// default fit-view limit). Hidden source/target handles for a clean look.
 pub fn new_flow() -> AgentFlow {
-    // zoetrope identity palette: stock dark base, but `accent` becomes GOLD —
-    // selection highlights, done medals, the REPLAY badge. Green stays
-    // exclusively "alive" (status), red "failed". Every surface resolves from
-    // flow.theme, so this one assignment brands the whole app.
-    let mut palette = Theme::Dark.palette();
-    palette.accent = Color::Indexed(178);
+    // The default theme, shared by native and wasm rendering; `App::set_theme`
+    // swaps the palette in place afterwards. Every surface resolves from
+    // flow.theme.
+    let palette = crate::theme::ThemeId::DEFAULT.palette();
     let mut flow = Flow::new()
         .with_theme(Theme::Custom(palette))
         .with_deselect_on_pane_click(false)
