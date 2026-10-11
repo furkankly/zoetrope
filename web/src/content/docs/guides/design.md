@@ -6,7 +6,7 @@ description: "How zoetrope stays correct: an event-sourced projection, two clock
 zoetrope has one hard job, and most of its design follows from it:
 
 > Reconstruct a faithful, navigable, live-or-replayed view of a coding agent's
-> session (Claude Code, Codex) from a transcript that is **undocumented,
+> session (Claude Code, Codex, OMP/Pi) from a transcript that is **undocumented,
 > append-only, only partly timestamped, and split across files**, and in which
 > **you often can't tell when something finished.**
 
@@ -82,7 +82,7 @@ Anything that overrides a fact already in the model is a bug.
 ## One boundary per format
 
 Every transcript format enters through a **provider**, one for Claude Code and
-one for Codex. A provider turns its own records into **facts**, a small shared
+one for Codex, one for OMP/Pi. A provider turns its own records into **facts**, a small shared
 vocabulary (an agent exists, a tool call started, a tool call ended with this
 outcome, an agent's end was observed), and the core folds facts without knowing
 which format stated them. The rule that decides what belongs on which side:

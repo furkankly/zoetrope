@@ -73,6 +73,7 @@ use crate::fact::Statement;
 // browser frontend goes through `tailer::Bundle`.
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod omp;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -85,21 +86,27 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    /// OMP (oh-my-pi) and Pi: one shared session format.
+    Omp,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Omp => "omp",
         }
     }
 
     /// The reverse of [`name`](Self::name), for `--provider`.
     pub fn parse(name: &str) -> Option<Provider> {
+        if name.eq_ignore_ascii_case("pi") {
+            return Some(Provider::Omp);
+        }
         Provider::ALL
             .into_iter()
             .find(|p| p.name().eq_ignore_ascii_case(name))
@@ -116,6 +123,7 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    Omp(omp::Stream),
 }
 
 impl Stream {
@@ -125,6 +133,34 @@ impl Stream {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::Omp(s) => s.push(line),
+        }
+    }
+
+    /// Parse a batch of lines in order. Equal to pushing each, except a
+    /// format whose file is a tree (OMP) states only the current branch.
+    pub fn push_lines<'a>(&mut self, lines: impl IntoIterator<Item = &'a str>) -> Vec<Statement> {
+        match self {
+            Stream::Omp(s) => s.push_lines(lines),
+            _ => lines.into_iter().filter_map(|l| self.push(l)).collect(),
+        }
+    }
+
+    /// Whether the last batch invalidated what this stream already stated,
+    /// so the whole file must be re-read through a fresh stream.
+    pub fn take_rebuild(&mut self) -> bool {
+        match self {
+            Stream::Omp(s) => s.take_rebuild(),
+            _ => false,
+        }
+    }
+
+    /// Spawn ids this stream's file states only on discarded branches (OMP).
+    /// Empty for formats whose files have no branches.
+    pub fn discarded_spawns(&self) -> std::collections::HashSet<String> {
+        match self {
+            Stream::Omp(s) => s.spawn_sets().1,
+            _ => Default::default(),
         }
     }
 }
@@ -137,6 +173,9 @@ pub fn provider_of(head: &str) -> Option<Provider> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let obj = v.as_object()?;
     let kind = obj.get("type").and_then(|t| t.as_str());
+    if omp::wire::looks_like_omp(line) {
+        return Some(Provider::Omp);
+    }
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
     }
@@ -340,6 +379,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::Omp => omp::discovery::all_paths(scope),
         }
     }
 
@@ -348,6 +388,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::Omp => omp::discovery::session_file(path),
         }
     }
 
@@ -358,6 +399,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::Omp => omp::discovery::related_paths(file),
         }
     }
 
@@ -366,6 +408,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::Omp => omp::discovery::project_key(cwd),
         }
     }
 
@@ -376,6 +419,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::Omp => omp::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
         }
     }
 
@@ -384,6 +428,14 @@ impl Provider {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::Omp => Stream::Omp(omp::Stream::new(match &file.role {
+                FileRole::Root => None,
+                _ => file
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned),
+            })),
         }
     }
 
@@ -394,7 +446,26 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
             Provider::Codex => None,
+            Provider::Omp => None,
         }
+    }
+
+    /// Whether `file` is a thread spawned on a branch discarded in some
+    /// stream (`discarded`, from [`Stream::discarded_spawns`]), or nested
+    /// below one. Only OMP threads can be; everything else is kept.
+    pub fn is_pruned(
+        self,
+        file: &SessionFile,
+        discarded: &std::collections::HashSet<String>,
+    ) -> bool {
+        self == Provider::Omp
+            && !discarded.is_empty()
+            && file.role != FileRole::Root
+            && file
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| omp::is_pruned(n, discarded))
     }
 }
 
@@ -586,6 +657,19 @@ mod tests {
         assert_eq!(provider_of(r#"{"agentType":"guide"}"#), None);
         assert_eq!(provider_of("not json"), None);
         assert_eq!(provider_of(""), None);
+    }
+
+    #[test]
+    fn omp_is_detected_by_content_and_pi_is_its_alias() {
+        assert_eq!(
+            provider_of(
+                r#"{"type":"session","version":3,"id":"01a1289f-e579-722c-bfe1-cded8884534d","timestamp":"2026-10-11T01:42:10.000Z","cwd":"/p"}"#
+            ),
+            Some(Provider::Omp)
+        );
+        assert_eq!(Provider::parse("omp"), Some(Provider::Omp));
+        assert_eq!(Provider::parse("Pi"), Some(Provider::Omp));
+        assert_eq!(Provider::Omp.name(), "omp");
     }
 
     #[test]

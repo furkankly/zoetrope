@@ -52,11 +52,11 @@ too_old() { report "$1" "Upgrade with one of" "brew upgrade" " --force"; }
 missing() { report "$1" "Install it with one of" "brew install" ""; }
 
 check() {
-  if takes_provider; then
-    echo "zoe $(version_of) at $(command -v zoe) opens sessions by id: good."
+  if takes_provider && zoe --help 2>/dev/null | grep -- '--provider' | grep -qw omp; then
+    echo "zoe $(version_of) at $(command -v zoe) opens sessions by id and OMP/Pi sessions by path: good."
     return 0
   fi
-  too_old "zoe $(version_of) at $(command -v zoe) does not take --provider, so it cannot open the session Herdr names. That arrived in $ZOE_SINCE."
+  too_old "zoe $(version_of) at $(command -v zoe) does not take --provider omp, so it cannot open the OMP/Pi session Herdr names."
 }
 
 if command -v zoe >/dev/null 2>&1; then

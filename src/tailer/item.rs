@@ -206,6 +206,13 @@ pub struct Bundle {
     session: String,
     streams: HashMap<String, Stream>,
     seen: std::collections::HashSet<String>,
+    /// Every accepted OMP file's classification and whole text, so a branch
+    /// switch can rebuild from scratch instead of folding the abandoned
+    /// branch (pruned children are kept raw, to restore on switching back).
+    files: HashMap<String, (SessionFile, String)>,
+    /// Set by [`append`](Self::append) when a branch switch made it rebuild:
+    /// the whole current-branch stream, for [`take_reload`](Self::take_reload).
+    reload: Option<(Vec<ReplayItem>, crate::state::SessionInfo)>,
 }
 
 impl Bundle {
@@ -236,13 +243,22 @@ impl Bundle {
             session: root.session.clone(),
             streams: HashMap::new(),
             seen: std::collections::HashSet::new(),
+            files: HashMap::new(),
+            reload: None,
         };
         let mut items: Vec<ReplayItem> = Vec::new();
         // Root first, then the rest in the order given.
         let mut ordered: Vec<&(SessionFile, &str)> = classified.iter().collect();
-        ordered.sort_by_key(|(f, _)| f.path != root.path);
+        ordered.sort_by_key(|(f, _)| spawn_order(f));
         for (file, text) in ordered {
             if file.session != bundle.session {
+                continue;
+            }
+            if bundle.pruned(file) {
+                bundle.files.insert(
+                    file.path.to_string_lossy().into_owned(),
+                    (file.clone(), (*text).to_string()),
+                );
                 continue;
             }
             items.extend(bundle.feed(file, text).into_iter().map(ReplayItem::new));
@@ -252,12 +268,26 @@ impl Bundle {
     }
 
     /// Feed newly-read text: appended bytes for a file already loaded, or a
-    /// whole new file. Returns what it stated, in order.
+    /// whole new file. Returns what it stated, in order. When a branch switch
+    /// invalidated stated history it returns nothing and the rebuilt stream
+    /// waits in [`take_reload`](Self::take_reload).
     pub fn append(&mut self, files: &[(&str, &str)]) -> Vec<Statement> {
         let mut out = Vec::new();
+        let mut rebuild = false;
         for (path, text) in files {
             if let Some(stream) = self.streams.get_mut(*path) {
-                out.extend(text.lines().filter_map(|l| stream.push(l)));
+                out.extend(stream.push_lines(text.lines()));
+                rebuild |= stream.take_rebuild();
+                if let Some((_, all)) = self.files.get_mut(*path) {
+                    all.push('\n');
+                    all.push_str(text);
+                }
+                continue;
+            }
+            // Appends to a retained (pruned) child only grow its raw text.
+            if let Some((_, all)) = self.files.get_mut(*path) {
+                all.push('\n');
+                all.push_str(text);
                 continue;
             }
             let Some(file) = self
@@ -269,9 +299,57 @@ impl Bundle {
             if file.session != self.session || file.role == FileRole::Root {
                 continue;
             }
+            if self.pruned(&file) {
+                self.files
+                    .insert((*path).to_string(), (file, (*text).to_string()));
+                continue;
+            }
             out.extend(self.feed(&file, text));
         }
+        // A child already fed whose spawner just moved to a discarded branch
+        // has facts in the timeline: only a rebuild removes them.
+        rebuild |= self
+            .files
+            .iter()
+            .any(|(key, (f, _))| self.streams.contains_key(key) && self.pruned(f));
+        if rebuild {
+            self.reload = Some(self.rebuild());
+            return Vec::new();
+        }
         out
+    }
+
+    /// Re-read every kept file whole through fresh streams.
+    fn rebuild(&mut self) -> (Vec<ReplayItem>, crate::state::SessionInfo) {
+        let mut all: Vec<(SessionFile, String)> = self.files.drain().map(|(_, v)| v).collect();
+        all.sort_by_key(|(f, _)| spawn_order(f));
+        self.streams.clear();
+        self.seen.clear();
+        let mut items = Vec::new();
+        for (file, text) in &all {
+            if self.pruned(file) {
+                // Keep the raw text: switching back to the branch that
+                // spawned it restores the child.
+                self.files.insert(
+                    file.path.to_string_lossy().into_owned(),
+                    (file.clone(), text.clone()),
+                );
+                continue;
+            }
+            items.extend(self.feed(file, text).into_iter().map(ReplayItem::new));
+        }
+        finish(items)
+    }
+
+    /// Whether `file` is a thread spawned on a branch some fed stream
+    /// discarded (or nested below one): its graph nodes must not exist.
+    fn pruned(&self, file: &SessionFile) -> bool {
+        let discarded: std::collections::HashSet<String> = self
+            .streams
+            .values()
+            .flat_map(|s| s.discarded_spawns())
+            .collect();
+        self.provider.is_pruned(file, &discarded)
     }
 
     /// One file's statements: through a new stream for a tailed file (kept for
@@ -281,8 +359,11 @@ impl Bundle {
         match file.read {
             ReadMode::Tail => {
                 let mut stream = self.provider.stream_for(file);
-                let out: Vec<Statement> = text.lines().filter_map(|l| stream.push(l)).collect();
-                self.streams.insert(key, stream);
+                let out = stream.push_lines(text.lines());
+                self.streams.insert(key.clone(), stream);
+                if self.provider == Provider::Omp {
+                    self.files.insert(key, (file.clone(), text.to_string()));
+                }
                 out
             }
             ReadMode::Whole => {
@@ -299,6 +380,12 @@ impl Bundle {
                 }
             }
         }
+    }
+
+    /// The rebuilt current-branch stream after a branch switch, once. The
+    /// consumer replaces its timeline with it.
+    pub fn take_reload(&mut self) -> Option<(Vec<ReplayItem>, crate::state::SessionInfo)> {
+        self.reload.take()
     }
 
     pub fn provider(&self) -> Provider {
@@ -321,6 +408,18 @@ impl Bundle {
         v.sort();
         v
     }
+}
+
+/// Feed order: root first, then shallower threads before deeper ones, so a
+/// spawner's stream has stated its discarded branches before its children
+/// are admitted.
+fn spawn_order(f: &SessionFile) -> (bool, usize, std::path::PathBuf) {
+    let depth = f
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or(0, |s| s.matches('.').count());
+    (f.role != FileRole::Root, depth, f.path.clone())
 }
 
 /// The first non-blank line, for classification.
@@ -563,5 +662,167 @@ mod tests {
                 .append(&[("rollout-2026-08-26T16-00-00-z.jsonl", stranger)])
                 .is_empty()
         );
+    }
+
+    /// OMP/Pi branch switch: initial load states only the active branch; an
+    /// append that leaves stated history reloads everything, dropping the
+    /// abandoned branch's tool calls and spawned agents.
+    #[test]
+    fn bundle_omp_branch_switch_reloads_without_abandoned_nodes() {
+        let root = "2026-10-11T01-42-10-041Z_01a1289f-e579-722c-bfe1-cded8884534d.jsonl";
+        let head = r#"{"type":"session","version":3,"id":"01a1289f-e579-722c-bfe1-cded8884534d","timestamp":"2026-10-11T01:42:10.000Z","cwd":"/p"}"#;
+        let a = r#"{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-11T01:42:11.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let b = r#"{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-11T01:42:12.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"dead","name":"task","arguments":{}}]}}"#;
+        let d = r#"{"type":"message","id":"d","parentId":"b","timestamp":"2026-10-11T01:42:13.000Z","message":{"role":"toolResult","toolCallId":"dead","toolName":"task","content":[],"details":{"progress":[{"id":"X","agent":"scout"}]}}}"#;
+        let c = r#"{"type":"message","id":"c","parentId":"a","timestamp":"2026-10-11T01:42:14.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"live","name":"read","arguments":{"path":"/p/a"}}]}}"#;
+        let has_dead = |items: &[ReplayItem]| {
+            items.iter().any(|i| {
+                i.any(|f| {
+                    f.agent.as_deref() == Some("X")
+                        || matches!(&f.kind, FactKind::ToolStart { call, .. } if call == "dead")
+                })
+            })
+        };
+        let text = [head, a, b, d].join("\n");
+        let (mut bundle, items, _) = Bundle::load(&[(root, &text)]).unwrap();
+        assert!(has_dead(&items), "the tip is on the task branch");
+
+        // Whole-file load of the branched file never states the dead branch.
+        let all = [head, a, b, d, c].join("\n");
+        let (_, items, _) = Bundle::load(&[(root, &all)]).unwrap();
+        assert!(!has_dead(&items));
+
+        // The same state reached by append reloads to the same thing.
+        assert!(bundle.append(&[(root, c)]).is_empty());
+        let (items, _) = bundle.take_reload().expect("branch switch must reload");
+        assert!(!has_dead(&items));
+        assert!(items.iter().any(|i| {
+            i.any(|f| matches!(&f.kind, FactKind::ToolStart { call, .. } if call == "live"))
+        }));
+        assert!(bundle.take_reload().is_none());
+        // Streams survive the reload: a further append folds normally.
+        let e = r#"{"type":"message","id":"e","parentId":"c","timestamp":"2026-10-11T01:42:15.000Z","message":{"role":"user","content":[{"type":"text","text":"more"}]}}"#;
+        assert_eq!(bundle.append(&[(root, e)]).len(), 1);
+        assert!(bundle.take_reload().is_none());
+    }
+
+    /// A child spawned only on a discarded branch (and its nested child)
+    /// leaves no graph node or activity; the active branch's child and a
+    /// header-only older thread stay. Same on initial load and on rebuild.
+    #[test]
+    fn bundle_omp_prunes_children_of_discarded_branch() {
+        let stem = "2026-10-11T01-42-10-041Z_01a1289f-e579-722c-bfe1-cded8884534d";
+        let root = format!("{stem}.jsonl");
+        let head = r#"{"type":"session","version":3,"id":"01a1289f-e579-722c-bfe1-cded8884534d","timestamp":"2026-10-11T01:42:10.000Z","cwd":"/p"}"#;
+        let a = r#"{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-11T01:42:11.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let b = r#"{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-11T01:42:12.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"dead","name":"task","arguments":{}}]}}"#;
+        let d = r#"{"type":"message","id":"d","parentId":"b","timestamp":"2026-10-11T01:42:13.000Z","message":{"role":"toolResult","toolCallId":"dead","toolName":"task","content":[],"details":{"progress":[{"id":"X","agent":"scout"}]}}}"#;
+        let c = r#"{"type":"message","id":"c","parentId":"a","timestamp":"2026-10-11T01:42:14.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"live","name":"task","arguments":{}}]}}"#;
+        let f = r#"{"type":"message","id":"f","parentId":"c","timestamp":"2026-10-11T01:42:15.000Z","message":{"role":"toolResult","toolCallId":"live","toolName":"task","content":[],"details":{"progress":[{"id":"Y","agent":"scout"}]}}}"#;
+        let child = |parent: &str, call: &str| {
+            format!(
+                r#"{{"type":"session","version":3,"id":"k","timestamp":"2026-10-11T01:42:16.000Z","cwd":"/p","parentSession":"{parent}"}}
+{{"type":"message","id":"m","parentId":null,"timestamp":"2026-10-11T01:42:17.000Z","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"{call}","name":"read","arguments":{{"path":"/p/a"}}}}]}}}}"#
+            )
+        };
+        let rootp = format!("{stem}.jsonl");
+        let xp = format!("{stem}/X.jsonl");
+        let xzp = format!("{stem}/X.Z.jsonl");
+        let yp = format!("{stem}/Y.jsonl");
+        let oldp = format!("{stem}/Old.jsonl");
+        let all = [head, a, b, d, c, f].join("\n");
+        let (x, xz, y) = (
+            child(&rootp, "xcall"),
+            child(&xp, "xzcall"),
+            child(&rootp, "ycall"),
+        );
+        let old = child(&rootp, "oldcall");
+        let files = [
+            (root.as_str(), all.as_str()),
+            (xp.as_str(), x.as_str()),
+            (xzp.as_str(), xz.as_str()),
+            (yp.as_str(), y.as_str()),
+            (oldp.as_str(), old.as_str()),
+        ];
+        let by = |items: &[ReplayItem], id: &str| {
+            items
+                .iter()
+                .any(|i| i.any(|f| f.agent.as_deref() == Some(id)))
+        };
+        let check = |items: &[ReplayItem]| {
+            assert!(!by(items, "X"), "discarded child");
+            assert!(!by(items, "X.Z"), "nested descendant");
+            assert!(by(items, "Y"), "active child stays");
+            assert!(by(items, "Old"), "header-only older thread stays");
+        };
+        let (mut bundle, items, _) = Bundle::load(&files).unwrap();
+        check(&items);
+
+        // Same via append: dead branch first, then the switch reloads.
+        let early = [head, a, b, d].join("\n");
+        let (mut b2, items, _) = Bundle::load(&[
+            (root.as_str(), early.as_str()),
+            (xp.as_str(), x.as_str()),
+            (xzp.as_str(), xz.as_str()),
+            (yp.as_str(), y.as_str()),
+            (oldp.as_str(), old.as_str()),
+        ])
+        .unwrap();
+        assert!(
+            by(&items, "X") && by(&items, "X.Z"),
+            "tip is on the dead branch"
+        );
+        assert!(
+            b2.append(&[(root.as_str(), [c, f].join("\n").as_str())])
+                .is_empty()
+        );
+        let (items, _) = b2.take_reload().expect("branch switch must reload");
+        check(&items);
+        assert!(bundle.take_reload().is_none());
+    }
+
+    /// One append states, on a new branch, a spawn result and the entry that
+    /// leaves it behind. The already-loaded child is now on a discarded branch
+    /// with no stated history to trigger a rebuild: the bundle must still drop
+    /// it, and bring it back when the branch with the spawn returns.
+    #[test]
+    fn bundle_omp_same_append_spawn_and_discard_prunes_loaded_child_and_restores() {
+        let stem = "2026-10-11T01-42-10-041Z_01a1289f-e579-722c-bfe1-cded8884534d";
+        let root = format!("{stem}.jsonl");
+        let xp = format!("{stem}/X.jsonl");
+        let head = r#"{"type":"session","version":3,"id":"01a1289f-e579-722c-bfe1-cded8884534d","timestamp":"2026-10-11T01:42:10.000Z","cwd":"/p"}"#;
+        let a = r#"{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-11T01:42:11.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let b = r#"{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-11T01:42:12.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"dead","name":"task","arguments":{}}]}}"#;
+        let d = r#"{"type":"message","id":"d","parentId":"b","timestamp":"2026-10-11T01:42:13.000Z","message":{"role":"toolResult","toolCallId":"dead","toolName":"task","content":[],"details":{"progress":[{"id":"X","agent":"scout"}]}}}"#;
+        let c = r#"{"type":"message","id":"c","parentId":"a","timestamp":"2026-10-11T01:42:14.000Z","message":{"role":"assistant","content":[{"type":"text","text":"other way"}]}}"#;
+        let f = r#"{"type":"message","id":"f","parentId":"d","timestamp":"2026-10-11T01:42:15.000Z","message":{"role":"assistant","content":[{"type":"text","text":"back"}]}}"#;
+        let x = format!(
+            r#"{{"type":"session","version":3,"id":"k","timestamp":"2026-10-11T01:42:16.000Z","cwd":"/p","parentSession":"{root}"}}
+{{"type":"message","id":"m","parentId":null,"timestamp":"2026-10-11T01:42:17.000Z","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"xcall","name":"read","arguments":{{"path":"/p/a"}}}}]}}}}"#
+        );
+        let by_x = |items: &[ReplayItem]| {
+            items
+                .iter()
+                .any(|i| i.any(|f| f.agent.as_deref() == Some("X")))
+        };
+        let first = [head, a].join("\n");
+        let (mut bundle, items, _) =
+            Bundle::load(&[(root.as_str(), first.as_str()), (xp.as_str(), x.as_str())]).unwrap();
+        assert!(by_x(&items), "nothing discarded yet");
+
+        assert!(
+            bundle
+                .append(&[(root.as_str(), [b, d, c].join("\n").as_str())])
+                .is_empty()
+        );
+        let (items, _) = bundle
+            .take_reload()
+            .expect("a child left on a discarded branch must reload");
+        assert!(!by_x(&items), "loaded child of the discarded branch stays");
+
+        // Back to the branch that spawned it: the retained text restores X.
+        assert!(bundle.append(&[(root.as_str(), f)]).is_empty());
+        let (items, _) = bundle.take_reload().expect("switching back must reload");
+        assert!(by_x(&items), "child not restored with its branch");
     }
 }

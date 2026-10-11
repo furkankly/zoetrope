@@ -150,6 +150,17 @@ impl LiveSession {
         self.tracked.insert(file.path.clone(), (stream, state));
     }
 
+    /// Whether `file` is a thread spawned on a branch some followed stream
+    /// discarded, or nested below one: it is not part of the session.
+    fn pruned(&self, file: &SessionFile) -> bool {
+        let discarded: HashSet<String> = std::iter::once(&self.main_stream)
+            .chain(self.tracked.values().map(|(s, _)| s))
+            .chain(self.seed_streams.values())
+            .flat_map(Stream::discarded_spawns)
+            .collect();
+        self.session.provider.is_pruned(file, &discarded)
+    }
+
     /// The target that re-attaches this same session from scratch.
     fn reattach(&self) -> Target {
         Target::Path(self.root_path().to_path_buf())
@@ -301,13 +312,36 @@ async fn poll_live(
             return Some(session.reattach());
         }
         ReadResult::Lines(lines) => {
-            statements.extend(lines.iter().filter_map(|l| session.main_stream.push(l)));
+            statements.extend(
+                session
+                    .main_stream
+                    .push_lines(lines.iter().map(String::as_str)),
+            );
+            // The user branched away from stated history: re-attach, which
+            // re-reads the whole file on its current branch.
+            if session.main_stream.take_rebuild() {
+                let _ = ui_tx
+                    .send(UiEvent::SessionReset {
+                        session_id: session_id.to_string(),
+                    })
+                    .await;
+                return Some(session.reattach());
+            }
         }
         ReadResult::NoChange | ReadResult::Missing => {}
     }
 
     // --- the session's other files: known ones and any that appeared ---
-    scan_files(session, &mut statements);
+    if scan_files(session, &mut statements) {
+        // A followed child now belongs to a discarded branch: its facts are in
+        // the model, so re-attach for a rebuilt one without its node.
+        let _ = ui_tx
+            .send(UiEvent::SessionReset {
+                session_id: session_id.to_string(),
+            })
+            .await;
+        return Some(session.reattach());
+    }
 
     // --- read each tracked non-root file ---
     if read_tracked(&mut session.tracked, &mut statements) {
@@ -391,7 +425,8 @@ fn read_tracked(
     for (path, (stream, state)) in tracked.iter_mut() {
         match read_appended(path, state) {
             ReadResult::Lines(lines) => {
-                statements.extend(lines.iter().filter_map(|l| stream.push(l)));
+                statements.extend(stream.push_lines(lines.iter().map(String::as_str)));
+                reset |= stream.take_rebuild();
             }
             ReadResult::Reset => reset = true,
             ReadResult::NoChange | ReadResult::Missing => {}
@@ -403,18 +438,57 @@ fn read_tracked(
 /// Register every file the session has, including any that appeared since
 /// the last tick: tailed files are tracked (idempotent), whole-read sidecars
 /// are stated once they parse.
-fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) {
+fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) -> bool {
     session.session.rescan();
-    let files = session.session.files.clone();
+    // A thread already followed that now descends from a discarded branch has
+    // facts in the UI model: only a re-attach (fresh read) removes them.
+    if session
+        .session
+        .files
+        .iter()
+        .any(|f| session.tracked.contains_key(&f.path) && session.pruned(f))
+    {
+        return true;
+    }
+    let mut files = session.session.files.clone();
+    // Spawners before the threads they spawned (OMP nests by `.`), so a
+    // stream's discarded branches are known before its children are admitted.
+    files.sort_by_key(|f| thread_depth(&f.path));
     let provider = session.session.provider;
+    // Threads tracked this call have not been read yet, so their own
+    // discarded branches are unknown: their children wait for the next tick.
+    let mut fresh: HashSet<String> = HashSet::new();
     for file in &files {
         match file.read {
-            ReadMode::Tail => session.track(file),
+            ReadMode::Tail => {
+                let stem = file.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if session.tracked.contains_key(&file.path) {
+                    continue;
+                }
+                // A thread tracked this call has not been read, so none of
+                // its descendants (at any depth) can be judged yet.
+                let waits = stem
+                    .match_indices('.')
+                    .any(|(i, _)| fresh.contains(&stem[..i]));
+                if waits || session.pruned(file) {
+                    continue;
+                }
+                fresh.insert(stem.to_string());
+                session.track(file);
+            }
             ReadMode::Whole => {
                 emit_whole(provider, file, &mut session.seen_whole, statements);
             }
         }
     }
+    false
+}
+
+/// Nesting depth of a thread file by its stem's dots.
+pub(crate) fn thread_depth(path: &Path) -> usize {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map_or(0, |s| s.matches('.').count())
 }
 
 /// State a whole-read sidecar's facts once its text parses.
@@ -717,6 +791,124 @@ mod tests {
             }
         }
         assert!(saw_reset);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fresh attach to `A`, `A.B`, `A.B.C` where `A`'s own file discards
+    /// branch `A.B`. `A.B` waits (its spawner is unread), and so must `A.B.C`;
+    /// admitting it makes the next tick see a followed descendant of a pruned
+    /// branch and re-attach, forever (each attach is fresh again).
+    #[tokio::test]
+    async fn fresh_nested_omp_descendants_wait_for_every_ancestor() {
+        let stem = "2026-10-11T01-42-10-041Z_01a1289f-e579-722c-bfe1-cded8884534d";
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("zoetrope_nested_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kids = dir.join(stem);
+        std::fs::create_dir_all(&kids).unwrap();
+        let root = dir.join(format!("{stem}.jsonl"));
+        let head = |id: &str| {
+            format!(
+                r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-10-11T01:42:10.000Z","cwd":"/p"}}"#
+            )
+        };
+        std::fs::write(
+            &root,
+            format!("{}\n", head("01a1289f-e579-722c-bfe1-cded8884534d")),
+        )
+        .unwrap();
+        let msg = |id: &str, parent: &str, body: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":{parent},"timestamp":"2026-10-11T01:42:12.000Z","message":{body}}}"#
+            )
+        };
+        let a_lines = [
+            head("k"),
+            msg("a", "null", r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#),
+            msg(
+                "b",
+                r#""a""#,
+                r#"{"role":"assistant","content":[{"type":"toolCall","id":"dead","name":"task","arguments":{}}]}"#,
+            ),
+            msg(
+                "d",
+                r#""b""#,
+                r#"{"role":"toolResult","toolCallId":"dead","toolName":"task","content":[],"details":{"progress":[{"id":"A.B","agent":"scout"}]}}"#,
+            ),
+            msg(
+                "c",
+                r#""a""#,
+                r#"{"role":"assistant","content":[{"type":"text","text":"other way"}]}"#,
+            ),
+        ]
+        .join("\n");
+        std::fs::write(kids.join("A.jsonl"), format!("{a_lines}\n")).unwrap();
+        for name in ["A.B.jsonl", "A.B.C.jsonl"] {
+            std::fs::write(kids.join(name), format!("{}\n", head("k"))).unwrap();
+        }
+
+        let (tx, _rx) = mpsc::channel(64);
+        let session = open(&Target::Path(root.clone()), None).unwrap();
+        let mut live = LiveSession::new(session, None, None);
+        for tick in 0..3 {
+            assert_eq!(
+                poll_live(&mut live, "01a1289f", &tx).await,
+                None,
+                "tick {tick} re-attached: a followed descendant of a discarded branch"
+            );
+        }
+        assert!(live.tracked.contains_key(&kids.join("A.jsonl")));
+        assert!(!live.tracked.contains_key(&kids.join("A.B.jsonl")));
+        assert!(
+            !live.tracked.contains_key(&kids.join("A.B.C.jsonl")),
+            "grandchild of a discarded branch was admitted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One append to the root states a spawn result AND branches away from it
+    /// in the same poll: the already-followed child is now pruned, and only a
+    /// re-attach removes its facts.
+    #[tokio::test]
+    async fn same_poll_spawn_and_divergence_reattaches_for_followed_child() {
+        use std::io::Write;
+
+        let stem = "2026-10-11T01-42-10-041Z_01a1289f-e579-722c-bfe1-cded8884534d";
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("zoetrope_samepoll_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kids = dir.join(stem);
+        std::fs::create_dir_all(&kids).unwrap();
+        let root = dir.join(format!("{stem}.jsonl"));
+        let head = r#"{"type":"session","version":3,"id":"01a1289f-e579-722c-bfe1-cded8884534d","timestamp":"2026-10-11T01:42:10.000Z","cwd":"/p"}"#;
+        let a = r#"{"type":"message","id":"a","parentId":null,"timestamp":"2026-10-11T01:42:11.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let b = r#"{"type":"message","id":"b","parentId":"a","timestamp":"2026-10-11T01:42:12.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"dead","name":"task","arguments":{}}]}}"#;
+        let d = r#"{"type":"message","id":"d","parentId":"b","timestamp":"2026-10-11T01:42:13.000Z","message":{"role":"toolResult","toolCallId":"dead","toolName":"task","content":[],"details":{"progress":[{"id":"X","agent":"scout"}]}}}"#;
+        let c = r#"{"type":"message","id":"c","parentId":"a","timestamp":"2026-10-11T01:42:14.000Z","message":{"role":"assistant","content":[{"type":"text","text":"other way"}]}}"#;
+        std::fs::write(&root, format!("{head}\n{a}\n")).unwrap();
+        let x = kids.join("X.jsonl");
+        std::fs::write(&x, format!("{head}\n")).unwrap();
+
+        let (tx, _rx) = mpsc::channel(64);
+        let session = open(&Target::Path(root.clone()), None).unwrap();
+        let mut live = LiveSession::new(session, None, None);
+        assert_eq!(poll_live(&mut live, "01a1289f", &tx).await, None);
+        assert!(
+            live.tracked.contains_key(&x),
+            "child followed before the divergence"
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&root)
+            .unwrap()
+            .write_all(format!("{b}\n{d}\n{c}\n").as_bytes())
+            .unwrap();
+        assert_eq!(
+            poll_live(&mut live, "01a1289f", &tx).await,
+            Some(Target::Path(root.clone())),
+            "followed child of a just-discarded branch must re-attach"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

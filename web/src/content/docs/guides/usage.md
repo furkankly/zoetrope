@@ -16,7 +16,7 @@ zoe <file.jsonl>             replay a recording from the start, paced (any file 
 zoe <id>                     replay a session by id, or a unique prefix of one
 zoe <file.jsonl> --follow    open a recording at its live edge instead
 zoe <file.jsonl> --speed N   playback speed multiplier (default 8.0)
-zoe --provider codex ...     force the format instead of detecting it from the file
+zoe --provider codex ...     force the format (claude, codex, omp; pi = omp) instead of detecting it
 zoe inspect <file|id>        print the session tree and exit (no TUI)
 ```
 
@@ -29,7 +29,7 @@ where the playhead starts (the live edge instead of the beginning).
 The [browser app](/app) boots into a bundled demo. To watch your own session:
 
 - **Sessions** (Chromium browsers): click **Sessions**, point it at
-  `~/.claude/projects` (Claude Code) or `~/.codex/sessions` (Codex), pick a
+  `~/.claude/projects` (Claude Code), `~/.codex/sessions` (Codex) or `~/.omp/agent/sessions` (OMP; Pi: `~/.pi/agent/sessions`), pick a
   session, and follow it live. zoetrope reads every file of the session, then
   tails the folder for new activity, including agents spawned after you picked.
   This is the same "follow a running session" flow as the native app, built on
@@ -42,8 +42,9 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
 - **Drag and drop** a transcript (any browser). A drop carries only what you
   dropped, and nothing in a transcript points at the session's other files, so
   drag a Claude Code `<uuid>.jsonl` **and** its `<uuid>/` folder together to get
-  subagents and workflows, or a Codex root `rollout-*.jsonl` together with its
-  subagents' rollouts. Drop the root alone and you get the main agent only;
+  subagents and workflows, a Codex root `rollout-*.jsonl` together with its
+  subagents' rollouts, or an OMP/Pi `<timestamp>_<uuid>.jsonl` with its
+  same-named folder. Drop the root alone and you get the main agent only;
   zoetrope will say so rather than pretending the session had no subagents.
 
 ## Launching (inside Herdr)

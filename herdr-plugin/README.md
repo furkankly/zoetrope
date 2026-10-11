@@ -2,8 +2,9 @@
 
 [Herdr](https://herdr.dev) runs coding agents in panes and knows which session
 each pane is running. This plugin asks it, then opens that session in `zoe` as
-a live flow graph, without you naming a file or an id. Claude Code and Codex
-panes both work.
+a live flow graph, without you naming a file or an id. Claude Code, Codex,
+OMP and Pi panes all work. Claude Code and Codex are opened by native session
+id; OMP and Pi by the exact absolute session `.jsonl` path Herdr reports.
 
 ## Installation
 
@@ -21,9 +22,9 @@ it never reports one, so start it again. `herdr integration status` lists what
 is installed.
 
 **The plugin install** checks that a `zoe` new enough to open a session by id
-is on `PATH`, and installs one with Homebrew or cargo when it is missing. An
-older `zoe` is reported with the upgrade commands, never replaced. `jq` is
-needed as well.
+and to read OMP/Pi (`--provider omp`) is on `PATH`, and installs one with
+Homebrew or cargo when it is missing. An older `zoe` is reported with the
+upgrade commands, never replaced. `jq` is needed as well.
 
 **The key step** writes one marked block into your Herdr config, since plugins
 cannot ship keys in their manifest. It backs the file up first, never takes a
@@ -72,6 +73,7 @@ The pane says why and waits for you to press enter, rather than closing on you:
 | Herdr reports | What you see |
 | --- | --- |
 | an id for a `claude` or `codex` pane | the graph |
+| an absolute readable `.jsonl` path for an `omp` or `pi` pane | the graph |
 | an agent but no session id | how to install the integration, and why the agent has to be restarted |
 | no agent in the pane | a line saying to focus an agent pane |
 | an agent zoetrope does not read | the same, naming the agent |

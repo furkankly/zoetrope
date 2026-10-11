@@ -501,6 +501,7 @@ impl SessionModel {
                 name,
                 summary,
             } => {
+                let completion = self.completed_calls.get(call).copied();
                 if let Some(a) = self.agents.get_mut(id)
                     && !a.tool_index.contains_key(call)
                 {
@@ -510,8 +511,12 @@ impl SessionModel {
                         name: name.clone(),
                         summary: summary.clone(),
                         ts: fact.ts,
-                        end_ts: None,
-                        state: ToolState::Pending,
+                        end_ts: completion.and_then(|(_, at)| at),
+                        state: match completion {
+                            Some((true, _)) => ToolState::Err,
+                            Some((false, _)) => ToolState::Ok,
+                            None => ToolState::Pending,
+                        },
                     });
                 }
             }
@@ -994,7 +999,7 @@ mod tests {
                     name: name.into(),
                     summary: Some(summary.into()),
                     ts: Some(ts(t)),
-                    end_ts: end.map(&ts),
+                    end_ts: end.map(ts),
                     state,
                 }
             };
@@ -1067,6 +1072,43 @@ mod tests {
         assert_eq!(f.kind, LogKind::Failure);
         assert_eq!(f.text, "Bash failed · cargo test");
         assert_eq!(f.ts, ts("2026-06-05T10:12:00Z"));
+    }
+
+    #[test]
+    fn tool_result_before_start_retains_verdict_and_duration() {
+        let start_at = "2026-10-11T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let end_at = "2026-10-11T00:00:02Z".parse::<DateTime<Utc>>().unwrap();
+        for outcome in [Outcome::Ok, Outcome::Err] {
+            let mut model = SessionModel::new("arrival-order".into());
+            model.apply_fact(&Fact {
+                agent: Some(MAIN_ID.into()),
+                ts: Some(end_at),
+                kind: FactKind::ToolEnd {
+                    call: "call".into(),
+                    outcome,
+                },
+            });
+            model.apply_fact(&Fact {
+                agent: Some(MAIN_ID.into()),
+                ts: Some(start_at),
+                kind: FactKind::ToolStart {
+                    call: "call".into(),
+                    name: "Bash".into(),
+                    summary: None,
+                },
+            });
+            let tool = &model.agent(MAIN_ID).unwrap().tool_calls[0];
+            assert_eq!(
+                tool.state,
+                if outcome == Outcome::Err {
+                    ToolState::Err
+                } else {
+                    ToolState::Ok
+                }
+            );
+            assert_eq!(tool.end_ts, Some(end_at));
+            assert_eq!(tool.ts, Some(start_at));
+        }
     }
 
     #[test]

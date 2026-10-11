@@ -5,7 +5,7 @@
 <h1 align="center">zoetrope</h1>
 
 <p align="center">
-  <em>Watch a Claude Code or Codex session as a live flow graph, in your terminal or your browser.</em>
+  <em>Watch a Claude Code, Codex, OMP or Pi session as a live flow graph, in your terminal or your browser.</em>
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code and Codex write a transcript for every session. zoetrope reads it and draws
+Claude Code, Codex, OMP and Pi write a transcript for every session. zoetrope reads it and draws
 the session as a graph in your terminal: the main agent, the agents it spawns, and the
 tools each one runs, updating live as it goes. Point it at a finished run and it replays,
 paced by the session's own timestamps. Point it at a running one and it follows along.
@@ -87,7 +87,7 @@ session running there, so the plugin in
 opens that exact session in `zoe`, without you naming a file or an id.
 
 ```bash
-herdr integration install claude          # and/or codex, so Herdr learns session ids
+herdr integration install claude          # and/or codex, so Herdr learns session ids (OMP/Pi report a session path themselves)
 herdr plugin install furkankly/zoetrope/herdr-plugin
 herdr plugin action invoke setup-keys --plugin furkankly.zoetrope
 ```
@@ -109,7 +109,7 @@ zoe <file.jsonl>             # replay a recording from the start (any file of a 
 zoe <id>                     # replay a session by id, or a unique prefix of one
 zoe <file.jsonl> --follow    # open a recording at its live edge
 zoe <file.jsonl> --speed N   # playback speed (default 8.0)
-zoe --provider codex ...     # force the format instead of detecting it from the file
+zoe --provider codex ...     # force the format (claude, codex, omp; pi = omp) instead of detecting it
 zoe inspect <file|id>        # print the session tree and exit (no TUI)
 ```
 

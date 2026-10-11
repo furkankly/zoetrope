@@ -66,7 +66,7 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
-    zoe --provider <name>   force the format (claude, codex) instead of detecting it
+    zoe --provider <name>   force the format (claude, codex, omp; pi = omp) instead of detecting it
     zoe inspect <file|id>   headless: print the session tree + info
     zoe --version           print the version and exit
 
@@ -83,7 +83,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
             .ok_or_else(|| anyhow!("--provider requires a name\n\n{USAGE}"))?;
         Provider::parse(&v)
             .map(Some)
-            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex"))
+            .ok_or_else(|| anyhow!("unknown provider {v:?}; known: claude, codex, omp (pi = omp)"))
     };
 
     // `inspect <file>` is the one distinct (headless) subcommand.
@@ -178,17 +178,31 @@ fn parse_session_fully(
             model.apply_fact(f);
         }
     };
-    // Order is not critical — the model is fold-order independent — so files
-    // go in as the session lists them, root first.
-    for f in session.every_file() {
+    // Spawners before the threads they spawned, so a stream's discarded
+    // branches are known before its children are read.
+    let mut files: Vec<_> = session.every_file().collect();
+    files.sort_by_key(|f| {
+        let dots = f
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map_or(0, |s| s.matches('.').count());
+        (f.path != session.root.path, dots)
+    });
+    let mut discarded = std::collections::HashSet::new();
+    for f in files {
+        if p.is_pruned(f, &discarded) {
+            continue;
+        }
         let text = std::fs::read_to_string(&f.path)
             .with_context(|| format!("reading {}", f.path.display()))?;
         match f.read {
             ReadMode::Tail => {
                 let mut stream = p.stream_for(f);
-                for statement in text.lines().filter_map(|l| stream.push(l)) {
+                for statement in stream.push_lines(text.lines()) {
                     apply(statement);
                 }
+                discarded.extend(stream.discarded_spawns());
             }
             ReadMode::Whole => {
                 if let Some(statement) = p.sidecar(f, &text) {

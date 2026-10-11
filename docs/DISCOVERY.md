@@ -60,7 +60,7 @@ pub struct Session {
 }
 
 /// One per-file parser. `push` is the whole reading contract.
-pub enum Stream { Claude(claude::Stream), Codex(codex::Stream) }
+pub enum Stream { Claude(claude::Stream), Codex(codex::Stream), Omp(omp::Stream) }
 impl Stream {
     pub fn push(&mut self, line: &str) -> Option<Statement>;
 }
@@ -89,6 +89,8 @@ Each provider implements these in `src/provider/<name>/discovery.rs`, about its 
 | `stream_for(file) -> Stream` | A parser for a tailed file, with whatever cross-line state the format needs | `claude::Stream` over `Source::Main`, `Sub(agent)`, or `Ledger(wf)`, derived from the path; state: the inherited timestamp, and whether the root has been stated | `codex::Stream`; state: the thread id, the root id, the ordinal below which the file is replayed parent history |
 | `sidecar(file, text) -> Option<Statement>` | What does a whole-read sidecar state, once its text parses? | `agent-<id>.meta.json`: the agent's birth, `Stream::meta` | none |
 | `session_file_from(path, head) -> Option<SessionFile>` | `session_file` without a filesystem: the path a file came with and its first bytes | by path, as `session_file` | by the first line, as `session_file` |
+
+OMP and Pi share one provider (`Provider::Omp`; `--provider pi` is an alias) and one format. `provider_of` recognises its `session` header or title record by content. A root is `<agent dir>/sessions/<project>/<timestamp>_<uuid>.jsonl`; spawned agents are `.jsonl` files anywhere below the same-stem directory, nested by `.`-joined agent ids, and `__*.jsonl` advisor transcripts are ignored. Agent dirs searched: `$PI_CODING_AGENT_DIR`, `$OMP_CODING_AGENT_DIR`, `~/.omp/agent`, `~/.pi/agent`. The file is a tree (`id`/`parentId`), so only the current branch is stated. A branch switch makes the stream report a rebuild (`Stream::take_rebuild`), and threads spawned only on a discarded branch are pruned (`Provider::is_pruned`) until that branch returns.
 
 Three things these answers show:
 

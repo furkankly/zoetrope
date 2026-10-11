@@ -128,7 +128,8 @@ socket docs at v0.9.0, and live responses.
   whole object is absent until an integration reports a session.
 - `AgentSessionRefKind` is `"id"` or `"path"`. Herdr maps `herdr:claude` and
   `herdr:codex` to an id, reported by each agent's `SessionStart` hook; `pi` and
-  `omp` store a path, and zoetrope does not read those agents.
+  `omp` store a path. The bridge opens that path only when it is absolute and a
+  readable regular file, as `zoe --provider omp --follow <path>` (`pi` is `omp`).
 - `PluginInvocationContext` is flat: `focused_pane_id`, `focused_pane_agent`,
   `focused_pane_cwd`, `focused_pane_status`, `workspace_cwd`, and so on.
 - Action `contexts` are `global`, `workspace`, `tab`, `pane`, `selection`,

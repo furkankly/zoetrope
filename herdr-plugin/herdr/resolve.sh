@@ -35,10 +35,27 @@ kind=$(printf  '%s' "$pane" | jq -r '.agent_session.kind  // empty')
 value=$(printf '%s' "$pane" | jq -r '.agent_session.value // empty')
 
 case "$agent" in
-  claude | codex) ;;
-  "") echo "pane $pane_id has no agent: focus a Claude Code or Codex pane" >&2; exit 1 ;;
-  *)  echo "agent '$agent' in pane $pane_id is not one zoe reads (Claude Code and Codex)" >&2; exit 1 ;;
+  claude | codex | omp | pi) ;;
+  "") echo "pane $pane_id has no agent: focus a Claude Code, Codex, OMP or Pi pane" >&2; exit 1 ;;
+  *)  echo "agent '$agent' in pane $pane_id is not one zoe reads (Claude Code, Codex, OMP and Pi)" >&2; exit 1 ;;
 esac
+
+# OMP and Pi have no session id zoe can look up: Herdr reports the absolute
+# path of the session `.jsonl` (kind `path`), and that exact file is opened.
+# The path is never guessed or normalised, and anything that is not a readable
+# regular file is refused rather than passed on.
+if [ "$agent" = omp ] || [ "$agent" = pi ]; then
+  [ "$kind" = path ] || { echo "Herdr reports ${kind:-no session reference} for this $agent pane, and the plugin expects a path" >&2; exit 1; }
+  case "$value" in
+    "" | *[[:cntrl:]]*) echo "the $agent session path from Herdr is missing or has control characters" >&2; exit 1 ;;
+    /*) ;;
+    *) echo "the $agent session path from Herdr is not absolute: $value" >&2; exit 1 ;;
+  esac
+  [ -f "$value" ] && [ -r "$value" ] || { echo "the $agent session path from Herdr is not a readable file: $value" >&2; exit 1; }
+  [ "$agent" = pi ] && agent=omp
+  printf '%s %s\n' "$agent" "$value"
+  exit 0
+fi
 
 case "$kind" in
   id) ;;

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::provider::{Provider, ReadMode, Session, Stream, Target, open};
 
 use super::item::{ReplayItem, date_and_sort};
-use super::live::{LiveSession, SnapshotSeed, tail_loop};
+use super::live::{LiveSession, SnapshotSeed, tail_loop, thread_depth};
 use super::{Flow, TailRequest, UiEvent};
 
 /// Replay feeder: open the session, parse everything on disk, merge by
@@ -101,11 +101,20 @@ pub(crate) fn build_replay(
     let mut seed = SnapshotSeed::default();
     let p = session.provider;
 
-    for file in session.every_file() {
+    // Spawners before the threads they spawned: a stream's discarded
+    // branches are known before its children are admitted.
+    let mut files: Vec<&crate::provider::SessionFile> = session.every_file().collect();
+    files.sort_by_key(|f| (f.path != session.root.path, thread_depth(&f.path)));
+    let mut discarded: std::collections::HashSet<String> = Default::default();
+    for file in files {
+        if p.is_pruned(file, &discarded) {
+            continue;
+        }
         match file.read {
             ReadMode::Tail => {
                 let mut stream = p.stream_for(file);
                 let consumed = parse_file_into(&file.path, &mut stream, &mut items);
+                discarded.extend(stream.discarded_spawns());
                 seed.offsets.insert(file.path.clone(), consumed);
                 seed.streams.insert(file.path.clone(), stream);
             }
@@ -149,8 +158,9 @@ fn parse_file_into(path: &Path, stream: &mut Stream, items: &mut Vec<ReplayItem>
         .unwrap_or(0);
     let text = String::from_utf8_lossy(&bytes[..consumed]);
     items.extend(
-        text.lines()
-            .filter_map(|l| stream.push(l))
+        stream
+            .push_lines(text.lines())
+            .into_iter()
             .map(ReplayItem::new),
     );
     consumed as u64

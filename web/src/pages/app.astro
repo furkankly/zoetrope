@@ -470,7 +470,7 @@ const wasmBase = '/wasm';
       <span id="status" class="statusbar">loading wasm…</span>
       <span class="spacer"></span>
 
-      <button id="open-folder" class="act primary" title="Browse your Claude Code and Codex sessions and replay or follow one live.">
+      <button id="open-folder" class="act primary" title="Browse your Claude Code, Codex and OMP/Pi sessions and replay or follow one live.">
         Sessions
       </button>
       <input id="dir-input" type="file" webkitdirectory hidden />
@@ -482,7 +482,7 @@ const wasmBase = '/wasm';
 
     <div id="terminal-container"></div>
 
-    <div id="drop" class="drop">Drop a session here to replay it: a Claude Code &lt;uuid&gt;.jsonl (with its &lt;uuid&gt;/ folder for subagents), or a Codex rollout-*.jsonl (with its subagents’ rollouts). Or use “Sessions” to browse yours.</div>
+    <div id="drop" class="drop">Drop a session here to replay it: a Claude Code &lt;uuid&gt;.jsonl (with its &lt;uuid&gt;/ folder for subagents), a Codex rollout-*.jsonl (with its subagents’ rollouts), or an OMP/Pi &lt;timestamp&gt;_&lt;uuid&gt;.jsonl (with its same-named folder for agents). Or use “Sessions” to browse yours.</div>
 
     {/* Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
         Dismissable, so a curious phone visitor can still watch the replay.
@@ -535,6 +535,12 @@ const wasmBase = '/wasm';
             Codex sessions live in
             <code>~/.codex/sessions</code>
             <button class="copy-btn" data-path="~/.codex/sessions" title="Copy the path">copy</button>
+          </p>
+          <p>
+            OMP and Pi sessions live in
+            <code>~/.omp/agent/sessions</code>
+            <button class="copy-btn" data-path="~/.omp/agent/sessions" title="Copy the path">copy</button>
+            (Pi: <code>~/.pi/agent/sessions</code>)
           </p>
           <p class="help-dim">The file dialog won't open a hidden folder for you, so:</p>
           <ol class="help-steps">
@@ -639,7 +645,7 @@ const wasmBase = '/wasm';
         }
         return summary;
       }
-      const PROVIDER_NAME = { claude: 'Claude Code', codex: 'Codex' };
+      const PROVIDER_NAME = { claude: 'Claude Code', codex: 'Codex', omp: 'OMP / Pi' };
       function describe(summary, label) {
         const who = PROVIDER_NAME[summary.provider] ?? summary.provider;
         const n = Math.max(summary.files - 1, 0);
@@ -668,7 +674,7 @@ const wasmBase = '/wasm';
       // Spawn tool calls in a Claude main transcript (`Task` is the legacy name
       // for `Agent`), or a Codex spawn. Only used to decide whether to hint
       // about sidecar files left behind.
-      const SPAWNS_RE = /"name":"(?:Agent|Task|Workflow|spawn_agent)"/;
+      const SPAWNS_RE = /"name":"(?:Agent|Task|Workflow|spawn_agent|task)"/;
 
       async function loadFiles(fileList) {
         if (!ready) return;
@@ -679,11 +685,15 @@ const wasmBase = '/wasm';
         // is one root plus bare `agent-*` files, place them there for the engine.
         const bare = (f) => !(f.zoePath || f.webkitRelativePath || '').includes('/');
         const roots = files.filter((f) => bare(f) && f.name.endsWith('.jsonl') && !f.name.startsWith('agent-') && f.name !== 'journal.jsonl');
-        const rootStem = roots.length === 1 ? roots[0].name.slice(0, -'.jsonl'.length) : null;
+        const ompRoots = roots.filter((f) => OMP_ROOT.test(f.name));
+        // An OMP/Pi root's agents sit under its same-stem directory, named by agent.
+        const ompStem = ompRoots.length === 1 ? ompRoots[0].name.slice(0, -'.jsonl'.length) : null;
+        const rootStem = !ompStem && roots.length === 1 ? roots[0].name.slice(0, -'.jsonl'.length) : null;
         const entries = [];
         for (const f of files) {
           let path = f.zoePath || f.webkitRelativePath || f.name;
-          if (rootStem && bare(f) && f.name.startsWith('agent-')) path = `${rootStem}/subagents/${f.name}`;
+          if (ompStem && bare(f) && f.name.endsWith('.jsonl') && f !== ompRoots[0] && !f.name.startsWith('__')) path = `${ompStem}/${f.name}`;
+          else if (rootStem && bare(f) && f.name.startsWith('agent-')) path = `${rootStem}/subagents/${f.name}`;
           entries.push({ path, text: await f.text() });
         }
         const label = files.length === 1 ? files[0].name : `${files.length} files`;
@@ -698,7 +708,9 @@ const wasmBase = '/wasm';
           const hint =
             summary.provider === 'codex'
               ? 'drop its subagents’ rollout files too'
-              : 'drop its <uuid>/ folder too';
+              : summary.provider === 'omp'
+                ? 'drop its <timestamp>_<uuid>/ folder too'
+                : 'drop its <uuid>/ folder too';
           setStatus(`replaying ${label} · main agent only. ${hint[0].toUpperCase() + hint.slice(1)} to see the agents it spawned`);
         } else {
           setStatus('replaying ' + describe(summary, label));
@@ -860,6 +872,156 @@ const wasmBase = '/wasm';
         return finishList(sessions);
       }
 
+      // ── OMP / Pi: `<agent>/sessions/<project>/<ts>_<uuid>.jsonl` + `<ts>_<uuid>/` ──
+      // The root is `<timestamp>_<uuid>.jsonl`. Every spawned agent is a `.jsonl`
+      // anywhere below the same-stem directory (nested for agents that spawn);
+      // `__*.jsonl` advisor transcripts are nobody's thread. The engine reads the
+      // session off that ancestor directory name, so paths keep it.
+      const OMP_STEM = /^\d{4}-\d{2}-\d{2}T[0-9A-Za-z-]+_[0-9a-f-]{8,}$/i;
+      const OMP_ROOT = /^\d{4}-\d{2}-\d{2}T[0-9A-Za-z-]+_[0-9a-f-]{8,}\.jsonl$/i;
+      const ompUuid = (stem) => stem.slice(stem.indexOf('_') + 1);
+
+      async function collectOmp(dir) {
+        const mains = new Map(),
+          dirs = new Map();
+        for await (const [name, handle] of dir.entries()) {
+          if (handle.kind === 'file' && OMP_ROOT.test(name)) mains.set(name.slice(0, -'.jsonl'.length), handle);
+          else if (handle.kind === 'directory') dirs.set(name, handle);
+        }
+        return mains.size ? { mains, dirs } : null;
+      }
+
+      // From whatever was picked down to a project folder of roots: `.omp` / `.pi`
+      // (anchor), `agent`, `sessions`, a project folder, or a folder of projects.
+      // ponytail: first anchor wins, so a home folder with both `.omp` and `.pi`
+      // shows only `.omp`; pick `.pi/agent/sessions` directly for Pi.
+      async function detectOmp(dir, depth = 0) {
+        if (depth > 5) return null;
+        const here = await collectOmp(dir);
+        if (here) return { repo: { name: dir.name, ...here } };
+        for (const name of ['.omp', '.pi', 'agent', 'sessions']) {
+          const sub = await getDir(dir, name);
+          if (!sub) continue;
+          const r = await detectOmp(sub, depth + 1);
+          if (r) return r;
+        }
+        const repos = [];
+        for await (const [name, handle] of dir.entries()) {
+          if (handle.kind === 'directory' && (await collectOmp(handle))) repos.push({ name, handle });
+        }
+        return repos.length ? { repos } : null;
+      }
+
+      // A session's files right now: the root, plus every transcript below its
+      // directory. Enumerated fresh on every live poll, so new agents appear.
+      function ompSession(stem, mainHandle, dirHandle) {
+        return async () => {
+          const out = [{ path: `${stem}.jsonl`, handle: mainHandle, whole: false }];
+          if (!dirHandle) return out;
+          const walk = async (dir, prefix, depth) => {
+            for await (const [name, h] of dir.entries()) {
+              if (h.kind === 'file') {
+                if (name.endsWith('.jsonl') && !name.startsWith('__')) out.push({ path: `${prefix}/${name}`, handle: h, whole: false });
+              } else if (depth < 6) await walk(h, `${prefix}/${name}`, depth + 1);
+            }
+          };
+          await walk(dirHandle, stem, 0);
+          return out;
+        };
+      }
+
+      // The title record may come before the session header; else the first typed prompt.
+      async function ompTitle(file) {
+        try {
+          const head = await headOf(file);
+          let prompt = '';
+          for (const line of head.split('\n')) {
+            if (!line) continue;
+            let o;
+            try {
+              o = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            if ((o.type === 'title' || o.type === 'title_change') && typeof o.title === 'string' && o.title.trim())
+              return o.title.replace(/\s+/g, ' ').trim().slice(0, 90);
+            const m = o.type === 'message' && o.message;
+            if (!prompt && m && m.role === 'user' && (!m.attribution || m.attribution === 'user')) {
+              const c = m.content;
+              const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((p) => p.type === 'text').map((p) => p.text).join(' ') : '';
+              if (text.trim()) prompt = text.replace(/\s+/g, ' ').trim().slice(0, 90);
+            }
+          }
+          return prompt;
+        } catch {}
+        return '';
+      }
+
+      async function ompSessionList(repo) {
+        const sessions = [];
+        for (const [stem, mainHandle] of repo.mains) {
+          let lastModified = 0,
+            size = 0,
+            title = '';
+          try {
+            const file = await mainHandle.getFile();
+            lastModified = file.lastModified;
+            size = file.size;
+            title = await ompTitle(file);
+          } catch {}
+          sessions.push({
+            provider: 'omp',
+            uuid: ompUuid(stem),
+            title,
+            lastModified,
+            size,
+            files: ompSession(stem, mainHandle, repo.dirs.get(stem) || null),
+          });
+        }
+        return finishList(sessions);
+      }
+
+      // OMP/Pi in a flat FileList: a root `<ts>_<uuid>.jsonl`, its children below the
+      // same-stem `<ts>_<uuid>/` directory. Paths keep that stem directory, because
+      // discovery reads the session off the ancestor directory name.
+      async function ompFromFiles(files) {
+        const byRepo = new Map(); // repo path prefix -> Map(stem -> session)
+        const repoOf = (p) => byRepo.get(p) ?? byRepo.set(p, new Map()).get(p);
+        const partsOf = (f) => (f.webkitRelativePath || f.name).split('/');
+        for (const f of files) {
+          const parts = partsOf(f);
+          const base = parts[parts.length - 1];
+          if (!OMP_ROOT.test(base)) continue;
+          const stem = base.slice(0, -'.jsonl'.length);
+          repoOf(parts.slice(0, -1).join('/')).set(stem, { stem, mainFile: f, files: [{ path: base, file: f, whole: false }] });
+        }
+        for (const f of files) {
+          const parts = partsOf(f);
+          const base = parts[parts.length - 1];
+          if (!base.endsWith('.jsonl') || base.startsWith('__')) continue;
+          const di = parts.findIndex((p, i) => i < parts.length - 1 && OMP_STEM.test(p));
+          if (di < 0) continue;
+          const s = repoOf(parts.slice(0, di).join('/')).get(parts[di]);
+          if (s) s.files.push({ path: parts.slice(di).join('/'), file: f, whole: false });
+        }
+        const repos = [];
+        for (const [prefix, sessMap] of byRepo) {
+          const sessions = [];
+          for (const s of sessMap.values()) {
+            sessions.push({
+              provider: 'omp',
+              uuid: ompUuid(s.stem),
+              title: await ompTitle(s.mainFile),
+              lastModified: Math.max(...s.files.map((x) => x.file.lastModified || 0)),
+              size: s.files.reduce((n, x) => n + (x.file.size || 0), 0),
+              files: async () => s.files,
+            });
+          }
+          if (sessions.length) repos.push({ prefix, sessions: finishList(sessions) });
+        }
+        return repos;
+      }
+
       // ── Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, one file per thread ──
       // Nothing in a path says which session a rollout belongs to; its first
       // line does. So detection reads heads, and a session is a root rollout
@@ -1019,41 +1181,41 @@ const wasmBase = '/wasm';
           dir = await window.showDirectoryPicker({ id: 'zoetrope-sessions', mode: 'read' });
         } catch (e) {
           if (e && e.name !== 'AbortError')
-            setStatus('Couldn’t open that folder. In the dialog, use ⌘⇧G and go to ~/.claude/projects or ~/.codex/sessions.', true);
+            setStatus('Couldn’t open that folder. In the dialog, use ⌘⇧G and go to ~/.claude/projects, ~/.codex/sessions or ~/.omp/agent/sessions.', true);
           else setStatus('demo · use “Sessions” to browse your sessions, or drop a transcript');
           return;
         }
         setStatus('scanning for sessions…');
         let claude = null,
-          codex = null;
+          codex = null,
+          omp = null;
         try {
           claude = await detectClaude(dir);
           codex = await detectCodex(dir);
+          omp = await detectOmp(dir);
         } catch (e) {
           setStatus('Could not read that folder: ' + (e?.message ?? e), true);
           return;
         }
-        if (!claude && !codex) {
-          setStatus('No Claude Code or Codex sessions there. Pick ~/.claude/projects, ~/.codex/sessions, or a folder inside one.', true);
+        const found = [];
+        if (claude) found.push({ label: 'Claude Code', subtitle: '~/.claude/projects', onPick: () => openClaude(claude) });
+        if (codex) found.push({ label: 'Codex', subtitle: '~/.codex/sessions', onPick: () => openCodex(codex) });
+        if (omp) found.push({ label: 'OMP / Pi', subtitle: '~/.omp/agent/sessions', onPick: () => openOmp(omp) });
+        if (!found.length) {
+          setStatus('No Claude Code, Codex or OMP/Pi sessions there. Pick ~/.claude/projects, ~/.codex/sessions, ~/.omp/agent/sessions, or a folder inside one.', true);
           return;
         }
-        if (claude && codex) {
-          // A home folder: both agents live here. Ask which.
-          showRepoPicker([
-            { label: 'Claude Code', subtitle: '~/.claude/projects', onPick: () => openClaude(claude) },
-            { label: 'Codex', subtitle: '~/.codex/sessions', onPick: () => openCodex(codex) },
-          ]);
-          return;
-        }
-        if (claude) openClaude(claude);
-        else openCodex(codex);
+        // A home folder holds several agents: ask which.
+        if (found.length > 1) return showRepoPicker(found);
+        found[0].onPick();
       }
 
-      async function openClaude(found) {
-        if (found.repo) return showSessionPicker(await claudeSessionList(found.repo), found.repo.name);
+      // One flow for any provider whose sessions group by project folder.
+      async function openRepos(found, collect, list) {
+        if (found.repo) return showSessionPicker(await list(found.repo), found.repo.name);
         if (found.repos.length === 1) {
-          const s = await collectClaude(found.repos[0].handle);
-          if (s) return showSessionPicker(await claudeSessionList({ name: found.repos[0].name, ...s }), found.repos[0].name);
+          const s = await collect(found.repos[0].handle);
+          if (s) return showSessionPicker(await list({ name: found.repos[0].name, ...s }), found.repos[0].name);
           return setStatus('No sessions in ' + found.repos[0].name, true);
         }
         showRepoPicker(
@@ -1063,13 +1225,14 @@ const wasmBase = '/wasm';
               label: prettyRepo(r.name),
               subtitle: r.name,
               onPick: async () => {
-                const s = await collectClaude(r.handle);
-                if (s) showSessionPicker(await claudeSessionList({ name: r.name, ...s }), r.name);
+                const s = await collect(r.handle);
+                if (s) showSessionPicker(await list({ name: r.name, ...s }), r.name);
                 else setStatus('No sessions in ' + r.name, true);
               },
             }))
         );
       }
+      const openClaude = (found) => openRepos(found, collectClaude, claudeSessionList);
 
       async function openCodex(found) {
         setStatus('reading rollouts…');
@@ -1077,6 +1240,8 @@ const wasmBase = '/wasm';
         if (!sessions.length) return setStatus('No Codex sessions in that folder.', true);
         showSessionPicker(sessions, 'Codex');
       }
+
+      const openOmp = (found) => openRepos(found, collectOmp, ompSessionList);
 
       // ── webkitdirectory fallback (Firefox/Safari): a flat FileList, so
       // sessions are grouped by parsing `webkitRelativePath` (Claude) or by
@@ -1147,8 +1312,9 @@ const wasmBase = '/wasm';
         setStatus('scanning for sessions…');
         const repos = claudeFromFiles(files);
         const codex = await codexFromFiles(files);
-        if (!repos.length && !codex.length) {
-          setStatus('No Claude Code or Codex sessions in that folder. Choose ~/.claude/projects, ~/.codex/sessions, or a folder inside one.', true);
+        const omp = await ompFromFiles(files);
+        if (!repos.length && !codex.length && !omp.length) {
+          setStatus('No Claude Code, Codex or OMP/Pi sessions in that folder. Choose ~/.claude/projects, ~/.codex/sessions, ~/.omp/agent/sessions, or a folder inside one.', true);
           return;
         }
         const rows = repos
@@ -1158,6 +1324,10 @@ const wasmBase = '/wasm';
             return { label: prettyRepo(name), subtitle: r.prefix, onPick: () => openFileRepo(r) };
           });
         if (codex.length) rows.push({ label: 'Codex', subtitle: `${codex.length} session${codex.length === 1 ? '' : 's'}`, onPick: () => showSessionPicker(codex, 'Codex') });
+        for (const r of omp.sort((a, b) => a.prefix.localeCompare(b.prefix))) {
+          const name = r.prefix.split('/').pop() || r.prefix;
+          rows.push({ label: `OMP · ${prettyRepo(name)}`, subtitle: r.prefix, onPick: () => showSessionPicker(r.sessions, name) });
+        }
         if (rows.length === 1) rows[0].onPick();
         else showRepoPicker(rows);
       }
@@ -1258,7 +1428,7 @@ const wasmBase = '/wasm';
         const label = s.title || s.uuid.slice(0, 8);
         setStatus(`opening ${label}…`);
         try {
-          const state = { files: s.files, tracked: new Map(), whole: new Set() };
+          const state = { session: s, files: s.files, tracked: new Map(), whole: new Set() };
           const { entries, commit } = await readNew(state);
           // Following needs re-readable handles; a File snapshot cannot grow.
           const canFollow = live && entries.length && (await s.files()).every((f) => f.handle);
@@ -1312,10 +1482,16 @@ const wasmBase = '/wasm';
       }
 
       async function pollLive() {
-        if (!liveState) return;
+        const st = liveState;
+        if (!st) return;
         try {
-          const { entries, commit } = await readNew(liveState);
-          if (entries.length) commit(JSON.parse(zoetrope_append(JSON.stringify(entries))));
+          const { entries, commit } = await readNew(st);
+          if (entries.length) {
+            const r = JSON.parse(zoetrope_append(JSON.stringify(entries)));
+            commit(r);
+            // The engine dropped already-stated history (OMP/Pi branch switch): read it all again.
+            if (r.reloaded) return loadSession(st.session, true);
+          }
         } catch {
           // Transient read race against an in-flight write — try again next tick.
         }

@@ -317,13 +317,32 @@ pub fn zoetrope_append(files_json: String) -> String {
         .iter()
         .map(|f| (f.path.as_str(), f.text.as_str()))
         .collect();
-    let (statements, accepted) = BUNDLE.with(|cell| {
+    let (statements, reload, accepted) = BUNDLE.with(|cell| {
         let mut b = cell.borrow_mut();
         match b.as_mut() {
-            Some(b) => (b.append(&files), b.accepted()),
-            None => (Vec::new(), Vec::new()),
+            Some(b) => (b.append(&files), b.take_reload(), b.accepted()),
+            None => (Vec::new(), None, Vec::new()),
         }
     });
+    // The session tree left already-stated history (OMP/Pi branch switch):
+    // replace the model with the rebuilt current branch, keeping the
+    // live/replay intent. The page re-reads every file whole afterwards.
+    if let Some((items, info)) = reload {
+        APP.with(|cell| {
+            if let Some(rc) = cell.borrow().as_ref() {
+                let mut app = rc.borrow_mut();
+                let mut next = App::new(LOADED_SESSION_ID.to_string(), app.mode);
+                next.handle_ui_event(UiEvent::ReplayLoaded {
+                    session_id: LOADED_SESSION_ID.to_string(),
+                    items,
+                    speed: DEMO_SPEED,
+                    info,
+                });
+                *app = next;
+            }
+        });
+        return serde_json::json!({ "accepted": accepted, "reloaded": true }).to_string();
+    }
     let summary = serde_json::json!({ "accepted": accepted }).to_string();
     if statements.is_empty() {
         return summary;
