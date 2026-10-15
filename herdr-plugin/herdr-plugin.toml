@@ -12,9 +12,11 @@ name = "zoetrope"
 # hand-edited label with no reader. The one version that gates an install is
 # min_herdr_version below; the one that describes what `zoe` must be able to do
 # lives in herdr/ensure-zoe.sh.
-version = "0.1.0"
+version = "0.2.0"
 description = "Watch the focused agent's session as a live flow graph."
-platforms = ["macos", "linux"]
+# Windows runs the same scripts, under Git for Windows' bash. Why the commands
+# below are shaped the way they are: docs/HERDR-PLUGIN.md, "Windows".
+platforms = ["macos", "linux", "windows"]
 
 # `agent_session` on pane.get / agent.get is what makes this plugin worth having:
 # Herdr already knows which agent occupies a pane and its native session id, which
@@ -23,9 +25,15 @@ platforms = ["macos", "linux"]
 min_herdr_version = "0.8.2"
 
 # `plugin install` runs this after the preview; `plugin link` does not. It only
-# checks for zoe, and installs it when missing.
+# checks for zoe, and installs it when missing. A bare `bash` on Windows is
+# usually WSL's, so Windows gets its own step, run with Git for Windows' bash.
 [[build]]
 command = ["bash", "herdr/ensure-zoe.sh"]
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["herdr/git-bash.cmd", "herdr/ensure-zoe.sh"]
+platforms = ["windows"]
 
 # Overlay: a temporary zoomed pane that restores the previous focus and zoom when
 # it closes. Watching the graph is a peek, not a side-by-side workflow. Users who
@@ -35,13 +43,26 @@ id = "graph"
 title = "zoetrope"
 placement = "overlay"
 command = ["bash", "herdr/open.sh"]
+platforms = ["macos", "linux"]
 
+# The same pane on Windows. Ids must be unique even across platforms, and
+# herdr/pane.sh picks this one there; nothing outside the plugin names a pane.
+[[panes]]
+id = "graph-windows"
+title = "zoetrope"
+placement = "overlay"
+command = ["herdr/git-bash.cmd", "herdr/open.sh"]
+platforms = ["windows"]
+
+# Keys and the CLI name actions by id, so each action is one entry, and an entry
+# has one command for every platform. herdr/bash.cmd is that command: `bash` on
+# macOS and Linux, Git for Windows' bash on Windows.
 [[actions]]
 id = "open"
 title = "zoetrope: session graph (overlay)"
 description = "Open the focused agent's session as a flow graph, over the focused pane. Closing it restores your layout. This is what the default key does."
 contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "open"]
+command = ["herdr/bash.cmd", "herdr/pane.sh", "open"]
 
 # Beside the agent instead of over it: a persistent split, no zoom, no overlay.
 [[actions]]
@@ -49,7 +70,7 @@ id = "open-split"
 title = "zoetrope: session graph (split)"
 description = "Open the focused agent's session as a flow graph, split beside the focused pane. Stays until you close it."
 contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "open", "split"]
+command = ["herdr/bash.cmd", "herdr/pane.sh", "open", "split"]
 
 # Its own tab: full area, kept until closed, one tab switch away from the agent.
 [[actions]]
@@ -57,7 +78,7 @@ id = "open-tab"
 title = "zoetrope: session graph (tab)"
 description = "Open the focused agent's session as a flow graph in its own tab. Full size, one tab switch from the agent."
 contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "open", "tab"]
+command = ["herdr/bash.cmd", "herdr/pane.sh", "open", "tab"]
 
 # Herdr binds keys only from the user's config, so the default key is installed
 # by an action: one marker-fenced block, removable by the sibling action.
@@ -66,11 +87,11 @@ id = "setup-keys"
 title = "zoetrope: install the default keybinding"
 description = "Bind prefix+shift+z to the overlay, and write the split and tab placements beside it as comments. One block in your Herdr config, backed up first."
 contexts = ["workspace"]
-command = ["bash", "herdr/keys.sh", "setup"]
+command = ["herdr/bash.cmd", "herdr/keys.sh", "setup"]
 
 [[actions]]
 id = "remove-keys"
 title = "zoetrope: remove the default keybinding"
 description = "Delete the block setup-keys wrote."
 contexts = ["workspace"]
-command = ["bash", "herdr/keys.sh", "remove"]
+command = ["herdr/bash.cmd", "herdr/keys.sh", "remove"]

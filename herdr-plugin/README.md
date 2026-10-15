@@ -25,6 +25,14 @@ is on `PATH`, and installs one with Homebrew or cargo when it is missing. An
 older `zoe` is reported with the upgrade commands, never replaced. `jq` is
 needed as well.
 
+**On Windows** the scripts run under the bash that ships with
+[Git for Windows](https://git-scm.com/download/win) (`winget install Git.Git`),
+found through its installer or the `git` on `PATH`. WSL's `bash` is not used.
+`jq` and `zoe` go on the Windows `PATH`. There is no Homebrew, so the install
+step uses cargo, or take the Windows zip from the
+[releases](https://github.com/furkankly/zoetrope/releases). The key step writes
+to `%APPDATA%\herdr\config.toml`, the config Herdr reads there.
+
 **The key step** writes one marked block into your Herdr config, since plugins
 cannot ship keys in their manifest. It backs the file up first, never takes a
 key you already use, and reloads Herdr. `remove-keys` deletes the block again.

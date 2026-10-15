@@ -12,7 +12,11 @@ die() {
   exit 1
 }
 
-command -v zoe >/dev/null 2>&1 || die "zoe is not on PATH (brew install furkankly/tap/zoetrope, or cargo install zoetrope)"
+case "$OSTYPE" in
+  msys* | cygwin*) get_zoe="cargo install zoetrope, or the Windows zip from https://github.com/furkankly/zoetrope/releases" ;;
+  *) get_zoe="brew install furkankly/tap/zoetrope, or cargo install zoetrope" ;;
+esac
+command -v zoe >/dev/null 2>&1 || die "zoe is not on PATH ($get_zoe)"
 
 if ! target=$(bash "$root/herdr/resolve.sh" 2>&1); then
   die "$target"
