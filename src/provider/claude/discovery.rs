@@ -1,5 +1,6 @@
 //! Where Claude Code keeps a session on disk, and how one session's files are
-//! found: `~/.claude/projects/<sanitized-cwd>/<uuid>.jsonl`, plus the
+//! found: `<config>/projects/<sanitized-cwd>/<uuid>.jsonl` (the config defaults
+//! to `~/.claude`), plus the
 //! `<uuid>/subagents/` tree of per-agent transcripts, `meta.json` sidecars and
 //! per-workflow `journal.jsonl` ledgers. Pure path logic plus directory scans;
 //! nothing here reads a line.
@@ -24,8 +25,11 @@ pub fn sanitize_cwd(cwd: &std::path::Path) -> String {
         .collect()
 }
 
-/// The `~/.claude/projects` root, if a home directory can be resolved.
+/// The Claude projects root: a non-empty `CLAUDE_CONFIG_DIR`, or `~/.claude`.
 fn claude_projects_root() -> Option<std::path::PathBuf> {
+    if let Some(config) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|s| !s.is_empty()) {
+        return Some(std::path::PathBuf::from(config).join("projects"));
+    }
     #[allow(deprecated)]
     let home = std::env::home_dir()
         .filter(|h| !h.as_os_str().is_empty())
@@ -33,8 +37,7 @@ fn claude_projects_root() -> Option<std::path::PathBuf> {
     Some(home.join(".claude").join("projects"))
 }
 
-/// Absolute path to the `~/.claude/projects/<sanitized-cwd>` directory for a
-/// given cwd.
+/// Path to `<Claude config>/projects/<sanitized-cwd>` for a given cwd.
 pub fn project_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(claude_projects_root()?.join(sanitize_cwd(cwd)))
 }
@@ -174,7 +177,7 @@ use std::time::SystemTime;
 
 use crate::provider::{FileRole, Provider, ReadMode, Scope, SessionFile};
 
-/// Every `<uuid>.jsonl` under `~/.claude/projects/*/`, or under the one
+/// Every `<uuid>.jsonl` under the selected Claude config's `projects/*/`, or the one
 /// project directory when the scope names a working directory. Only roots:
 /// a session's other files are found from its root.
 pub fn all_paths(scope: &Scope) -> Vec<PathBuf> {
@@ -401,6 +404,140 @@ fn root_of(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn config_root_discovery_regression() {
+        use crate::provider::{Provider, Scope, Target, open, sweep};
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        const DEFAULT_ID: &str = "0e599cbe-23c4-460b-b097-cbd1d6bc0e3d";
+        const CUSTOM_ID: &str = "55badaf6-c5d2-4b85-af5b-f41f42b3a8a7";
+        const CASE: &str = "ZOE_CONFIG_ROOT_TEST_CASE";
+        const FIXTURE_HOME: &str = "ZOE_CONFIG_ROOT_TEST_HOME";
+
+        if let Some(case) = std::env::var_os(CASE) {
+            let home = PathBuf::from(std::env::var_os(FIXTURE_HOME).expect("isolated home"));
+            // Stop before any discovery if the platform did not honor the sandbox.
+            #[allow(deprecated)]
+            let resolved_home = std::env::home_dir();
+            assert_eq!(resolved_home.as_deref(), Some(home.as_path()));
+            let cwd = home.join("work");
+            let (root, id) = match case.to_str().expect("test case") {
+                "custom" => (home.join("profile with spaces Ω"), Some(CUSTOM_ID)),
+                "missing" => (home.join("missing profile"), None),
+                "empty-root" => (home.join("empty profile"), None),
+                "unset" | "empty" => (home.join(".claude"), Some(DEFAULT_ID)),
+                _ => panic!("unknown test case"),
+            };
+            let expected_paths: Vec<_> = id
+                .map(|id| {
+                    root.join("projects")
+                        .join(sanitize_cwd(&cwd))
+                        .join(format!("{id}.jsonl"))
+                })
+                .into_iter()
+                .collect();
+            for scope in [Scope::ALL, Scope::project(&cwd)] {
+                assert_eq!(Provider::Claude.all_paths(&scope), expected_paths);
+                let sessions = sweep(&scope, Some(Provider::Claude));
+                assert_eq!(sessions.len(), expected_paths.len());
+                assert_eq!(sessions.first().map(|s| s.id.as_str()), id);
+            }
+            if let Some(id) = id {
+                assert_eq!(
+                    open(&Target::Id(id.to_owned()), Some(Provider::Claude))
+                        .unwrap()
+                        .root
+                        .path,
+                    expected_paths[0]
+                );
+            }
+            assert_eq!(
+                open(&Target::Here(cwd), Some(Provider::Claude))
+                    .ok()
+                    .map(|s| s.id),
+                id.map(str::to_owned)
+            );
+            return;
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "zoetrope-config-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = home.join("work");
+        let custom = home.join("profile with spaces Ω");
+        let missing = home.join("missing profile");
+        let empty = home.join("empty profile");
+        std::fs::create_dir_all(empty.join("projects")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        for (root, id) in [
+            (home.join(".claude"), DEFAULT_ID),
+            (custom.clone(), CUSTOM_ID),
+        ] {
+            let project = root.join("projects").join(sanitize_cwd(&cwd));
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join(format!("{id}.jsonl")),
+                b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"synthetic fixture\"}}\n",
+            )
+            .unwrap();
+        }
+        let mut outcomes = Vec::new();
+        for (case, config) in [
+            ("custom", Some(custom.as_os_str())),
+            ("unset", None),
+            ("empty", Some(OsStr::new(""))),
+            ("missing", Some(missing.as_os_str())),
+            ("empty-root", Some(empty.as_os_str())),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .env_clear()
+                .arg("--exact")
+                .arg("provider::claude::discovery::tests::config_root_discovery_regression")
+                .arg("--nocapture");
+            for key in [
+                "PATH",
+                "SystemRoot",
+                "WINDIR",
+                "LD_LIBRARY_PATH",
+                "DYLD_LIBRARY_PATH",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    child.env(key, value);
+                }
+            }
+            child
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env(CASE, case)
+                .env(FIXTURE_HOME, &home);
+            if let Some(config) = config {
+                child.env("CLAUDE_CONFIG_DIR", config);
+            }
+            outcomes.push((case, child.output().expect("run isolated discovery test")));
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+        for (case, output) in outcomes {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{case}: {stdout}\n{stderr}");
+            assert!(
+                stdout.contains("1 passed"),
+                "{case}: child test was not executed: {stdout}"
+            );
+        }
+    }
 
     // --- Sanitization ------------------------------------------------------
 
