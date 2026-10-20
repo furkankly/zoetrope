@@ -16,6 +16,12 @@ herdr="${HERDR_BIN_PATH:-herdr}"
 ctx="${HERDR_PLUGIN_CONTEXT_JSON:-{\}}"
 title="zoetrope"
 placement="${2:-overlay}"
+# Pane ids are unique even across platforms, so Windows, where this runs under
+# Git for Windows' bash, has its own entry in the manifest.
+case "$OSTYPE" in
+  msys* | cygwin*) entrypoint="graph-windows" ;;
+  *) entrypoint="graph" ;;
+esac
 
 case "${1:-open}" in
   open) ;;
@@ -23,6 +29,9 @@ case "${1:-open}" in
 esac
 
 if command -v jq >/dev/null 2>&1; then
+  # A native jq.exe ends every line in CRLF unless told not to, and the CR would
+  # ride along into the pane id.
+  case "$OSTYPE" in msys* | cygwin*) jq() { command jq -b "$@"; } ;; esac
   focused=$(printf '%s' "$ctx" | jq -r '.focused_pane_id // empty')
   if [ -n "$focused" ]; then
     pane=$("$herdr" pane get "$focused" 2>/dev/null | jq -r '.result.pane // empty' 2>/dev/null || true)
@@ -36,5 +45,5 @@ fi
 
 exec "$herdr" plugin pane open \
   --plugin "${HERDR_PLUGIN_ID:-furkankly.zoetrope}" \
-  --entrypoint graph \
+  --entrypoint "$entrypoint" \
   --placement "$placement"

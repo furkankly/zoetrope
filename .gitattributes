@@ -1,0 +1,4 @@
+# The Herdr plugin's scripts run under bash on every platform, Windows included,
+# and bash reads a CR as part of the line. Keep them LF whatever core.autocrlf
+# says, so a Windows checkout can be linked with `herdr plugin link`.
+herdr-plugin/herdr/* text eol=lf

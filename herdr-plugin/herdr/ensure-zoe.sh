@@ -33,6 +33,8 @@ version_of() {
 from_source_hint() {
   root=$(cd "${HERDR_PLUGIN_ROOT:-.}/.." 2>/dev/null && pwd) || return 0
   [ -f "$root/Cargo.toml" ] || return 0
+  # Under Git Bash, print the path the way a Windows shell would take it.
+  case "$OSTYPE" in msys* | cygwin*) root=$(cygpath -m "$root") ;; esac
   printf '    cargo install --path "%s" --force   (build it from this checkout)\n' "$root"
 }
 
@@ -40,7 +42,11 @@ report() {
   {
     printf '\n  %s\n\n' "$1"
     printf '  %s:\n' "$2"
-    printf '    %s furkankly/tap/zoetrope\n' "$3"
+    case "$OSTYPE" in
+      # No Homebrew there; every release carries a Windows zip instead.
+      msys* | cygwin*) printf '    the Windows zip from https://github.com/furkankly/zoetrope/releases, unpacked onto PATH\n' ;;
+      *) printf '    %s furkankly/tap/zoetrope\n' "$3" ;;
+    esac
     printf '    cargo install zoetrope%s\n' "$4"
     from_source_hint
     printf '\n  then run the plugin install again.\n\n'

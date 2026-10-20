@@ -19,6 +19,9 @@ herdr="${HERDR_BIN_PATH:-herdr}"
 ctx="${HERDR_PLUGIN_CONTEXT_JSON:-{\}}"
 
 command -v jq >/dev/null 2>&1 || { echo "jq is not on PATH, and the plugin reads Herdr's JSON with it" >&2; exit 1; }
+# A native jq.exe, the one Git for Windows' bash finds, ends every line in CRLF
+# unless told not to, and the CR would ride along into the session id.
+case "$OSTYPE" in msys* | cygwin*) jq() { command jq -b "$@"; } ;; esac
 
 pane_id=$(printf '%s' "$ctx" | jq -r '.focused_pane_id // empty')
 [ -n "$pane_id" ] || { echo "no focused pane in the invocation context" >&2; exit 1; }

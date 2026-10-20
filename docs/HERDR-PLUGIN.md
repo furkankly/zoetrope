@@ -7,7 +7,8 @@ it over. The user-facing half is [`herdr-plugin/README.md`](../herdr-plugin/READ
 this is the rest.
 
 It lives in `herdr-plugin/`, ships by git clone rather than with the crate, and
-is a manifest plus three shell scripts. Herdr plugin panes run an ordinary argv
+is a manifest, five bash scripts, and the launcher that starts them on every
+platform (§6 has why there is one). Herdr plugin panes run an ordinary argv
 command in a real TTY, so `zoe` itself is the plugin UI. Nothing is embedded in
 Herdr's render loop, and nothing about the graph is written twice.
 
@@ -31,10 +32,12 @@ zoe --provider <agent> --follow <id>
 `--provider` narrows the lookup to the agent Herdr named. `--follow` is right
 by definition here, since the pane's agent is running.
 
-## 2. The three scripts
+## 2. The scripts
 
 | Script | Role |
 |---|---|
+| `herdr/bash.cmd` | the command of every action. `bash <script>` on macOS and Linux, `git-bash.cmd` on Windows (§6) |
+| `herdr/git-bash.cmd` | Windows only: finds Git for Windows' bash and runs a script with it. The Windows pane and build step name it directly |
 | `herdr/pane.sh` | all three actions (`open`, `open-split`, `open-tab`), differing only in the placement they pass. Opens the graph pane, or closes it when the graph is the focused pane, which is what makes the key a toggle |
 | `herdr/open.sh` | the pane command. Resolves the session and execs `zoe` |
 | `herdr/resolve.sh` | asks `pane.get` about the focused pane, prints `<agent> <session-id>`, or exits with the reason |
@@ -142,7 +145,53 @@ socket docs at v0.9.0, and live responses.
   `HERDR_PANE_ID` where they apply. Actions also get `HERDR_PLUGIN_ACTION_ID`,
   pane commands `HERDR_PLUGIN_ENTRYPOINT_ID`.
 
-## 6. Working on it
+## 6. Windows
+
+The scripts are the same on Windows. What changes is how they are started.
+Everything below comes from Herdr's source (`src/plugin_command.rs`, which
+resolves commands the same way at v0.8.2 and v0.9.3) or was observed on Herdr
+0.9.3 on Windows 11.
+
+- **A bare `bash` is the wrong one.** Herdr looks a bare command up on `PATH`,
+  where `C:\Windows\System32\bash.exe`, the WSL launcher, usually comes first,
+  and Git's `bin` is usually absent. Through WSL a script runs inside Linux,
+  where the `HERDR_*` environment does not reach and there is no `herdr`.
+  `herdr/git-bash.cmd` finds Git for Windows' bash instead: the `GitForWindows`
+  registry key, then the `git` on `PATH`. It takes `bin\bash.exe`, the launcher
+  that puts Git's coreutils on `PATH`, not `usr\bin\bash.exe`.
+- **One command per action, on every platform.** A manifest entry has one
+  command, and ids must be unique even across disjoint `platforms` (Herdr
+  refuses with `duplicate_plugin_action_id`). Keys and the CLI name actions by
+  id, so each action stays one entry, and its command is `herdr/bash.cmd`. That
+  file is a shell script to `/bin/sh` and a batch file to cmd. Herdr resolves a
+  relative program against the plugin root everywhere, and on Windows runs a
+  `.cmd` through `cmd /d /c`, so one argv reaches the right half on each OS.
+  The price on Windows: cmd echoes the shebang line and reports it as an unknown
+  command, which lands in `herdr plugin log` and nowhere else. On macOS and
+  Linux it costs one `sh` exec, and the file needs its executable bit (100755
+  in git; `herdr plugin install` checks out with git, which keeps it).
+- **Panes and the build step split by platform instead.** Nothing outside the
+  plugin names a pane id, and a build step has none, so Windows gets the
+  `graph-windows` pane and its own `[[build]]`, both naming `git-bash.cmd`
+  directly. The pane is what the user looks at, and this keeps the shebang line
+  out of it.
+- **Batch, not PowerShell.** `powershell.exe` takes about half a second to
+  start and cmd a few milliseconds, and the launcher sits on the path of every
+  key press. The batch files avoid labels and `goto`, which cmd finds
+  unreliably in an LF file. They read `%errorlevel%` on a line of its own,
+  because a bare `exit /b` reports 0 to `cmd /c` whatever the script returned.
+- **LF, always.** bash reads a CR as part of the line, and `core.autocrlf` would
+  give it one in a Windows checkout. `.gitattributes` pins `herdr-plugin/herdr/*`
+  to LF.
+- **The config is under `%APPDATA%`.** Herdr on Windows honours
+  `HERDR_CONFIG_PATH` and `XDG_CONFIG_HOME` as elsewhere, then falls back to
+  `%APPDATA%\herdr\config.toml`, not `~/.config`. `keys.sh` follows, and
+  normalises the path with `cygpath -m`, since `dirname` splits only on `/`.
+- **`jq.exe` writes CRLF.** A native jq ends every line in CRLF unless given
+  `-b`, and command substitution keeps the CR, which would ride into the pane
+  and session ids. `pane.sh` and `resolve.sh` run `jq -b` under Git Bash.
+
+## 7. Working on it
 
 ```bash
 herdr plugin link "$(pwd)/herdr-plugin"        # link runs no build step: have zoe on PATH
@@ -155,7 +204,9 @@ herdr pane list | jq '.result.panes[] | {pane_id, agent, agent_session}'
 `herdr-plugin.toml`. The scripts read Herdr only through `$HERDR_BIN_PATH` and
 `jq`, so they can be exercised without Herdr by putting a stub `herdr` on
 `PATH` that prints a canned `pane.get` response and setting
-`HERDR_PLUGIN_CONTEXT_JSON` to `{"focused_pane_id":"w1:p1"}`.
+`HERDR_PLUGIN_CONTEXT_JSON` to `{"focused_pane_id":"w1:p1"}`. On Windows, start
+them the way Herdr does, from the plugin root with an absolute path:
+`cmd /d /c C:\...\herdr-plugin\herdr\bash.cmd herdr/keys.sh setup`.
 
 Anything asserted here about Herdr's shapes came from the schema or a live
 response, never from memory. Keep it that way: the field names are close enough

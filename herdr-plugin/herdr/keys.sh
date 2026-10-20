@@ -4,7 +4,8 @@
 # Herdr plugins cannot ship keys in their manifest (plugin v1 binds keys only
 # from the user's config), so this writes one marker-fenced block into the
 # config Herdr loads, the way it resolves the path itself: HERDR_CONFIG_PATH,
-# then $XDG_CONFIG_HOME/herdr/config.toml, then ~/.config/herdr/config.toml.
+# then $XDG_CONFIG_HOME/herdr/config.toml, then ~/.config/herdr/config.toml, or
+# %APPDATA%\herdr\config.toml on Windows.
 #
 # Rules: never touch anything outside the block, leave a key that is already
 # bound elsewhere alone and say so, back the file up before writing, hand the
@@ -38,7 +39,10 @@ config_path() {
   elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
     printf '%s/herdr/config.toml' "$XDG_CONFIG_HOME"
   else
-    printf '%s/.config/herdr/config.toml' "$HOME"
+    case "$OSTYPE" in
+      msys* | cygwin*) printf '%s/herdr/config.toml' "$APPDATA" ;;
+      *) printf '%s/.config/herdr/config.toml' "$HOME" ;;
+    esac
   fi
 }
 
@@ -72,6 +76,8 @@ reload() {
 
 path=$(config_path)
 [ -n "$path" ] || fail "HERDR_CONFIG_PATH is set but empty, so Herdr loads no config and there is nowhere to put a key."
+# A Windows path arrives with backslashes, and dirname only splits on `/`.
+case "$OSTYPE" in msys* | cygwin*) path=$(cygpath -m "$path") ;; esac
 
 case "${1:-}" in
   setup)
