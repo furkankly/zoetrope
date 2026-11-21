@@ -1,0 +1,13 @@
+2026-11-02T09:00:00+00:00  Agent@main
+2026-11-02T09:00:00+00:00  Prompt@main
+2026-11-02T09:00:01+00:00  Model@main
+2026-11-02T09:00:03+00:00  Reasoning@main
+2026-11-02T09:00:04+00:00  ToolStart@main
+2026-11-02T09:00:06+00:00  ToolEnd@main
+2026-11-02T09:00:06+00:00  Reasoning@main
+2026-11-02T09:00:20+00:00  Tokens@main
+2026-11-02T09:00:32+00:00  ToolStart@main
+2026-11-02T09:00:36+00:00  ToolEnd@main
+2026-11-02T09:00:36+00:00  Reasoning@main
+2026-11-02T09:00:45+00:00  Tokens@main
+2026-11-02T09:00:51+00:00  Activity@main

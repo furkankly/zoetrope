@@ -36,6 +36,18 @@
 //!   completion shows them finished, not on every poll. Tokens likewise wait
 //!   for completion, because the first count the core sees under a `dedup` key
 //!   is the one it keeps.
+//! - **A call is stated once it is made.** A tool part is first `streaming`,
+//!   its input a half-written string; the core keeps the first `ToolStart` per
+//!   call, so one stated then would never get its summary, and a resume of a
+//!   subagent would pass for a spawn.
+//! - **Parts may be rows of their own.** With `experimental.part_rows` each
+//!   assistant part is a `session_part` row and the message's own `content` is
+//!   empty; updating a part leaves the message row alone, so a message is
+//!   changed when it or any of its parts is (see `db.rs`).
+//! - **The clock comes from the document, every pass.** Where a part sits in
+//!   time is worked out from the message as it reads now, whether or not a
+//!   part was stated on an earlier poll, so reading a message as it grows and
+//!   reading it finished date what follows a tool the same.
 //! - **`synthetic`, `system`, `compaction` and the switch records** are
 //!   context the runtime wrote around the thread, not the thread speaking.
 //!   They state nothing.
@@ -127,27 +139,34 @@ impl Stream {
     }
 
     /// Read what changed since the last call and state it, in the order the
-    /// session made it. Empty when nothing changed, or when the database cannot
-    /// be read this tick (it is retried on the next).
+    /// session made it. `None` when the database could not be read (busy,
+    /// gone, or the session's row is not there), which is not the same as
+    /// nothing having changed: a caller that must not mistake one for the
+    /// other (`inspect`) asks this, a live one retries on the next tick.
+    ///
+    /// Everything is read before anything is stated, so a read that fails
+    /// partway leaves the stream where it was and the next call starts the same.
     #[cfg(feature = "native")]
-    pub fn poll(&mut self) -> Vec<Statement> {
-        let Some(conn) = db::open(&self.db) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        if let Some(row) = db::session(&conn, &self.session) {
-            out.extend(self.session_row(&row));
+    pub fn try_poll(&mut self) -> Option<Vec<Statement>> {
+        let conn = db::open(&self.db)?;
+        let session = db::session(&conn, &self.session)?;
+        let rows = db::messages_since(&conn, &self.session, self.cursor)?;
+        let mut out = self.session_row(&session);
+        for row in &rows {
+            out.extend(self.push(row));
         }
-        for row in db::messages_since(&conn, &self.session, self.cursor) {
-            out.extend(self.push(&row));
-        }
-        out
+        Some(out)
     }
 
     /// Without the database layer there is nothing to read.
     #[cfg(not(feature = "native"))]
+    pub fn try_poll(&mut self) -> Option<Vec<Statement>> {
+        None
+    }
+
+    /// [`try_poll`](Self::try_poll), where a failed read is an empty tick.
     pub fn poll(&mut self) -> Vec<Statement> {
-        Vec::new()
+        self.try_poll().unwrap_or_default()
     }
 
     fn is_root(&self) -> bool {
@@ -218,7 +237,7 @@ impl Stream {
     /// State what one message row says that has not been stated. A row read
     /// again unchanged states nothing.
     pub fn push(&mut self, row: &Row) -> Vec<Statement> {
-        let print = fingerprint(&row.data);
+        let print = fingerprint(row);
         if row.time_updated == self.cursor && self.boundary.get(&row.id) == Some(&print) {
             return Vec::new();
         }
@@ -270,7 +289,7 @@ impl Stream {
     /// have closed, the tools that have started or ended, and the message's
     /// tokens once it completes, each at its own time.
     fn assistant(&mut self, row: &Row) -> Vec<Statement> {
-        let Some(msg) = Message::parse(&row.data) else {
+        let Some(msg) = Message::parse_with(&row.data, &row.parts) else {
             return Vec::new();
         };
         let owner = self.owner.clone();
@@ -285,7 +304,11 @@ impl Stream {
         let says = |ts: Option<DateTime<Utc>>, facts: Vec<Fact>| Statement { at: ts, facts };
 
         // Where the message is on the clock: it starts when the first token
-        // arrives and moves to each tool's own times as they pass.
+        // arrives and moves to each part's own times as they pass. It is worked
+        // out from the document on *every* pass, whether or not a part has
+        // already been stated, so a poll that finds a tool long since stated and
+        // one that reads the finished message from scratch date what follows it
+        // the same.
         let began = ms(msg.time.first_token.or(msg.time.created));
         let mut now = began;
         let mut out = Vec::new();
@@ -307,6 +330,11 @@ impl Stream {
             let mem = &mut seen.parts[i];
             match part.kind.as_str() {
                 "text" | "reasoning" => {
+                    // Reasoning says when it finished; text does not, and sits
+                    // where the part before it left the clock.
+                    if let Some(at) = ms(part.time.completed.or(part.time.created)) {
+                        now = Some(at);
+                    }
                     // Still being written until something follows it.
                     let closed = complete || i + 1 < msg.content.len();
                     if closed && mem.stage == Stage::Pending {
@@ -325,8 +353,22 @@ impl Stream {
                     else {
                         continue;
                     };
+                    // A call the model is still writing is `streaming`, its
+                    // input a half-written string. Nothing is stated until it
+                    // is made: the core keeps the first `ToolStart` it sees for
+                    // a call, so one stated now would never get its summary,
+                    // and a resume would pass for a spawn, since only the
+                    // parsed input says which it is.
+                    if state.streaming() {
+                        continue;
+                    }
                     let name = part.tool_name();
                     let started = ms(part.time.ran.or(part.time.created)).or(now);
+                    let ended = if state.finished() {
+                        ms(part.time.completed).or(started)
+                    } else {
+                        None
+                    };
                     // `subagent` with a session of its own is a resume.
                     let spawns = name == "subagent" && state.input_str("sessionID").is_none();
 
@@ -349,7 +391,6 @@ impl Stream {
                             ));
                         }
                         out.push(says(started, facts));
-                        now = started;
                     }
 
                     // The child exists once the part names it, which may be
@@ -390,7 +431,6 @@ impl Stream {
 
                     if mem.stage == Stage::Started && state.finished() {
                         mem.stage = Stage::Ended;
-                        let ended = ms(part.time.completed).or(now);
                         let failed = state.errored() || (name == "shell" && state.shell_failed());
                         let outcome = if failed { Outcome::Err } else { Outcome::Ok };
                         out.push(says(
@@ -403,8 +443,11 @@ impl Stream {
                                 },
                             )],
                         ));
-                        now = ended;
                     }
+
+                    // The clock moves past this call whether or not it was
+                    // stated just now.
+                    now = ended.or(started);
                 }
                 _ => {}
             }
@@ -442,10 +485,13 @@ impl Stream {
     }
 }
 
-/// A stable fingerprint of a document, to tell a rewrite from a re-read.
-fn fingerprint(data: &str) -> u64 {
+/// A stable fingerprint of a message and its parts, to tell a rewrite from a
+/// re-read. The parts count: with part rows a tool finishing rewrites a part
+/// and leaves the message's own document as it was.
+fn fingerprint(row: &Row) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut h);
+    row.data.hash(&mut h);
+    row.parts.hash(&mut h);
     h.finish()
 }
 
@@ -579,9 +625,14 @@ mod database_tests {
         assert!(!fixtures.is_empty(), "no fixtures under {}", dir.display());
         for name in fixtures {
             let db = load(&name).unwrap();
+            let root = discovery::list_in(&db, &Scope::ALL)
+                .into_iter()
+                .find(|f| f.role == FileRole::Root)
+                .unwrap_or_else(|| panic!("{name}: no root session"))
+                .session;
             let path = db.clone();
             let streams = move || -> Vec<Vec<Statement>> {
-                let session = session_of(&path, ROOT);
+                let session = session_of(&path, &root);
                 session
                     .every_file()
                     .map(|f| session.provider.stream_for(f).poll())
@@ -716,6 +767,97 @@ mod database_tests {
         unload(&db);
     }
 
+    /// With `experimental.part_rows` the parts are rows of their own. They are
+    /// read, alongside a message of the same session that is still inline; a
+    /// call still being written states nothing; and a part finishing is a change
+    /// although the message's own row is exactly as it was.
+    #[test]
+    fn part_rows_are_read_and_a_part_finishing_is_a_change() {
+        let Some(db) = load("part-rows") else { return };
+        let session = session_of(&db, "ses_parts_root");
+        let mut stream = session.provider.stream_for(&session.root);
+
+        let first = stream.poll();
+        let started: Vec<&str> = first
+            .iter()
+            .flat_map(|s| &s.facts)
+            .filter_map(|f| match &f.kind {
+                FactKind::ToolStart { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            ["read", "grep"],
+            "one from part rows, one inline; the streaming call is not made yet"
+        );
+        assert!(stream.poll().is_empty());
+
+        // The model makes the call. Only its part row is rewritten: the
+        // message row keeps its time.
+        write(
+            &db,
+            r#"UPDATE session_part SET time_updated = time_updated + 5000, data = json_set(
+                   json_set(json_set(data, '$.state.status', 'running'),
+                            '$.state.input', json('{"patchText":"*** Begin Patch\n*** Update File: /home/dev/parts/src/config.rs\n*** End Patch"}')),
+                   '$.time.ran', 1793610000000)
+               WHERE message_id = 'msg_p04';"#,
+        );
+        let called = stream.poll();
+        assert_eq!(kinds(&called), ["ToolStart"]);
+        assert!(matches!(
+            &called[0].facts[0].kind,
+            FactKind::ToolStart { name, summary, .. }
+                if name == "patch" && summary.as_deref() == Some("src/config.rs")
+        ));
+
+        write(
+            &db,
+            r#"UPDATE session_part SET time_updated = time_updated + 5000, data = json_set(
+                   json_set(data, '$.state.status', 'completed'), '$.time.completed', 1793610005000)
+               WHERE message_id = 'msg_p04';"#,
+        );
+        assert_eq!(kinds(&stream.poll()), ["ToolEnd"]);
+        assert!(stream.poll().is_empty());
+        unload(&db);
+    }
+
+    /// A read that fails is not a tick with nothing new: `inspect` must be able
+    /// to tell, and the stream must not have moved, so the next read states
+    /// exactly what it would have.
+    #[test]
+    fn a_failed_read_is_not_an_empty_one_and_leaves_the_stream_where_it_was() {
+        let Some(db) = load("demo") else { return };
+        let session = session_of(&db, ROOT);
+        let child = session
+            .files
+            .iter()
+            .find(|f| f.path.to_string_lossy().ends_with("ses_demo_explore"))
+            .unwrap();
+        let mut stream = session.provider.stream_for(child);
+        assert!(stream.try_poll().is_some_and(|s| !s.is_empty()));
+
+        // The messages are out of reach for a moment.
+        write(
+            &db,
+            "ALTER TABLE session_message RENAME TO session_message_away;",
+        );
+        assert!(stream.try_poll().is_none(), "unreadable is not nothing");
+        assert!(stream.poll().is_empty(), "though a live tick just retries");
+
+        write(
+            &db,
+            r#"ALTER TABLE session_message_away RENAME TO session_message;
+               INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+               VALUES ('msg_e07', 'ses_demo_explore', 'user', 7, 1793527700000, 1793527700000,
+                       '{"time":{"created":1793527700000},"text":"One more thing."}');"#,
+        );
+        let then = stream.try_poll().expect("readable again");
+        assert_eq!(then.len(), 1, "exactly the row written since: {then:?}");
+        assert!(matches!(then[0].facts[0].kind, FactKind::Activity));
+        unload(&db);
+    }
+
     /// The database is the user's, live, and holds their credentials: what we
     /// open it with must not be able to change it, whatever the SQL.
     #[test]
@@ -738,6 +880,7 @@ mod database_tests {
         let gone = std::env::temp_dir().join("zoetrope_opencode_never_existed.db");
         let _ = std::fs::remove_file(&gone);
         assert!(stream_at(&gone).poll().is_empty());
+        assert!(stream_at(&gone).try_poll().is_none());
         assert!(discovery::session_file(&discovery::locator(&gone, "ses_x")).is_none());
         assert!(discovery::list_in(&gone, &Scope::ALL).is_empty());
     }
@@ -786,6 +929,15 @@ mod tests {
             kind: kind.into(),
             time_updated: updated,
             data: data.into(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// An assistant row whose parts live in `session_part` rows.
+    fn row_with_parts(id: &str, updated: i64, data: &str, parts: &[&str]) -> Row {
+        Row {
+            parts: parts.iter().map(|p| p.to_string()).collect(),
+            ..row(id, "assistant", updated, data)
         }
     }
 
@@ -886,6 +1038,118 @@ mod tests {
         );
         assert_eq!(then[0].at, ms(Some(2900)), "the end sits at its own time");
         assert!(s.push(&row("m1", "assistant", 3000, done)).is_empty());
+    }
+
+    /// OpenCode stores a tool part as `streaming` with a half-written string
+    /// for input, and only replaces both when the call is made. A start stated
+    /// then would be the one the core keeps, summary-less, and would take a
+    /// resume for a spawn.
+    #[test]
+    fn a_tool_still_being_written_states_nothing_until_it_is_called() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let streaming = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"call_s","name":"subagent",
+             "state":{"status":"streaming","input":"{\"sessionID\":\"ses_c\",\"desc"},
+             "time":{"created":1100}}]}"#;
+        let first = s.push(&row("m1", "assistant", 1100, streaming));
+        assert_eq!(
+            kinds(&first),
+            ["Activity"],
+            "the message is working; the call is not made yet"
+        );
+
+        let called = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"call_s","name":"subagent",
+             "state":{"status":"running","input":{"sessionID":"ses_c","description":"Carry on","prompt":"p"},"metadata":{}},
+             "time":{"created":1100,"ran":1500}}]}"#;
+        let then = s.push(&row("m1", "assistant", 1500, called));
+        // The parsed input says this is a resume: no spawn, and the summary is there.
+        assert_eq!(kinds(&then), ["ToolStart"]);
+        assert!(matches!(
+            &then[0].facts[0].kind,
+            FactKind::ToolStart { summary, .. } if summary.as_deref() == Some("Carry on")
+        ));
+        assert_eq!(
+            then[0].at,
+            ms(Some(1500)),
+            "started when it was made, not when it was asked for"
+        );
+
+        // A call that fails while still streaming ends with an object for input.
+        let failed = r#"{"time":{"created":2000},"content":[
+            {"type":"tool","id":"call_f","name":"read",
+             "state":{"status":"error","input":{},"error":{"type":"tool.input-incomplete","message":"x"}},
+             "time":{"created":2100,"completed":2200}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m2", "assistant", 2200, failed))),
+            ["ToolStart", "ToolEnd"]
+        );
+    }
+
+    /// What follows a tool is dated by the tool, whether the tool was stated
+    /// on this poll or on one long before: reading a message as it grows and
+    /// reading it finished must agree.
+    #[test]
+    fn what_follows_a_tool_is_dated_the_same_live_and_from_scratch() {
+        let growing = r#"{"time":{"created":1000,"firstToken":1100},"content":[
+            {"type":"tool","id":"c","name":"read","state":{"status":"completed","input":{"path":"a"}},
+             "time":{"created":5000,"ran":5000,"completed":9000}},
+            {"type":"text","text":"then this"}]}"#;
+        let done = growing.replacen(
+            r#""firstToken":1100}"#,
+            r#""firstToken":1100,"completed":9500}"#,
+            1,
+        );
+
+        // Live: the tool is stated on one poll; the text closes on the next.
+        let mut live = stream("ses_r", "ses_r", None);
+        live.push(&row("m", "assistant", 9000, growing));
+        let live_text = live.push(&row("m", "assistant", 9500, &done));
+        // From scratch: the finished message, once.
+        let mut bulk = stream("ses_r", "ses_r", None);
+        let bulk_said = bulk.push(&row("m", "assistant", 9500, &done));
+
+        let text_at = |said: &[Statement]| {
+            said.iter()
+                .find(|s| {
+                    s.facts
+                        .iter()
+                        .any(|f| matches!(f.kind, FactKind::Reasoning(_)))
+                })
+                .map(|s| s.at)
+        };
+        assert_eq!(
+            text_at(&live_text),
+            Some(ms(Some(9000))),
+            "after the tool, not at the message's start"
+        );
+        assert_eq!(text_at(&live_text), text_at(&bulk_said));
+    }
+
+    /// With `experimental.part_rows` the parts are rows of their own and the
+    /// message's document has none: they are read from the rows, and a part
+    /// finishing is a change to the message even though its own row is as it was.
+    #[test]
+    fn part_rows_state_what_inline_parts_would() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let envelope = r#"{"time":{"created":1000,"firstToken":1100},"content":[]}"#;
+        let running = r#"{"type":"tool","id":"call_1","name":"shell",
+            "state":{"status":"running","input":{"command":"cargo test"},"metadata":{}},
+            "time":{"created":1200,"ran":1210}}"#;
+        let first = s.push(&row_with_parts("m1", 1210, envelope, &[running]));
+        assert_eq!(kinds(&first), ["ToolStart"]);
+
+        // The part is rewritten; the message row is untouched and an update
+        // time later than it is all that tells.
+        let done = r#"{"type":"tool","id":"call_1","name":"shell",
+            "state":{"status":"completed","input":{"command":"cargo test"},"metadata":{"exit":0}},
+            "time":{"created":1200,"ran":1210,"completed":2000}}"#;
+        let then = s.push(&row_with_parts("m1", 2000, envelope, &[done]));
+        assert_eq!(kinds(&then), ["ToolEnd"]);
+        assert!(
+            s.push(&row_with_parts("m1", 2000, envelope, &[done]))
+                .is_empty()
+        );
     }
 
     #[test]

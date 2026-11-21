@@ -11,8 +11,8 @@
 //!   milliseconds on a lock rather than the UI's patience, and lives for one
 //!   poll. A failure to read is "nothing new this tick", the way an unreadable
 //!   file is for a tailer.
-//! - **Only the tables a session is made of.** `session_v2` and
-//!   `session_message`, and only the columns this module names. Nothing here
+//! - **Only the tables a session is made of.** `session_v2`, `session_message`
+//!   and `session_part`, and only the columns this module names. Nothing here
 //!   reads another table, so nothing here can leak what lives in it.
 
 use std::path::Path;
@@ -97,28 +97,62 @@ pub fn descendants(conn: &Connection, root: &str) -> Vec<SessionRow> {
     rows.flatten().collect()
 }
 
+/// Whether this database has `session_part` at all. A database written only
+/// by an older OpenCode may not, and a session read from one has no part rows.
+fn has_part_table(conn: &Connection) -> bool {
+    conn.prepare("SELECT 1 FROM session_part LIMIT 0").is_ok()
+}
+
 /// A session's messages written or rewritten at or after `since`
-/// (milliseconds), in the order they were made. The bound is inclusive on
-/// purpose: a row rewritten within the millisecond of the last one read has
-/// the same `time_updated`, and the caller tells it apart by content.
-pub fn messages_since(conn: &Connection, session: &str, since: i64) -> Vec<Row> {
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, type, time_updated, data FROM session_message \
-         WHERE session_id = ?1 AND time_updated >= ?2 ORDER BY seq",
-    ) else {
-        return Vec::new();
+/// (milliseconds), in the order they were made, each with its part rows. A
+/// message counts as rewritten when it *or any of its parts* was: with part
+/// rows OpenCode updates a part and leaves the message alone, so the message's
+/// own `time_updated` alone would miss a tool finishing. The bound is
+/// inclusive on purpose: a row rewritten within the millisecond of the last
+/// one read has the same time, and the caller tells it apart by content.
+///
+/// `None` is a read that failed (busy, gone, not a database), which is not
+/// the same thing as nothing having changed.
+pub fn messages_since(conn: &Connection, session: &str, since: i64) -> Option<Vec<Row>> {
+    let with_parts = has_part_table(conn);
+    let latest = if with_parts {
+        "MAX(m.time_updated, COALESCE((SELECT MAX(p.time_updated) FROM session_part p \
+         WHERE p.message_id = m.id), 0))"
+    } else {
+        "m.time_updated"
     };
-    let Ok(rows) = stmt.query_map(params![session, since], |r| {
-        Ok(Row {
-            id: r.get(0)?,
-            kind: r.get(1)?,
-            time_updated: r.get(2)?,
-            data: r.get(3)?,
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT m.id, m.type, {latest} AS updated, m.data FROM session_message m \
+             WHERE m.session_id = ?1 AND updated >= ?2 ORDER BY m.seq"
+        ))
+        .ok()?;
+    let mut rows: Vec<Row> = stmt
+        .query_map(params![session, since], |r| {
+            Ok(Row {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                time_updated: r.get(2)?,
+                data: r.get(3)?,
+                parts: Vec::new(),
+            })
         })
-    }) else {
-        return Vec::new();
-    };
-    rows.flatten().collect()
+        .ok()?
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if with_parts {
+        let mut parts = conn
+            .prepare("SELECT data FROM session_part WHERE message_id = ?1 ORDER BY ordinal")
+            .ok()?;
+        for row in rows.iter_mut().filter(|r| r.kind == "assistant") {
+            row.parts = parts
+                .query_map(params![row.id], |r| r.get::<_, String>(0))
+                .ok()?
+                .collect::<Result<_, _>>()
+                .ok()?;
+        }
+    }
+    Some(rows)
 }
 
 /// Whether a file starts with SQLite's magic, so a bare path to a database

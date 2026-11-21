@@ -7,7 +7,9 @@
 //! a document is read many times, and what it says is whatever it says now.
 //!
 //! The message's kind (`user`, `assistant`, `idle`, ...) is a column, not a
-//! field of the document; [`Message::parse`] takes the document alone.
+//! field of the document; [`Message::parse`] takes the document alone. With
+//! OpenCode's `experimental.part_rows` the assistant's parts are rows of a
+//! table of their own, which [`Message::parse_with`] folds back into `content`.
 //!
 //! Defensive like the other wire modules: every field is optional, a part
 //! that does not parse becomes an empty one that states nothing, and a
@@ -39,6 +41,25 @@ pub struct Message {
 impl Message {
     pub fn parse(data: &str) -> Option<Message> {
         serde_json::from_str(data).ok()
+    }
+
+    /// A message whose parts may live in rows of their own. With OpenCode's
+    /// `experimental.part_rows` on, each assistant part is a `session_part`
+    /// row (the same document an inline `content` element is) and the
+    /// envelope's `content` is empty. A database can hold both shapes on one
+    /// message, after a downgrade and an upgrade; OpenCode keeps the rows
+    /// first and the inline parts after them, and so does this.
+    pub fn parse_with(data: &str, parts: &[String]) -> Option<Message> {
+        let mut message = Message::parse(data)?;
+        if !parts.is_empty() {
+            let mut content: Vec<Part> = parts
+                .iter()
+                .map(|p| serde_json::from_str(p).unwrap_or_default())
+                .collect();
+            content.append(&mut message.content);
+            message.content = content;
+        }
+        Some(message)
     }
 
     /// Whether the assistant has finished this message. Its `content` stops
@@ -127,6 +148,14 @@ impl ToolState {
         self.metadata.as_ref()?.get(key)?.as_str()
     }
 
+    /// The call is still being written by the model and has not been made:
+    /// OpenCode first stores a tool part as `streaming` with its input as a
+    /// half-written *string*, and replaces both when the call is made. (`pending`
+    /// is the same state under an older name.)
+    pub fn streaming(&self) -> bool {
+        matches!(self.status.as_deref(), Some("streaming" | "pending"))
+    }
+
     /// The tool ran and said it failed.
     pub fn errored(&self) -> bool {
         self.status.as_deref() == Some("error")
@@ -172,13 +201,17 @@ pub struct SessionRow {
 }
 
 /// A message's row: the kind and the update time are columns, `data` is the
-/// document [`Message::parse`] reads.
+/// document [`Message::parse_with`] reads. `parts` are the documents of its
+/// `session_part` rows in order, empty for a message that keeps its parts
+/// inline. `time_updated` is the latest write to the message *or* any of its
+/// parts: with part rows, OpenCode updates a part without touching the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
     pub kind: String,
     pub time_updated: i64,
     pub data: String,
+    pub parts: Vec<String>,
 }
 
 /// Epoch milliseconds as a time. `None` for a missing or out-of-range value.
@@ -222,6 +255,30 @@ mod tests {
         assert_eq!(tool.tool_name(), "read");
         assert_eq!(tool.state.as_ref().unwrap().input_str("path"), Some("a.rs"));
         assert_eq!(tool.time.ran, Some(1210));
+    }
+
+    #[test]
+    fn part_rows_come_first_and_inline_parts_after_them() {
+        let rows = [
+            r#"{"type":"reasoning","text":"from a row"}"#.to_string(),
+            "not json".to_string(),
+        ];
+        let m = Message::parse_with(
+            r#"{"time":{"created":1},"content":[{"type":"text","text":"inline"}]}"#,
+            &rows,
+        )
+        .unwrap();
+        let kinds: Vec<&str> = m.content.iter().map(|p| p.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["reasoning", "", "text"],
+            "an unreadable row is empty, not dropped"
+        );
+        assert_eq!(m.content[0].text.as_deref(), Some("from a row"));
+        // No rows: exactly the inline message.
+        let plain =
+            Message::parse_with(r#"{"content":[{"type":"text","text":"x"}]}"#, &[]).unwrap();
+        assert_eq!(plain.content.len(), 1);
     }
 
     #[test]

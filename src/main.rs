@@ -181,9 +181,14 @@ fn parse_session_fully(
     // Order is not critical — the model is fold-order independent — so files
     // go in as the session lists them, root first.
     for f in session.every_file() {
-        // A rows file is not a file: its stream is asked for everything.
+        // A rows file is not a file: its stream is asked for everything, and
+        // a read that fails is an unreadable file, not an empty one.
         if f.read == ReadMode::Rows {
-            for statement in p.stream_for(f).poll() {
+            let statements = p
+                .stream_for(f)
+                .try_poll()
+                .with_context(|| format!("reading {}", f.path.display()))?;
+            for statement in statements {
                 apply(statement);
             }
             continue;

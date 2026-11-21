@@ -144,9 +144,17 @@ impl Stream {
     /// stream keeps its own place, as `push` does between lines. Empty for a
     /// stream read by lines.
     pub fn poll(&mut self) -> Vec<Statement> {
+        self.try_poll().unwrap_or_default()
+    }
+
+    /// [`poll`](Self::poll), but a read that failed is `None` and not an empty
+    /// answer: a live feeder retries on the next tick and does not mind, a
+    /// one-shot reader (`inspect`) must not report success for a session it
+    /// could not read. A stream read by lines has nothing to fail at.
+    pub fn try_poll(&mut self) -> Option<Vec<Statement>> {
         match self {
-            Stream::Claude(_) | Stream::Codex(_) => Vec::new(),
-            Stream::OpenCode(s) => s.poll(),
+            Stream::Claude(_) | Stream::Codex(_) => Some(Vec::new()),
+            Stream::OpenCode(s) => s.try_poll(),
         }
     }
 }
