@@ -291,9 +291,11 @@ async fn run_tui(cli: Cli) -> Result<()> {
 }
 
 /// What a positional argument means: an existing file is a session's file, an
-/// existing directory is a project to follow, anything shaped like a path
-/// that does not exist is a typo, and the rest is a session id or a prefix
-/// of one. Shared by `zoe <target>` and `zoe inspect <target>`.
+/// existing directory is a project to follow, a locator a provider recognises
+/// (a session inside a database, `opencode.db#ses_...`) is that session,
+/// anything else shaped like a path that does not exist is a typo, and the
+/// rest is a session id or a prefix of one. Shared by `zoe <target>` and
+/// `zoe inspect <target>`.
 fn resolve_target(arg: String) -> Result<Target> {
     let path = PathBuf::from(&arg);
     if path.is_file() {
@@ -301,6 +303,14 @@ fn resolve_target(arg: String) -> Result<Target> {
     }
     if path.is_dir() {
         return Ok(Target::Here(path));
+    }
+    // Not on disk, but a provider whose sessions live inside something else
+    // may still say it names one.
+    if Provider::ALL
+        .into_iter()
+        .any(|p| p.is_virtual() && p.session_file(&path).is_some())
+    {
+        return Ok(Target::Path(path));
     }
     if path.components().count() > 1 || path.extension().is_some() {
         bail!("not found: {}", path.display());
@@ -336,6 +346,32 @@ mod tests {
         let mut v = vec!["zoe".to_string()];
         v.extend(args.iter().map(|s| s.to_string()));
         parse_cli(v.into_iter())
+    }
+
+    /// A session inside a database is not a file, but the path that names it
+    /// is a target all the same, and an unrecognised path that does not exist
+    /// is still a typo.
+    #[test]
+    fn a_locator_a_provider_recognises_is_a_target_and_other_missing_paths_are_not() {
+        let db = std::env::temp_dir().join(format!("zoetrope_target_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session_v2 (id text PRIMARY KEY, parent_id text, directory text, \
+                 title text, version text, agent text, time_created integer, time_updated integer); \
+                 INSERT INTO session_v2 VALUES ('ses_x', NULL, '/p', NULL, '2', NULL, 1, 2);",
+            )
+            .unwrap();
+        let locator = format!("{}#ses_x", db.display());
+        match resolve_target(locator.clone()).unwrap() {
+            Target::Path(p) => assert_eq!(p, PathBuf::from(&locator)),
+            other => panic!("expected a path target, got {other:?}"),
+        }
+        // Right database, no such session: nobody claims it.
+        assert!(resolve_target(format!("{}#ses_nope", db.display())).is_err());
+        assert!(resolve_target("/no/such/file.jsonl".into()).is_err());
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]
