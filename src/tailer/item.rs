@@ -285,6 +285,9 @@ impl Bundle {
                 self.streams.insert(key, stream);
                 out
             }
+            // A database is not something a page can be handed as text, and
+            // `session_file_from` never classifies a file as one.
+            ReadMode::Rows => Vec::new(),
             ReadMode::Whole => {
                 if self.seen.contains(&key) {
                     return Vec::new();

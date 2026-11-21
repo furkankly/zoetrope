@@ -181,6 +181,13 @@ fn parse_session_fully(
     // Order is not critical — the model is fold-order independent — so files
     // go in as the session lists them, root first.
     for f in session.every_file() {
+        // A rows file is not a file: its stream is asked for everything.
+        if f.read == ReadMode::Rows {
+            for statement in p.stream_for(f).poll() {
+                apply(statement);
+            }
+            continue;
+        }
         let text = std::fs::read_to_string(&f.path)
             .with_context(|| format!("reading {}", f.path.display()))?;
         match f.read {
@@ -195,6 +202,7 @@ fn parse_session_fully(
                     apply(statement);
                 }
             }
+            ReadMode::Rows => {}
         }
     }
 

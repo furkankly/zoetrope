@@ -18,7 +18,7 @@ edition = "2024"
 # Inherited from ratatui 0.30, which is the floor: nothing in this crate's own
 # source needs anything newer. Verified by the `msrv` job in CI.
 rust-version = "1.88"
-description = "Terminal UI that visualizes Claude Code and Codex agent sessions as a live flow graph."
+description = "Terminal UI that visualizes Claude Code, Codex and OpenCode agent sessions as a live flow graph."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/furkankly/zoetrope"
@@ -37,8 +37,9 @@ include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [features]
 default = ["native"]
-# The native frontend: terminal (crossterm backend), async runtime (tokio), and
-# filesystem tailing. Code gated `#[cfg(feature = "native")]`. Turn it OFF
+# The native frontend: terminal (crossterm backend), async runtime (tokio),
+# filesystem tailing, and the SQLite read OpenCode's sessions need. Code gated
+# `#[cfg(feature = "native")]`. Turn it OFF
 # (`default-features = false`) for the portable core alone — the model, the
 # timeline, the graph projection, the UI rendering and the providers, with
 # no runtime and no IO of its own (discovery touches the disk only when a
@@ -48,6 +49,7 @@ native = [
   "dep:crossterm",
   "dep:futures",
   "dep:anyhow",
+  "dep:rusqlite",
   "ratatui/crossterm",
   "rataflow/crossterm",
 ]
@@ -86,6 +88,15 @@ tokio = { version = "1", features = [
 ], optional = true }
 futures = { version = "0.3", optional = true }
 anyhow = { version = "1", optional = true }
+# OpenCode keeps its sessions in one SQLite database, not a file per session, so
+# reading them takes a SQLite. `bundled` compiles it in: the release targets
+# (musl via `cross`, macOS, Windows) cannot count on a system libsqlite3, and it
+# is what keeps a read-only open of a WAL database independent of the host's
+# build. 0.40 is the newest that holds the 1.88 floor (0.41 wants 1.89).
+# Native only: sqlite cannot be built for wasm32, and the browser has no disk.
+rusqlite = { version = "0.40", default-features = false, features = [
+  "bundled",
+], optional = true }
 # Persistent collections: cloning a `SessionModel` shares structure instead of
 # copying it, which is what makes a snapshot ladder rung O(1).
 imbl = "7.0.1"

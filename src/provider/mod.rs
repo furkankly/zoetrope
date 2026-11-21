@@ -55,12 +55,15 @@
 //!
 //! A provider's own shape follows its format: the Claude stream carries one
 //! inherited timestamp, the Codex stream learns whose file it is from the
-//! first line. Both are expected, not deviations.
+//! first line, the OpenCode stream keeps a cursor into a database. All are
+//! expected, not deviations.
 //!
-//! This contract covers agents that write one append-only file per thread.
-//! An agent that rewrites a document per turn would add a document push
-//! beside `Stream::push`; one that keeps a database is a different kind of
-//! feeder, not a wider `SessionFile`.
+//! This contract covers agents that write one append-only file per thread,
+//! and, through [`ReadMode::Rows`], one that keeps a database: its sessions
+//! are named by a locator in place of a path, and its stream is asked
+//! ([`Stream::poll`]) what changed in place of being pushed lines. An agent
+//! that rewrites a document per turn would add a document push beside
+//! `Stream::push`. `docs/DISCOVERY.md` §7 says what each class costs.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -73,6 +76,7 @@ use crate::fact::Statement;
 // browser frontend goes through `tailer::Bundle`.
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod opencode;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -85,16 +89,18 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::OpenCode];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::OpenCode => "opencode",
         }
     }
 
@@ -116,15 +122,31 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    /// Boxed: it remembers what it has stated about every message, which makes
+    /// it several times the size of a line parser's state.
+    OpenCode(Box<opencode::Stream>),
 }
 
 impl Stream {
     /// Parse one line and state what it says. `None` for a blank or
-    /// unparsable line, or one that states nothing.
+    /// unparsable line, or one that states nothing, and always for a stream
+    /// that is not read by lines ([`ReadMode::Rows`]).
     pub fn push(&mut self, line: &str) -> Option<Statement> {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::OpenCode(_) => None,
+        }
+    }
+
+    /// State what a stream read by rows ([`ReadMode::Rows`]) has not yet
+    /// stated: everything on the first call, what changed on each after. The
+    /// stream keeps its own place, as `push` does between lines. Empty for a
+    /// stream read by lines.
+    pub fn poll(&mut self) -> Vec<Statement> {
+        match self {
+            Stream::Claude(_) | Stream::Codex(_) => Vec::new(),
+            Stream::OpenCode(s) => s.poll(),
         }
     }
 }
@@ -174,11 +196,17 @@ pub enum FileRole {
     Sidecar,
 }
 
-/// How a file is read: line by line as it grows, or whole, once it parses.
+/// How a file is read: line by line as it grows, whole once it parses, or by
+/// asking its stream what changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadMode {
     Tail,
     Whole,
+    /// Not a file of its own but rows of a database: there is no byte to
+    /// resume from, so the [`Stream`] is asked ([`Stream::poll`]) what is new
+    /// and keeps its own place. The file's `path` is a locator the provider
+    /// made up; nothing but the provider may open it.
+    Rows,
 }
 
 /// What the core assembles from files. Never produced by a provider.
@@ -340,6 +368,33 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::OpenCode => opencode::discovery::all_paths(scope),
+        }
+    }
+
+    /// Every session file this provider has that `scope` admits, classified.
+    /// For a provider that keeps files this is [`all_paths`](Self::all_paths)
+    /// then [`session_file`](Self::session_file) on each. A provider that keeps
+    /// sessions in a database answers in one read instead of one per session,
+    /// which is why [`sweep`] asks this and not the two.
+    pub fn list(self, scope: &Scope) -> Vec<SessionFile> {
+        match self {
+            Provider::Claude | Provider::Codex => self
+                .all_paths(scope)
+                .into_iter()
+                .filter_map(|path| self.session_file(&path))
+                .collect(),
+            Provider::OpenCode => opencode::discovery::sessions(scope),
+        }
+    }
+
+    /// Whether this provider's paths are locators rather than files: names it
+    /// made up for sessions that live inside something else, so that a path
+    /// need not exist on disk to be one of its sessions.
+    pub fn is_virtual(self) -> bool {
+        match self {
+            Provider::Claude | Provider::Codex => false,
+            Provider::OpenCode => true,
         }
     }
 
@@ -348,6 +403,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::OpenCode => opencode::discovery::session_file(path),
         }
     }
 
@@ -358,6 +414,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::OpenCode => opencode::discovery::related_paths(file),
         }
     }
 
@@ -366,24 +423,28 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::OpenCode => opencode::discovery::project_key(cwd),
         }
     }
 
     /// [`session_file`](Self::session_file) without a filesystem: the path a
     /// file came with and its first bytes. A Claude file is classified by its
-    /// path, a Codex file by its first line. The browser's way in.
+    /// path, a Codex file by its first line. The browser's way in. OpenCode
+    /// has no file to hand over, only a database, so it never answers.
     pub fn session_file_from(self, path: &Path, head: &str) -> Option<SessionFile> {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::OpenCode => None,
         }
     }
 
-    /// A parser for one of this provider's tailed files.
+    /// A parser for one of this provider's files.
     pub fn stream_for(self, file: &SessionFile) -> Stream {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::OpenCode => Stream::OpenCode(Box::new(opencode::discovery::stream_for(file))),
         }
     }
 
@@ -393,7 +454,7 @@ impl Provider {
     pub fn sidecar(self, file: &SessionFile, text: &str) -> Option<Statement> {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
-            Provider::Codex => None,
+            Provider::Codex | Provider::OpenCode => None,
         }
     }
 }
@@ -452,11 +513,7 @@ pub fn sweep(scope: &Scope, only: Option<Provider>) -> Vec<Session> {
         if only.is_some_and(|o| o != p) {
             continue;
         }
-        for path in p.all_paths(scope) {
-            if let Some(f) = p.session_file(&path) {
-                files.push(f);
-            }
-        }
+        files.extend(p.list(scope));
     }
     assemble(files)
         .into_iter()
@@ -470,19 +527,25 @@ pub fn sweep(scope: &Scope, only: Option<Provider>) -> Vec<Session> {
 pub fn open(target: &Target, only: Option<Provider>) -> Result<Session, OpenError> {
     let file = match target {
         Target::Path(path) => {
-            if !path.is_file() {
-                return Err(OpenError::NotFound(target.clone()));
-            }
-            // Content first; failing that (an empty, just-created file), the
-            // first provider whose layout claims the path.
-            let p = only
-                .or_else(|| read_head(path).and_then(|head| provider_of(&head)))
-                .or_else(|| {
-                    Provider::ALL
-                        .into_iter()
-                        .find(|p| p.session_file(path).is_some())
-                })
-                .ok_or_else(|| OpenError::Unrecognized(path.clone()))?;
+            let p = if path.is_file() {
+                // Content first; failing that (an empty, just-created file),
+                // the first provider whose layout claims the path.
+                only.or_else(|| read_head(path).and_then(|head| provider_of(&head)))
+                    .or_else(|| {
+                        Provider::ALL
+                            .into_iter()
+                            .find(|p| p.session_file(path).is_some())
+                    })
+                    .ok_or_else(|| OpenError::Unrecognized(path.clone()))?
+            } else {
+                // Not a file. Only a provider whose sessions live inside
+                // something else (a locator, not a path) can say it is one.
+                Provider::ALL
+                    .into_iter()
+                    .filter(|p| p.is_virtual() && only.is_none_or(|o| o == *p))
+                    .find(|p| p.session_file(path).is_some())
+                    .ok_or_else(|| OpenError::NotFound(target.clone()))?
+            };
             // Any file of a session opens the session: the rest of it, root
             // included, is wherever the provider says files of one session are.
             p.session_file(path)
