@@ -1,6 +1,6 @@
 ---
 title: Usage & keys
-description: How to launch zoetrope at a live Claude Code or Codex session or a saved transcript, and the full key map for scrubbing, camera, and overlays.
+description: How to launch zoetrope at a live Claude Code, Codex or OpenCode session or a saved transcript, and the full key map for scrubbing, camera, and overlays.
 ---
 
 The launch only picks the **defaults**: *what* to open and *where the playhead
@@ -14,6 +14,7 @@ zoe                          follow the current project's live session
 zoe <dir>                    follow another project's live session
 zoe <file.jsonl>             replay a recording from the start, paced (any file of a session)
 zoe <id>                     replay a session by id, or a unique prefix of one
+zoe <opencode.db>            replay the newest session in an OpenCode database (<db>#<session> for one)
 zoe <file.jsonl> --follow    open a recording at its live edge instead
 zoe <file.jsonl> --speed N   playback speed multiplier (default 8.0)
 zoe --provider codex ...     force the format instead of detecting it from the file
@@ -24,6 +25,12 @@ A **file** target bulk-loads then tails it; a **directory** (or none → the cur
 project) discovers the latest session and follows it live. `--follow` only changes
 where the playhead starts (the live edge instead of the beginning).
 
+OpenCode keeps its sessions in one SQLite database
+(`~/.local/share/opencode/opencode.db`, or wherever `OPENCODE_DB` points), not a
+file per session. zoetrope opens it read-only, reads only the session tables, and
+treats a session and the agents it spawned as one session. An id, a directory,
+or no argument all find OpenCode's sessions the same way they find the others.
+
 ## Launching (browser)
 
 The [browser app](/app) boots into a bundled demo. To watch your own session:
@@ -33,7 +40,9 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
   session, and follow it live. zoetrope reads every file of the session, then
   tails the folder for new activity, including agents spawned after you picked.
   This is the same "follow a running session" flow as the native app, built on
-  the File System Access API. Nothing is uploaded.
+  the File System Access API. Nothing is uploaded. OpenCode's sessions live in a
+  database rather than files, which a page can't read, so use the native app
+  for them.
 - **Sessions** (other browsers): the same button falls back to a folder picker,
   so browsing and replaying work everywhere. **Following live does not** — without
   the File System Access API the browser hands over an immutable *snapshot* of

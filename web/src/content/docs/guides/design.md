@@ -6,7 +6,7 @@ description: "How zoetrope stays correct: an event-sourced projection, two clock
 zoetrope has one hard job, and most of its design follows from it:
 
 > Reconstruct a faithful, navigable, live-or-replayed view of a coding agent's
-> session (Claude Code, Codex) from a transcript that is **undocumented,
+> session (Claude Code, Codex, OpenCode) from a transcript that is **undocumented,
 > append-only, only partly timestamped, and split across files**, and in which
 > **you often can't tell when something finished.**
 

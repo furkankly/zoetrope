@@ -5,7 +5,7 @@
 <h1 align="center">zoetrope</h1>
 
 <p align="center">
-  <em>Watch a Claude Code or Codex session as a live flow graph, in your terminal or your browser.</em>
+  <em>Watch a Claude Code, Codex or OpenCode session as a live flow graph, in your terminal or your browser.</em>
 </p>
 
 <p align="center">
@@ -24,7 +24,8 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code and Codex write a transcript for every session. zoetrope reads it and draws
+Claude Code and Codex write a transcript for every session, and OpenCode keeps each one in
+a database. zoetrope reads them and draws
 the session as a graph in your terminal: the main agent, the agents it spawns, and the
 tools each one runs, updating live as it goes. Point it at a finished run and it replays,
 paced by the session's own timestamps. Point it at a running one and it follows along.
@@ -40,10 +41,13 @@ Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkank
 | --- | --- | --- | --- | --- |
 | [Claude Code](https://claude.com/claude-code) | `~/.claude/projects/` | ✓ | ✓ | ✓ sessions and subagents |
 | [Codex](https://openai.com/codex/) CLI and desktop app | `~/.codex/sessions/` | ✓ | ✓ | ✓ sessions and subagents |
+| [OpenCode](https://opencode.ai) v2 | `~/.local/share/opencode/opencode.db` (or `$OPENCODE_DB`) | ✓ | ✓ | — a database, not a file to drop |
 
 zoetrope reads a session from any of its files and tells the formats apart by
-content, so `zoe <file>` works for either, and `zoe <id>` finds a session by id
-across both.
+content, so `zoe <file>` works for any of them, and `zoe <id>` finds a session by id
+across all three. OpenCode's sessions are rows of one SQLite database, which
+zoetrope opens read-only and only for the session tables, never the rest of the
+file.
 
 ![zoetrope replaying a Codex CLI session as a flow graph](https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope-codex.gif)
 
@@ -107,6 +111,7 @@ zoe                          # follow the current project's live session
 zoe <dir>                    # follow another project's session
 zoe <file.jsonl>             # replay a recording from the start (any file of a session)
 zoe <id>                     # replay a session by id, or a unique prefix of one
+zoe <opencode.db>            # replay the newest session in an OpenCode database (<db>#<session> for one)
 zoe <file.jsonl> --follow    # open a recording at its live edge
 zoe <file.jsonl> --speed N   # playback speed (default 8.0)
 zoe --provider codex ...     # force the format instead of detecting it from the file

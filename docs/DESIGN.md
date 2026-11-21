@@ -24,9 +24,10 @@ zoe <file> --follow      # ride a file's live edge instead of replaying it
 zoe <file> --speed 8     # playback speed (default 8.0)
 zoe --provider codex ... # force the format instead of reading it off the content
 zoe inspect <file|id>    # no TUI: print session info + parsed tree (smoke-test)
+zoe <opencode.db>        # a session of OpenCode's database: its newest (or <db>#<session> for one)
 ```
 
-Resolution goes through `provider::open` (see [DISCOVERY.md](DISCOVERY.md)): a **file** is `Target::Path` and bulk-loads + tails (replay feeder), the provider read off its first record; an **id** is `Target::Id`, looked up across every provider's roots; a **dir** (or none → cwd) is `Target::Here` and follows the newest session of that project, any provider. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<String>, follow: bool, speed: f64, provider: Option<Provider> } | Inspect { file, provider }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
+Resolution goes through `provider::open` (see [DISCOVERY.md](DISCOVERY.md)): a **file** is `Target::Path` and bulk-loads + tails (replay feeder), the provider read off its first record (a database, which has none, by its SQLite header; a session inside one by its `<db>#<session>` locator, which is not a file at all); an **id** is `Target::Id`, looked up across every provider's roots; a **dir** (or none → cwd) is `Target::Here` and follows the newest session of that project, any provider. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<String>, follow: bool, speed: f64, provider: Option<Provider> } | Inspect { file, provider }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
 
 ## Workspace layout
 
@@ -64,6 +65,7 @@ crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 tokio     = { version = "1", features = ["rt-multi-thread","macros","time","sync","fs","io-util"], optional = true }
 futures   = { version = "0.3", optional = true }
 anyhow    = { version = "1", optional = true }
+rusqlite  = { version = "0.40", default-features = false, features = ["bundled"], optional = true }  # OpenCode keeps a SQLite database; read-only, never in the portable core
 # native also flips on ratatui/crossterm + rataflow/crossterm.
 
 # the library's own wasm need, under [target.'cfg(target_arch="wasm32")'.dependencies]
@@ -100,10 +102,15 @@ src/
 │   │   ├── mod.rs       # the Claude provider: Entry → Facts (`facts`, `Record`) and the per-file `Stream`; the tool-summary lexicon
 │   │   ├── wire.rs      # Claude's serde model for JSONL entries + meta.json sidecars
 │   │   └── discovery.rs # the ~/.claude/projects layout: cwd sanitization, session / subagent / journal scans, the primitives
-│   └── codex/
-│       ├── mod.rs       # the Codex provider: rollout lines → Facts through a `Stream` that learns its thread from its first line
-│       ├── wire.rs      # Codex's serde model: the envelope, `response_item`, `event_msg` and its `item_completed` items
-│       └── discovery.rs # the ~/.codex/sessions/YYYY/MM/DD layout: rollouts, the head read that classifies them, the primitives
+│   ├── codex/
+│   │   ├── mod.rs       # the Codex provider: rollout lines → Facts through a `Stream` that learns its thread from its first line
+│   │   ├── wire.rs      # Codex's serde model: the envelope, `response_item`, `event_msg` and its `item_completed` items
+│   │   └── discovery.rs # the ~/.codex/sessions/YYYY/MM/DD layout: rollouts, the head read that classifies them, the primitives
+│   └── opencode/
+│       ├── mod.rs       # the OpenCode provider: message rows → Facts through a polled `Stream` that remembers what it has stated about each (rows are rewritten as they stream)
+│       ├── wire.rs      # OpenCode's serde model: the `session_message.data` documents, and the two plain row types
+│       ├── discovery.rs # opencode.db and the `<db>#<session>` locator: the tree of sessions by `parent_id`, the primitives
+│       └── db.rs        # (native only) the read-only SQLite reads; the only code that names a table, and only the two a session is made of
 ├── state/
 │   ├── mod.rs     # App: owns the Flow + SessionModel + Timeline + SessionInfo + UI state; handle_ui_event, seek, camera
 │   ├── session.rs # SessionModel: the pure domain model (agents, statuses, tool calls) folded from Facts — knows no format
@@ -153,6 +160,19 @@ This is one provider's format, modelled in `provider/claude/wire.rs` and found o
 ### Tool calls
 `tool_use` names observed: Bash, Edit, Read, Write, ToolSearch, AskUserQuestion, Agent, Workflow, TaskStop, WebFetch. `Agent` input: `{description, prompt, subagent_type}`. Pair `tool_use.id` with the later user `tool_result.tool_use_id` → pending (no result yet = in-flight) vs complete (`is_error` decides Failed).
 
+## OpenCode storage (read against OpenCode 2.0.32, 2.3.0 and 2.3.2)
+
+One provider's storage, modelled in `provider/opencode/wire.rs`, found by `discovery.rs`, and read by `db.rs`. The shape of it, as the provider relies on it:
+
+- **One SQLite database**, `~/.local/share/opencode/opencode.db` (`OPENCODE_DB` overrides), WAL mode, written by OpenCode's service while we read. It also holds credentials; see the rule in `db.rs`. Times are epoch milliseconds.
+- **`session_v2`**: one row per session. A spawned agent is a session whose `parent_id` is the session that spawned it, so a session and its agents are a tree. `directory` is the working directory; `agent` the agent that ran it (`build`, `general`, ...); `title` is set after the first exchange.
+- **`session_message`**: one row per message, `seq` ordered within a session, `type` a column and `data` a JSON document. Kinds read: `user` (`text`) and `assistant`. Kinds that state nothing: `idle` (a turn ended: `outcome` `succeeded`/`failed`/`interrupted`), `synthetic`, `system`, `compaction`, `model-switched`, `location-switched`. (`session_part` exists and is empty in v2.)
+- **An `assistant` row is rewritten while it streams.** Same `id`, later `time_updated`; its `content` grows and each tool part's `state.status` walks `running` → `completed` (or `error`). Its `time` is `{created, firstToken, streamed, completed}`; `completed` is absent while it streams and `tokens` is final only once it is there.
+- **`content[]` parts**: `text` and `reasoning` (`text`), and `tool` (`id` = the call id, `name`, `state: {status, input, metadata}`, `time: {created, ran, completed}`). Tool names seen: `shell`, `read`, `patch`, `grep`, `glob`, `edit`, `write`, `webfetch`, `websearch`, `skill`, `execute`, `question`, `subagent`, and MCP tools by their own names.
+- **Spawning**: the `subagent` tool, `input: {agent, description, prompt}`, and `state.metadata.sessionID` is the child session once it exists. `input.sessionID` set means *resume that child*, not spawn one.
+- **A tool's verdict is not always its status.** A `shell` command that exits non-zero is `status: completed` with `metadata.exit != 0` (a signal sets `metadata.signal`); a background shell completes as a launch acknowledgement with `metadata.status: "running"`.
+- **`tokens`**: `{input, output, reasoning, cache}`; the provider counts `output + reasoning`.
+
 ## Domain model (state/session.rs)
 
 Folded from `Fact`s only, through one entry point, `apply_fact`; the model never
@@ -191,7 +211,7 @@ pub struct AgentInfo {
 }
 ```
 
-**Untimed session metadata → `SessionInfo` (not the timeline).** Session-level facts (`Title`, `Session { label, value }`, `Tally`) carry no timestamp and are not activity, so they would otherwise clump at the front of the sorted timeline. Feeders route them into `SessionInfo { title, fields: Vec<(label, value)>, tallies }` instead, whichever record carried them (`Statement::take_session_meta`; a Codex root names itself and its app on one line): the provider labels the rows (Claude: `mode`, `permission`, `last prompt`; tallies `queued`, `file edits`; Codex: `app`, `version`, `cwd`), values are latest-wins per label in first-seen order, and the `i` overlay and `inspect` render whatever rows arrived (`state::render`). Lives on `App` (not `SessionModel`), so it survives backward-seek rebuilds — it's session-constant. The title is on `SessionInfo`, NOT on `SessionModel`, so the model holds only timed, foldable state.
+**Untimed session metadata → `SessionInfo` (not the timeline).** Session-level facts (`Title`, `Session { label, value }`, `Tally`) carry no timestamp and are not activity, so they would otherwise clump at the front of the sorted timeline. Feeders route them into `SessionInfo { title, fields: Vec<(label, value)>, tallies }` instead, whichever record carried them (`Statement::take_session_meta`; a Codex root names itself and its app on one line): the provider labels the rows (Claude: `mode`, `permission`, `last prompt`; tallies `queued`, `file edits`; Codex: `app`, `version`, `cwd`; OpenCode: `version`, `cwd`, and its title), values are latest-wins per label in first-seen order, and the `i` overlay and `inspect` render whatever rows arrived (`state::render`). Lives on `App` (not `SessionModel`), so it survives backward-seek rebuilds — it's session-constant. The title is on `SessionInfo`, NOT on `SessionModel`, so the model holds only timed, foldable state.
 
 **Graph topology (v1): nodes are agents, not messages.** One node per agent + one group node per workflow run. Edges: one parent edge per agent, id `e-<child id>` (`graph::edge_id`), `workflow → its subagents`. Sessions have 800+ lines — per-message nodes would be noise; agents are the story.
 
@@ -319,7 +339,7 @@ The crossterm input channel is **unbounded** (input must never block); the **cap
 - **Detail panel** (ui/panel.rs): when `flow.selected_nodes().next()` is Some → a **30/70** horizontal split (orientation canvas 30% · panel 70%); panel shows the selected agent's description, model, status, timing, and a scrollable recent-tool-call list (name + summary, `⏳`/`✓`/`✗` + local time; path tools keep the basename). Data from `SessionModel`, keyed by node id. Copy the selected id out before borrowing app mutably elsewhere (borrow-checker note from rwy).
 - **Tool-call chips** (ui/chips.rs): ephemeral `⚒ read ×N` overlays anchored *below* agent cards (NOT graph nodes — no layout/minimap/hit-test), drawn in `render_canvas` after the flow. One reconcile pass per frame ages them in watch-time; pending persists as the in-flight indicator, completed fade (`CHIP_TTL` 2.5s, err 4s, ≤3/agent), width-gated like edge labels. This is where "current tool" lives now — edges carry no labels. Full model: [`ARCHITECTURE.md`](ARCHITECTURE.md) §5.
 - **Scrubber** (`render_scrubber`, shown when the timeline has a span): a **bordered panel** (rounded, subtle), 6 rows = border + marker strip (1) + bars (2) + info (1) + border. Markers and bars are on **separate rows** so neither can overwrite the other (a marker on a bar cell hid real activity; the gap seam was the worst offender).
-  - **Marker strip (1 row, on top)**: **fast-forward `»`** at idle-gap columns (≥`GAP_MARKER_SECS`, where playback compresses dead air; full-session; drawn only when gap-compression is on); **spawn** (an `Agent` birth, or a `Spawn` call whose agent never appeared) drawn as the session's provider's emblem — Claude's sunburst `❋` in coral ≈ xterm 173, Codex's circled star `❂` in green ≈ xterm 36, a plain `✦` in a neutral before the root is stated (`ui::spawn_mark`; the browser's font atlas drops the colour and shows the glyph alone) and **failure `✗`** (red, a failed `ToolEnd`), **past-only** (`c < head`) so they reveal as the playhead reaches them (in sync with the graph's chips).
+  - **Marker strip (1 row, on top)**: **fast-forward `»`** at idle-gap columns (≥`GAP_MARKER_SECS`, where playback compresses dead air; full-session; drawn only when gap-compression is on); **spawn** (an `Agent` birth, or a `Spawn` call whose agent never appeared) drawn as the session's provider's emblem — Claude's sunburst `❋` in coral ≈ xterm 173, Codex's circled star `❂` in green ≈ xterm 36, OpenCode's shadowed square `❏` in blue ≈ xterm 75, a plain `✦` in a neutral before the root is stated (`ui::spawn_mark`; the browser's font atlas drops the colour and shows the glyph alone) and **failure `✗`** (red, a failed `ToolEnd`), **past-only** (`c < head`) so they reveal as the playhead reaches them (in sync with the graph's chips).
   - **Activity bars (2 rows)**: a tool-call sparkline via ratatui's `Sparkline` — per-column height = tool calls in that slice (`ToolStart` facts counted over the column's item-index range, binned on the event-index axis). Counts normalized to the available eighths (`rows × 8` = 16) with a **floor of 1 for any nonzero column** (`ceil(count/max × levels)`) — else the busiest column scales the rest down and a low-activity tick rounds to 0 (invisible). Played/unplayed fill: bright accent left of the playhead, dim right.
   - **Playhead**: a gold vertical line `│` over a translucent (`muted`-bg) column, spanning the marker strip + both bar rows.
   - **Info row**: playhead date+time (left), transport tag (right). Full-width so changing labels can't reflow it; the whole row is the seekable area, so a click maps to the exact width the playhead is drawn over. Row 2 is an info line: the playhead's local date+time (left) and the emergent transport tag (right). `App.scrubber_area` is recorded each frame for hit-testing mouse drags.
@@ -330,7 +350,7 @@ The crossterm input channel is **unbounded** (input must never block); the **cap
 
 ## inspect subcommand
 
-`zoe inspect <file|id>`: open the session (`provider::open`, any provider, any file of it, or an id), fold every file, and print: session title, **session info** (the provider's labelled rows: mode · permission · queued · file edits · last prompt for Claude; app · version · cwd for Codex), agent/tool totals, then the agent tree (type, description, status, #tools, tokens). Exit non-zero on an unreadable or unrecognised file. **This is the headless smoke test** — CI-runnable end-to-end check of parser + session model + info extraction with no TTY.
+`zoe inspect <file|id>`: open the session (`provider::open`, any provider, any file of it, or an id), fold every file, and print: session title, **session info** (the provider's labelled rows: mode · permission · queued · file edits · last prompt for Claude; app · version · cwd for Codex; version · cwd for OpenCode), agent/tool totals, then the agent tree (type, description, status, #tools, tokens). Exit non-zero on an unreadable or unrecognised file. **This is the headless smoke test** — CI-runnable end-to-end check of parser + session model + info extraction with no TTY.
 
 ## Testing (inline #[cfg(test)], no tests/ dir)
 

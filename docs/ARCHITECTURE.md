@@ -8,8 +8,10 @@ reasoning that governs how those pieces are allowed to behave.
 The whole program solves one hard problem:
 
 > Reconstruct a faithful, navigable, live-or-replayed picture of a coding-agent
-> session (Claude Code, Codex) from an **undocumented, append-only, partially-timestamped,
-> multi-file** transcript — in which **completion is frequently unknowable**.
+> session (Claude Code, Codex, OpenCode) from an **undocumented, append-only,
+> partially-timestamped, multi-file** transcript — in which **completion is
+> frequently unknowable**. (OpenCode keeps a database, not a transcript, and
+> rewrites a record as it streams; see the fifth consequence below.)
 
 Almost every design decision below is downstream of that one sentence.
 
@@ -33,7 +35,7 @@ result came back. Reasoning about *absence* — the ack-vs-completion join (§2.
 time-derived liveness (§4), group rollup — lives in the core once, and survives
 every format.
 
-Four consequences worth knowing before touching either side:
+Five consequences worth knowing before touching either side:
 
 - **Every fact carries the same envelope** (`agent`, `ts`). Activity tracking
   and undated-item dating (`Timing`) read the envelope, so neither needs to know
@@ -53,6 +55,18 @@ Four consequences worth knowing before touching either side:
   `provider::harness::conform`: order invariance (§1.1) plus two golden files
   beside the fixture, the folded model and the dated timeline, which double as
   the readable record of what that provider extracts.
+- **A record may be read more than once, and may say more the second time.**
+  Most formats append. OpenCode rewrites a message row as it streams: the same
+  id, a growing `content`, a tool part walking `running` → `completed`. Its
+  provider remembers what it has stated about each message and states only what
+  is new, so re-reading a row is a no-op and the facts stay idempotent (§1.1).
+  The same care decides *when* a part is stated: a count the core keeps the
+  first of (`Tokens` under a `dedup` key) is stated at completion, never while
+  it is still growing, and text is stated once something follows it. And the
+  provider still never concludes: OpenCode's `idle` is the end of a turn, not
+  of an agent (a subagent is resumable), so it states nothing, exactly as
+  Codex's `task_complete` does; a subagent's end is the call that spawned it
+  returning (§2.1), which stays reversible when it is resumed.
 
 The same rule holds one level up, for finding files rather than reading them
 ([DISCOVERY.md](DISCOVERY.md)):
