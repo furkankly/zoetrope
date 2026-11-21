@@ -52,7 +52,7 @@
 //!   context the runtime wrote around the thread, not the thread speaking.
 //!   They state nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
@@ -98,18 +98,23 @@ pub struct Stream {
     seen: HashMap<String, Seen>,
 }
 
-/// What has been stated about one message.
+/// What has been stated about one message. Kept by what a part *is*, never by
+/// where it sits: OpenCode can replace a message's whole run of parts, and a
+/// position then names a different part than it did.
 #[derive(Debug, Clone, Default)]
 struct Seen {
     started: bool,
     tokens: bool,
-    parts: Vec<PartMem>,
+    /// Where each tool call has got to, by call id.
+    tools: HashMap<String, ToolMem>,
+    /// The text and reasoning already stated, by content.
+    said: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct PartMem {
+struct ToolMem {
     stage: Stage,
-    /// The child a `subagent` part names has been stated.
+    /// The child a `subagent` call names has been stated.
     linked: bool,
 }
 
@@ -117,11 +122,9 @@ struct PartMem {
 enum Stage {
     #[default]
     Pending,
-    /// A text or reasoning part, stated.
-    Said,
-    /// A tool part whose start is stated.
+    /// The call's start is stated.
     Started,
-    /// A tool part whose end is stated.
+    /// The call's end is stated.
     Ended,
 }
 
@@ -149,8 +152,7 @@ impl Stream {
     #[cfg(feature = "native")]
     pub fn try_poll(&mut self) -> Option<Vec<Statement>> {
         let conn = db::open(&self.db)?;
-        let session = db::session(&conn, &self.session)?;
-        let rows = db::messages_since(&conn, &self.session, self.cursor)?;
+        let (session, rows) = db::read(&conn, &self.session, self.cursor)?;
         let mut out = self.session_row(&session);
         for row in &rows {
             out.extend(self.push(row));
@@ -323,11 +325,7 @@ impl Stream {
             out.push(says(at, vec![by(at, FactKind::Model(model.to_string()))]));
         }
 
-        if seen.parts.len() < msg.content.len() {
-            seen.parts.resize(msg.content.len(), PartMem::default());
-        }
         for (i, part) in msg.content.iter().enumerate() {
-            let mem = &mut seen.parts[i];
             match part.kind.as_str() {
                 "text" | "reasoning" => {
                     // Reasoning says when it finished; text does not, and sits
@@ -337,15 +335,16 @@ impl Stream {
                     }
                     // Still being written until something follows it.
                     let closed = complete || i + 1 < msg.content.len();
-                    if closed && mem.stage == Stage::Pending {
-                        mem.stage = Stage::Said;
-                        let text = part.text.as_deref().unwrap_or_default().trim_end();
-                        if !text.trim().is_empty() {
-                            out.push(says(
-                                now,
-                                vec![by(now, FactKind::Reasoning(text.to_string()))],
-                            ));
-                        }
+                    let text = part.text.as_deref().unwrap_or_default().trim_end();
+                    // Remembered by what it says, not where it is.
+                    if closed
+                        && !text.trim().is_empty()
+                        && seen.said.insert(content_key(&part.kind, text))
+                    {
+                        out.push(says(
+                            now,
+                            vec![by(now, FactKind::Reasoning(text.to_string()))],
+                        ));
                     }
                 }
                 "tool" => {
@@ -362,6 +361,7 @@ impl Stream {
                     if state.streaming() {
                         continue;
                     }
+                    let mem = seen.tools.entry(call.to_string()).or_default();
                     let name = part.tool_name();
                     let started = ms(part.time.ran.or(part.time.created)).or(now);
                     let ended = if state.finished() {
@@ -483,6 +483,14 @@ impl Stream {
         }
         out
     }
+}
+
+/// What a text or reasoning part is, for remembering that it was stated.
+fn content_key(kind: &str, text: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut h);
+    text.hash(&mut h);
+    h.finish()
 }
 
 /// A stable fingerprint of a message and its parts, to tell a rewrite from a
@@ -875,6 +883,29 @@ mod database_tests {
         unload(&db);
     }
 
+    /// The session row and its messages come from one read transaction on a
+    /// connection that cannot write, or the old inline parts of a message being
+    /// moved into part rows could be read beside their own copies. Nothing can
+    /// be interleaved with a single call from here, so what is checked is that
+    /// the transaction opens and ends on that connection and hands over both.
+    #[test]
+    fn the_session_and_its_messages_are_read_in_one_transaction() {
+        for (fixture, root) in [("demo", ROOT), ("part-rows", "ses_parts_root")] {
+            let Some(db) = load(fixture) else { return };
+            let conn = db::open(&db).unwrap();
+            let (row, rows) = db::read(&conn, root, 0).expect("readable");
+            assert_eq!(row.id, root);
+            assert!(rows.iter().any(|r| r.kind == "assistant"), "{fixture}");
+            assert!(
+                db::read(&conn, "ses_nope", 0).is_none(),
+                "an absent session is a failed read"
+            );
+            // The snapshot is let go: the same connection reads again.
+            assert!(db::read(&conn, root, 0).is_some());
+            unload(&db);
+        }
+    }
+
     #[test]
     fn a_database_that_is_gone_states_nothing() {
         let gone = std::env::temp_dir().join("zoetrope_opencode_never_existed.db");
@@ -1149,6 +1180,53 @@ mod tests {
         assert!(
             s.push(&row_with_parts("m1", 2000, envelope, &[done]))
                 .is_empty()
+        );
+    }
+
+    /// OpenCode can replace a message's whole run of parts. What was stated
+    /// about a part is remembered by what it is, so a call that moves, and a
+    /// part that now sits where another did, are not mistaken for one another.
+    #[test]
+    fn a_rewrite_that_moves_parts_is_followed_by_call_and_content_not_position() {
+        let mut s = stream("ses_r", "ses_r", None);
+        // [text, running A]: the text is closed by the call after it.
+        let before = r#"{"time":{"created":1000},"content":[
+            {"type":"text","text":"First I will look."},
+            {"type":"tool","id":"call_a","name":"read","state":{"status":"running","input":{"path":"a"}},
+             "time":{"created":1100,"ran":1100}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1100, before))),
+            ["Reasoning", "ToolStart"]
+        );
+
+        // Replaced by [completed A]: A is at position 0, where the text was.
+        let after = r#"{"time":{"created":1000,"completed":2000},"content":[
+            {"type":"tool","id":"call_a","name":"read","state":{"status":"completed","input":{"path":"a"}},
+             "time":{"created":1100,"ran":1100,"completed":1900}}]}"#;
+        let then = s.push(&row("m", "assistant", 2000, after));
+        assert_eq!(
+            kinds(&then),
+            ["ToolEnd"],
+            "A ended, or its start would stay pending for good"
+        );
+        assert!(
+            matches!(&then[0].facts[0].kind, FactKind::ToolEnd { call, .. } if call == "call_a")
+        );
+        assert!(
+            s.push(&row("m", "assistant", 2500, after)).is_empty(),
+            "the same call is not ended twice"
+        );
+
+        // Replaced again: the text is back, a position later, with a new call
+        // before it. The text was stated; the new call was not.
+        let again = r#"{"time":{"created":1000,"completed":3000},"content":[
+            {"type":"tool","id":"call_b","name":"read","state":{"status":"completed","input":{"path":"b"}},
+             "time":{"created":2100,"ran":2100,"completed":2200}},
+            {"type":"text","text":"First I will look."}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 3000, again))),
+            ["ToolStart", "ToolEnd"],
+            "the text that moved is not stated twice"
         );
     }
 

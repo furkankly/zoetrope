@@ -97,6 +97,25 @@ pub fn descendants(conn: &Connection, root: &str) -> Vec<SessionRow> {
     rows.flatten().collect()
 }
 
+/// A session's row and its changed messages from **one snapshot**. The writer
+/// is live, and OpenCode moves a message's inline parts into `session_part` and
+/// clears its content as separate statements. Read the message in one query and
+/// its parts in the next with a write between, and the old inline parts meet
+/// their own new row copies: `[A, B]` becomes `[A, B, A, B]`. A read
+/// transaction is one view of the database for every query inside it.
+///
+/// `None` is a read that failed, as for [`messages_since`].
+pub fn read(conn: &Connection, session_id: &str, since: i64) -> Option<(SessionRow, Vec<Row>)> {
+    // A deferred transaction on a read-only connection: it takes no write lock,
+    // and starts its snapshot at the first query.
+    let tx = conn.unchecked_transaction().ok()?;
+    let row = session(&tx, session_id)?;
+    let messages = messages_since(&tx, session_id, since)?;
+    // Nothing was written; ending it is only letting the snapshot go.
+    tx.commit().ok()?;
+    Some((row, messages))
+}
+
 /// Whether this database has `session_part` at all. A database written only
 /// by an older OpenCode may not, and a session read from one has no part rows.
 fn has_part_table(conn: &Connection) -> bool {
