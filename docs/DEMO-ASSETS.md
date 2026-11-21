@@ -274,6 +274,14 @@ database and the provider reads real sessions of OpenCode 2.0.32, 2.3.0 and
 evidence, the same argument as for Codex: record a short throwaway session in a
 scratch directory, export the rows of its tree, and replace the file.
 
+`assets/opencode/part-rows.sql` is a second synthetic database, for the one
+shape the first does not have: `experimental.part_rows` on, so an assistant
+message's parts are `session_part` rows and its own `content` is empty, beside
+a message of the same session that is still inline and a call still
+`streaming`. `demo.sql` has no `session_part` table at all, as a database
+written only by an older OpenCode may not. Both shapes are taken from
+OpenCode's own source (2.3.2) where no database we hold has them.
+
 `captures_conform` (`src/provider/opencode/mod.rs`) runs every `*.sql` under
 `assets/opencode/` through the same conformance check, with goldens beside it
 (`UPDATE_GOLDEN=1`).
