@@ -282,6 +282,13 @@ a message of the same session that is still inline and a call still
 written only by an older OpenCode may not. Both shapes are taken from
 OpenCode's own source (2.3.2) where no database we hold has them.
 
+`assets/opencode/background.sql` has the shape 2.3.x writes when subagents run
+in the background: the spawning call returns at once and a `synthetic` row
+reports the child's end later. Its absence is how the first version of the
+provider shipped without reading those reports. It has an interim report, a
+failure, a cancellation (from the source; no database we hold has one) and a
+child resumed after reporting.
+
 `captures_conform` (`src/provider/opencode/mod.rs`) runs every `*.sql` under
 `assets/opencode/` through the same conformance check, with goldens beside it
 (`UPDATE_GOLDEN=1`).
