@@ -21,6 +21,19 @@ pub const MAIN_ID: &str = "main";
 /// this is minutes, not the main agent's seconds-scale file-growth window.
 const INTERACTIVE_IDLE_SECS: i64 = 120;
 
+/// How two reported ends of one agent rank: the later one, and at one instant
+/// the one that says more went wrong. Only has to be total.
+fn report_order((at, status): (Option<DateTime<Utc>>, AgentStatus)) -> (Option<DateTime<Utc>>, u8) {
+    let rank = match status {
+        AgentStatus::Running => 0,
+        AgentStatus::Idle => 1,
+        AgentStatus::Done => 2,
+        AgentStatus::Stopped => 3,
+        AgentStatus::Failed => 4,
+    };
+    (at, rank)
+}
+
 /// The full derived view of a session.
 ///
 /// `Clone` is O(1): every growing collection here is persistent
@@ -55,6 +68,11 @@ pub struct SessionModel {
     /// [`resolve_spawn_status`](Self::resolve_spawn_status), where it OUTRANKS
     /// the spawn acknowledgement and time-derived liveness.
     ended: HashMap<String, AgentStatus>,
+    /// The latest reported end per agent, from a `Reported` fact, with the
+    /// report's time. Like [`ended`](Self::ended) it is recorded whether or
+    /// not the agent exists yet and outranks the spawn acknowledgement, but it
+    /// holds only while nothing the agent did is later than it.
+    reported: HashMap<String, (Option<DateTime<Utc>>, AgentStatus)>,
     /// Provenance facts: why each spawned agent exists, keyed by the spawning
     /// call (order-independent, like the other stores). Captured at the
     /// `Spawn` fact; joined to the agent via `spawned_by` at render.
@@ -307,6 +325,7 @@ impl SessionModel {
             labels: OrdMap::new(),
             completed_calls: HashMap::new(),
             ended: HashMap::new(),
+            reported: HashMap::new(),
             spawn_context: HashMap::new(),
             prompts: Vector::new(),
             last_reasoning: HashMap::new(),
@@ -360,7 +379,7 @@ impl SessionModel {
     /// Idempotent and commutative: re-applying a fact is a no-op, and two facts
     /// reach the same state in either order (ARCHITECTURE.md §1.1). Facts *by*
     /// an agent create it ("an agent exists once it has spoken"); facts *about*
-    /// one (`Label`, `Ended`) only record until it appears.
+    /// one (`Label`, `Ended`, `Reported`) only record until it appears.
     ///
     /// Returns `true` if graph *structure* changed.
     pub fn apply_fact(&mut self, fact: &Fact) -> bool {
@@ -372,7 +391,10 @@ impl SessionModel {
         let Some(id) = fact.agent.as_deref() else {
             return false;
         };
-        let by_agent = !matches!(fact.kind, FactKind::Label { .. } | FactKind::Ended(_));
+        let by_agent = !matches!(
+            fact.kind,
+            FactKind::Label { .. } | FactKind::Ended(_) | FactKind::Reported(_)
+        );
         if by_agent {
             match &fact.kind {
                 FactKind::Agent { kind, parent, .. } => {
@@ -533,6 +555,19 @@ impl SessionModel {
                 self.ended.insert(id.to_string(), *status);
                 self.resolve_spawn_status(id);
             }
+            FactKind::Reported(status) => {
+                // The latest report by its own time, so two arriving in either
+                // order leave the same one. Two at one instant settle by rank.
+                let report = (fact.ts, *status);
+                if self
+                    .reported
+                    .get(id)
+                    .is_none_or(|&held| report_order(held) < report_order(report))
+                {
+                    self.reported.insert(id.to_string(), report);
+                }
+                self.resolve_spawn_status(id);
+            }
         }
         structural
     }
@@ -577,7 +612,8 @@ impl SessionModel {
     }
 
     /// Derive a spawned agent's status from its recorded facts: an `Ended`
-    /// fact if there is one, else the end of the call that spawned it.
+    /// fact if there is one, else a `Reported` one, else the end of the call
+    /// that spawned it.
     ///
     /// The spawning call's end is an *acknowledgement*, which doubles as the
     /// completion only for a synchronous subagent. The tell is the timestamp:
@@ -594,6 +630,21 @@ impl SessionModel {
         {
             agent.status = status;
             agent.terminal = true;
+            return;
+        }
+        // A reported end holds until the agent does something later than it,
+        // which only a resumed agent can. Resumed, it is back with time-derived
+        // liveness, and the older acknowledgement has no say.
+        if let Some(&(at, status)) = self.reported.get(id)
+            && let Some(agent) = self.agents.get_mut(id)
+        {
+            let resumed = matches!((agent.last_ts, at), (Some(l), Some(a)) if l > a);
+            agent.status = if resumed {
+                AgentStatus::Running
+            } else {
+                status
+            };
+            agent.terminal = !resumed;
             return;
         }
         let Some(agent) = self.agents.get(id) else {
@@ -982,6 +1033,115 @@ mod tests {
     /// fixture itself is malformed (parser returns `None`).
     fn entry(line: &str) -> Entry {
         parse_line(line).expect("test fixture must parse")
+    }
+
+    /// A fact by or about `child`, `secs` into the session.
+    fn child_fact(secs: i64, kind: FactKind) -> Fact {
+        Fact {
+            agent: Some("child".into()),
+            ts: DateTime::from_timestamp(secs, 0),
+            kind,
+        }
+    }
+
+    /// The child's status after folding `facts` in the order given, with its
+    /// liveness derived at `now` seconds.
+    fn child_after(facts: &[&Fact], now: i64) -> AgentStatus {
+        let mut m = SessionModel::new("s".into());
+        for f in facts {
+            m.apply_fact(f);
+        }
+        m.recompute_liveness(DateTime::from_timestamp(now, 0));
+        m.agents["child"].status
+    }
+
+    #[test]
+    fn a_report_ends_an_agent_whichever_arrives_first() {
+        let work = child_fact(10, FactKind::Activity);
+        let failed = child_fact(20, FactKind::Reported(AgentStatus::Failed));
+        // At once, with no wait for the idle window, and it stays so after it.
+        for now in [21, 10_000] {
+            assert_eq!(child_after(&[&work, &failed], now), AgentStatus::Failed);
+            assert_eq!(child_after(&[&failed, &work], now), AgentStatus::Failed);
+        }
+        // A report is about an agent: alone it creates none.
+        let mut m = SessionModel::new("s".into());
+        m.apply_fact(&failed);
+        assert!(!m.agents.contains_key("child"));
+    }
+
+    #[test]
+    fn activity_after_a_report_resumes_the_agent_and_a_later_report_ends_it_again() {
+        let first = child_fact(10, FactKind::Activity);
+        let done = child_fact(20, FactKind::Reported(AgentStatus::Done));
+        let resumed = child_fact(30, FactKind::Activity);
+        let stopped = child_fact(40, FactKind::Reported(AgentStatus::Stopped));
+        for order in [[&first, &done, &resumed], [&resumed, &first, &done]] {
+            assert_eq!(child_after(&order, 31), AgentStatus::Running);
+            // Resumed is not pinned: quiet settles it by liveness as usual.
+            assert_eq!(child_after(&order, 10_000), AgentStatus::Done);
+        }
+        // The latest report by time wins, not the last to arrive.
+        for order in [
+            [&first, &done, &resumed, &stopped],
+            [&stopped, &resumed, &done, &first],
+        ] {
+            assert_eq!(child_after(&order, 41), AgentStatus::Stopped);
+        }
+    }
+
+    #[test]
+    fn a_report_outranks_the_spawn_acknowledgement_but_not_an_ending() {
+        let by_parent = |secs, kind| Fact {
+            agent: Some(MAIN_ID.into()),
+            ts: DateTime::from_timestamp(secs, 0),
+            kind,
+        };
+        let start = by_parent(
+            5,
+            FactKind::ToolStart {
+                call: "c".into(),
+                name: "subagent".into(),
+                summary: None,
+            },
+        );
+        let born = child_fact(
+            5,
+            FactKind::Agent {
+                kind: AgentKind::Subagent,
+                parent: Some(MAIN_ID.into()),
+                agent_type: None,
+                description: None,
+                spawned_by: Some("c".into()),
+                interactive: false,
+            },
+        );
+        let ack = by_parent(
+            6,
+            FactKind::ToolEnd {
+                call: "c".into(),
+                outcome: Outcome::Ok,
+            },
+        );
+        let work = child_fact(10, FactKind::Activity);
+        let failed = child_fact(20, FactKind::Reported(AgentStatus::Failed));
+        assert_eq!(
+            child_after(&[&start, &born, &ack, &work, &failed], 21),
+            AgentStatus::Failed
+        );
+        assert_eq!(
+            child_after(&[&failed, &work, &ack, &born, &start], 21),
+            AgentStatus::Failed
+        );
+        // `Ended` is final, as before: neither a report nor later activity moves it.
+        let ended = child_fact(15, FactKind::Ended(AgentStatus::Done));
+        assert_eq!(
+            child_after(
+                &[&ended, &born, &failed, &child_fact(30, FactKind::Activity)],
+                31
+            ),
+            AgentStatus::Done
+        );
     }
 
     #[test]

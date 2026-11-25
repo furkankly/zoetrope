@@ -126,7 +126,10 @@ pub(crate) fn date_and_sort_live(items: &mut [ReplayItem]) {
 fn is_by_agent(fact: &Fact) -> bool {
     !matches!(
         fact.kind,
-        FactKind::Agent { .. } | FactKind::Label { .. } | FactKind::Ended(_)
+        FactKind::Agent { .. }
+            | FactKind::Label { .. }
+            | FactKind::Ended(_)
+            | FactKind::Reported(_)
     )
 }
 
@@ -163,7 +166,7 @@ fn date_and_sort_inner(items: &mut [ReplayItem], complete: bool) {
         let ending = item
             .facts
             .iter()
-            .any(|f| matches!(f.kind, FactKind::Ended(_)));
+            .any(|f| matches!(f.kind, FactKind::Ended(_) | FactKind::Reported(_)));
         let resolved = if ending {
             // Bulk only: an orphan ending (no matching transcript anywhere)
             // → earliest, so it folds with the start instead of leading as an
