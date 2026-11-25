@@ -51,11 +51,28 @@ pub fn locator(db: &Path, session: &str) -> PathBuf {
 /// session id is the part after the last `#` and holds no separator, so a `#`
 /// in a directory name is not mistaken for one.
 pub fn split(path: &Path) -> Option<(PathBuf, String)> {
-    let s = path.to_str()?;
-    let (db, id) = s.rsplit_once('#')?;
-    if db.is_empty() || id.is_empty() || id.contains(['/', '\\']) {
+    let (db, id) = split_last_hash(path)?;
+    if db.as_os_str().is_empty() || id.is_empty() || id.contains(['/', '\\']) {
         return None;
     }
+    Some((db, id))
+}
+
+/// A path cut at its last `#`. On Unix a path is bytes and need not be UTF-8;
+/// the database's part is kept as it is and only the id has to be text.
+#[cfg(unix)]
+fn split_last_hash(path: &Path) -> Option<(PathBuf, String)> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let at = bytes.iter().rposition(|&b| b == b'#')?;
+    let id = std::str::from_utf8(&bytes[at + 1..]).ok()?;
+    let db = std::ffi::OsStr::from_bytes(&bytes[..at]);
+    Some((PathBuf::from(db), id.to_string()))
+}
+
+#[cfg(not(unix))]
+fn split_last_hash(path: &Path) -> Option<(PathBuf, String)> {
+    let (db, id) = path.to_str()?.rsplit_once('#')?;
     Some((PathBuf::from(db), id.to_string()))
 }
 
@@ -71,7 +88,9 @@ pub fn db_path() -> Option<PathBuf> {
 }
 
 /// [`db_path`] over explicit values, so the rule is testable without
-/// touching the process environment. An empty variable is an unset one.
+/// touching the process environment. An empty variable is an unset one. A
+/// relative `OPENCODE_DB` is under the data directory, as OpenCode resolves it,
+/// not under wherever `zoe` was run.
 #[cfg(feature = "native")]
 pub fn db_path_from(
     db: Option<OsString>,
@@ -79,11 +98,14 @@ pub fn db_path_from(
     home: Option<OsString>,
 ) -> Option<PathBuf> {
     let set = |v: Option<OsString>| v.filter(|s| !s.is_empty()).map(PathBuf::from);
-    if let Some(db) = set(db) {
-        return Some(db);
+    let data = set(xdg_data)
+        .or_else(|| set(home).map(|h| h.join(".local").join("share")))
+        .map(|d| d.join("opencode"));
+    match set(db) {
+        Some(db) if db.is_absolute() => Some(db),
+        Some(db) => data.map(|d| d.join(db)),
+        None => data.map(|d| d.join("opencode.db")),
     }
-    let data = set(xdg_data).or_else(|| set(home).map(|h| h.join(".local").join("share")))?;
-    Some(data.join("opencode").join("opencode.db"))
 }
 
 /// OpenCode records the working directory as it is; a trailing separator is
@@ -124,12 +146,6 @@ pub fn stream_for(file: &SessionFile) -> Stream {
 // Reading the database (native only)
 // ---------------------------------------------------------------------------
 
-/// How far up a `parent_id` chain is followed before the row reached is taken
-/// as the root. Real trees are a few deep; the bound only has to outlast one
-/// and stop a corrupt cycle.
-#[cfg(feature = "native")]
-const MAX_DEPTH: usize = 32;
-
 #[cfg(feature = "native")]
 fn at(ms: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
@@ -156,14 +172,17 @@ fn file_of(db: &Path, row: &SessionRow, root: &SessionRow) -> SessionFile {
 }
 
 /// The topmost row above `row`. A parent that is gone (deleted, or never
-/// there) makes the row that named it the root of what is left.
+/// there) makes the row that named it the root of what is left. The walk goes
+/// as far as the tree does and stops only at a row it has been to, which a
+/// corrupt cycle of `parent_id`s would otherwise repeat for ever.
 #[cfg(feature = "native")]
 fn root_row(conn: &rusqlite::Connection, row: SessionRow) -> SessionRow {
+    let mut visited = std::collections::HashSet::from([row.id.clone()]);
     let mut row = row;
-    for _ in 0..MAX_DEPTH {
-        let Some(parent) = row.parent_id.as_deref().and_then(|p| db::session(conn, p)) else {
+    while let Some(parent) = row.parent_id.as_deref().and_then(|p| db::session(conn, p)) {
+        if !visited.insert(parent.id.clone()) {
             break;
-        };
+        }
         row = parent;
     }
     row
@@ -175,12 +194,13 @@ fn root_id<'a>(
     by_id: &std::collections::HashMap<&'a str, &'a SessionRow>,
     row: &'a SessionRow,
 ) -> &'a str {
+    let mut visited = std::collections::HashSet::from([row.id.as_str()]);
     let mut cur = row;
-    for _ in 0..MAX_DEPTH {
-        match cur.parent_id.as_deref().and_then(|p| by_id.get(p)) {
-            Some(parent) => cur = parent,
-            None => break,
+    while let Some(parent) = cur.parent_id.as_deref().and_then(|p| by_id.get(p)) {
+        if !visited.insert(parent.id.as_str()) {
+            break;
         }
+        cur = parent;
     }
     cur.id.as_str()
 }
@@ -258,18 +278,18 @@ pub fn all_paths(scope: &Scope) -> Vec<PathBuf> {
 /// to the database is its newest session.
 #[cfg(feature = "native")]
 pub fn session_file(path: &Path) -> Option<SessionFile> {
-    if let Some((db, id)) = split(path) {
-        let conn = db::open(&db)?;
-        let row = db::session(&conn, &id)?;
-        let root = root_row(&conn, row.clone());
-        return Some(file_of(&db, &row, &root));
-    }
+    // A database that is really there is one, whatever its name holds; a
+    // locator is never a file, so a `#` in such a name is not mistaken for one.
     if path.is_file() && db::is_sqlite_file(path) {
         return list_in(path, &Scope::ALL)
             .into_iter()
             .find(|f| f.role == FileRole::Root);
     }
-    None
+    let (db, id) = split(path)?;
+    let conn = db::open(&db)?;
+    let row = db::session(&conn, &id)?;
+    let root = root_row(&conn, row.clone());
+    Some(file_of(&db, &row, &root))
 }
 
 #[cfg(not(feature = "native"))]
@@ -344,6 +364,27 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share/opencode/opencode.db"))
         );
         assert_eq!(db_path_from(None, None, None), None);
+    }
+
+    #[test]
+    fn a_relative_override_is_under_the_data_directory() {
+        let os = |s: &str| Some(OsString::from(s));
+        assert_eq!(
+            db_path_from(os("work.db"), None, os("/home/u")),
+            Some(PathBuf::from("/home/u/.local/share/opencode/work.db"))
+        );
+    }
+
+    /// A locator keeps whatever bytes the database's path has.
+    #[cfg(unix)]
+    #[test]
+    fn a_locator_round_trips_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let db = PathBuf::from(OsString::from_vec(b"/tmp/\xff/opencode.db".to_vec()));
+        assert_eq!(
+            split(&locator(&db, "ses_a")),
+            Some((db, "ses_a".to_string()))
+        );
     }
 
     #[test]

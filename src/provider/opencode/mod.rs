@@ -50,10 +50,10 @@
 //!   assistant part is a `session_part` row and the message's own `content` is
 //!   empty; updating a part leaves the message row alone, so a message is
 //!   changed when it or any of its parts is (see `db.rs`).
-//! - **The clock comes from the document, every pass.** Where a part sits in
-//!   time is worked out from the message as it reads now, whether or not a
-//!   part was stated on an earlier poll, so reading a message as it grows and
-//!   reading it finished date what follows a tool the same.
+//! - **Untimed text is dated only by times that never change.** Text carries
+//!   no time of its own, so it takes the clock of the parts before it, which
+//!   moves on a call's `created` and never on when it ran or finished: those
+//!   arrive later, after the text may already have been stated.
 //! - **`system`, `compaction`, the switch records and every other
 //!   `synthetic` row** are context the runtime wrote around the thread, not the
 //!   thread speaking. They state nothing.
@@ -111,10 +111,13 @@ pub struct Stream {
 struct Seen {
     started: bool,
     tokens: bool,
+    /// The model this message last named.
+    model: Option<String>,
     /// Where each tool call has got to, by call id.
     tools: HashMap<String, ToolMem>,
-    /// The text and reasoning already stated, by content.
-    said: HashSet<u64>,
+    /// The text and reasoning already stated, by content and by which time
+    /// that content has occurred in the message.
+    said: HashSet<(u64, usize)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -343,26 +346,33 @@ impl Stream {
         };
         let says = |ts: Option<DateTime<Utc>>, facts: Vec<Fact>| Statement { at: ts, facts };
 
-        // Where the message is on the clock: it starts when the first token
-        // arrives and moves to each part's own times as they pass. It is worked
-        // out from the document on *every* pass, whether or not a part has
-        // already been stated, so a poll that finds a tool long since stated and
-        // one that reads the finished message from scratch date what follows it
-        // the same.
+        // Where the message is on the clock, for text that carries no time of
+        // its own: it starts when the first token arrives and moves on at each
+        // part. Only times written once may move it (a call's `created`, never
+        // when it ran or finished) and it is worked out on *every* pass, so a
+        // poll partway through and a read of the finished message date the same
+        // text the same.
         let began = ms(msg.time.first_token.or(msg.time.created));
         let mut now = began;
         let mut out = Vec::new();
 
-        // Every message names its model; state it when it is not the one
-        // already stated, so a session on one model says it once.
+        // Every message names its model; state it when it differs from the one
+        // last stated, so a session on one model says it once. A rewrite of a
+        // message naming what it named before is no news, however many other
+        // models have been stated since.
         if let Some(model) = msg.model.as_ref().and_then(|m| m.id.as_deref())
-            && self.model.as_deref() != Some(model)
+            && seen.model.as_deref() != Some(model)
         {
-            self.model = Some(model.to_string());
-            let at = ms(msg.time.created).or(began);
-            out.push(says(at, vec![by(at, FactKind::Model(model.to_string()))]));
+            seen.model = Some(model.to_string());
+            if self.model.as_deref() != Some(model) {
+                self.model = Some(model.to_string());
+                let at = ms(msg.time.created).or(began);
+                out.push(says(at, vec![by(at, FactKind::Model(model.to_string()))]));
+            }
         }
 
+        // How many times each content has been met on this pass.
+        let mut met: HashMap<u64, usize> = HashMap::new();
         for (i, part) in msg.content.iter().enumerate() {
             match part.kind.as_str() {
                 "text" | "reasoning" => {
@@ -374,11 +384,13 @@ impl Stream {
                     // Still being written until something follows it.
                     let closed = complete || i + 1 < msg.content.len();
                     let text = part.text.as_deref().unwrap_or_default().trim_end();
-                    // Remembered by what it says, not where it is.
-                    if closed
-                        && !text.trim().is_empty()
-                        && seen.said.insert(content_key(&part.kind, text))
-                    {
+                    // Remembered by what it says and which time it says it,
+                    // not where it is.
+                    let key = content_key(&part.kind, text);
+                    let nth = met.entry(key).or_default();
+                    let occurrence = (key, *nth);
+                    *nth += 1;
+                    if closed && !text.trim().is_empty() && seen.said.insert(occurrence) {
                         out.push(says(
                             now,
                             vec![by(now, FactKind::Reasoning(text.to_string()))],
@@ -390,6 +402,10 @@ impl Stream {
                     else {
                         continue;
                     };
+                    // The model has asked for this call: what it writes next
+                    // is no earlier than this.
+                    let asked = ms(part.time.created);
+                    now = asked.or(now);
                     // A call the model is still writing is `streaming`, its
                     // input a half-written string. Nothing is stated until it
                     // is made: the core keeps the first `ToolStart` it sees for
@@ -401,14 +417,19 @@ impl Stream {
                     }
                     let mem = seen.tools.entry(call.to_string()).or_default();
                     let name = part.tool_name();
-                    let started = ms(part.time.ran.or(part.time.created)).or(now);
+                    let started = ms(part.time.ran).or(asked).or(now);
                     let ended = if state.finished() {
                         ms(part.time.completed).or(started)
                     } else {
                         None
                     };
-                    // `subagent` with a session of its own is a resume.
-                    let spawns = name == "subagent" && state.input_str("sessionID").is_none();
+                    // `subagent` with a session of its own is a resume, and
+                    // one that failed before its input arrived (`{}`) asked
+                    // for nothing.
+                    let spawns = name == "subagent"
+                        && state.input_str("sessionID").is_none()
+                        && (state.input_str("prompt").is_some()
+                            || state.input_str("agent").is_some());
 
                     if mem.stage == Stage::Pending {
                         mem.stage = Stage::Started;
@@ -482,10 +503,6 @@ impl Stream {
                             )],
                         ));
                     }
-
-                    // The clock moves past this call whether or not it was
-                    // stated just now.
-                    now = ended.or(started);
                 }
                 _ => {}
             }
@@ -693,7 +710,7 @@ mod database_tests {
     /// would hide the mistake: an interim report ends nobody, a final one does
     /// at once and says how, and a resumed child is running again.
     #[test]
-    fn a_background_childs_status_follows_its_reports_through_the_session() {
+    fn a_background_subagents_status_follows_its_reports_through_the_session() {
         use crate::fact::{AgentStatus, Fact};
         use crate::state::session::SessionModel;
 
@@ -726,6 +743,52 @@ mod database_tests {
             AgentStatus::Running,
             "resumed"
         );
+        unload(&db);
+    }
+
+    /// A database is a database whatever its name holds.
+    #[test]
+    fn a_bare_database_with_a_hash_in_its_name_opens() {
+        let Some(db) = load("demo") else { return };
+        let odd = db.with_file_name(format!("zoetrope#odd_{}.db", std::process::id()));
+        std::fs::rename(&db, &odd).unwrap();
+        assert_eq!(open(&Target::Path(odd.clone()), None).unwrap().id, ROOT);
+        // And a session inside it is still located.
+        assert_eq!(session_of(&odd, "ses_demo_review").id, ROOT);
+        unload(&odd);
+    }
+
+    /// However deep the tree, it has one root.
+    #[test]
+    fn a_very_deep_tree_has_one_root() {
+        let Some(db) = load("demo") else { return };
+        let mut parent = ROOT.to_string();
+        for i in 0..40 {
+            write(
+                &db,
+                &format!(
+                    "INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, version, time_created, time_updated) \
+                 VALUES ('ses_deep_{i}', 'p', '{parent}', 's', '/home/dev/shop', '2', 1, 1);"
+                ),
+            );
+            parent = format!("ses_deep_{i}");
+        }
+        let files = discovery::list_in(&db, &Scope::ALL);
+        assert!(files.iter().all(|f| f.session == ROOT));
+        assert_eq!(session_of(&db, &parent).id, ROOT);
+        unload(&db);
+    }
+
+    /// A corrupt `parent_id` cycle ends the walk and loses nothing.
+    #[test]
+    fn a_cycle_of_parents_terminates() {
+        let Some(db) = load("demo") else { return };
+        write(
+            &db,
+            "UPDATE session_v2 SET parent_id = 'ses_demo_review' WHERE id = 'ses_demo_root';",
+        );
+        assert_eq!(discovery::list_in(&db, &Scope::ALL).len(), 3);
+        assert!(discovery::session_file(&discovery::locator(&db, ROOT)).is_some());
         unload(&db);
     }
 
@@ -1195,9 +1258,9 @@ mod tests {
         );
     }
 
-    /// What follows a tool is dated by the tool, whether the tool was stated
-    /// on this poll or on one long before: reading a message as it grows and
-    /// reading it finished must agree.
+    /// What follows a tool is dated by when the tool was asked for, whether it
+    /// was stated on this poll or on one long before: reading a message as it
+    /// grows and reading it finished must agree.
     #[test]
     fn what_follows_a_tool_is_dated_the_same_live_and_from_scratch() {
         let growing = r#"{"time":{"created":1000,"firstToken":1100},"content":[
@@ -1229,8 +1292,8 @@ mod tests {
         };
         assert_eq!(
             text_at(&live_text),
-            Some(ms(Some(9000))),
-            "after the tool, not at the message's start"
+            Some(ms(Some(5000))),
+            "from the call, not the message's start"
         );
         assert_eq!(text_at(&live_text), text_at(&bulk_said));
     }
@@ -1305,6 +1368,106 @@ mod tests {
             kinds(&s.push(&row("m", "assistant", 3000, again))),
             ["ToolStart", "ToolEnd"],
             "the text that moved is not stated twice"
+        );
+    }
+
+    /// A call that fails while the model is still writing it ends with `{}`
+    /// for input: it asked for nothing, so it is no spawn.
+    #[test]
+    fn a_subagent_call_that_never_got_its_input_is_no_spawn() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let failed = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"c","name":"subagent","state":{"status":"error","input":{}},
+             "time":{"created":1100,"completed":1200}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1200, failed))),
+            ["ToolStart", "ToolEnd"]
+        );
+    }
+
+    /// Saying the same thing twice is saying it twice: the latest reasoning
+    /// is the last one said, not the last one that was new.
+    #[test]
+    fn the_same_text_said_again_is_stated_again() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let said = r#"{"time":{"created":1000,"completed":2000},"content":[
+            {"type":"text","text":"Retrying."},{"type":"text","text":"Other."},{"type":"text","text":"Retrying."}]}"#;
+        let first = s.push(&row("m", "assistant", 2000, said));
+        assert_eq!(kinds(&first), ["Reasoning", "Reasoning", "Reasoning"]);
+        assert!(
+            s.push(&row("m", "assistant", 2500, said)).is_empty(),
+            "once each"
+        );
+    }
+
+    /// Text closed by a later call while an earlier one still runs must not be
+    /// dated differently once that earlier call has finished.
+    #[test]
+    fn text_between_calls_is_dated_the_same_while_they_run_and_after() {
+        let tool = |id: &str, at: i64, status: &str, done: &str| {
+            format!(
+                r#"{{"type":"tool","id":"{id}","name":"read","state":{{"status":"{status}","input":{{"path":"a"}}}},"time":{{"created":{at},"ran":{at}{done}}}}}"#
+            )
+        };
+        let message = |first: String| {
+            format!(
+                r#"{{"time":{{"created":1000,"firstToken":1100}},"content":[{first},{{"type":"text","text":"meanwhile"}},{}]}}"#,
+                tool("b", 6000, "running", "")
+            )
+        };
+        let text_at = |data: &str| {
+            stream("ses_r", "ses_r", None)
+                .push(&row("m", "assistant", 9000, data))
+                .iter()
+                .find(|s| {
+                    s.facts
+                        .iter()
+                        .any(|f| matches!(f.kind, FactKind::Reasoning(_)))
+                })
+                .and_then(|s| s.at)
+        };
+        assert_eq!(
+            text_at(&message(tool("a", 5000, "running", ""))),
+            text_at(&message(tool(
+                "a",
+                5000,
+                "completed",
+                r#","completed":9000"#
+            )))
+        );
+    }
+
+    /// An old message rewritten after the model changed does not change it back.
+    #[test]
+    fn a_rewrite_of_an_older_message_is_no_change_of_model() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let msg = |model: &str, extra: &str| {
+            format!(
+                r#"{{"time":{{"created":1000{extra}}},"model":{{"id":"{model}"}},"content":[]}}"#
+            )
+        };
+        let models = |said: Vec<Statement>| kinds(&said).iter().filter(|k| **k == "Model").count();
+        assert_eq!(
+            models(s.push(&row("a", "assistant", 1000, &msg("x", "")))),
+            1
+        );
+        assert_eq!(
+            models(s.push(&row("b", "assistant", 2000, &msg("y", "")))),
+            1
+        );
+        assert_eq!(
+            models(s.push(&row(
+                "a",
+                "assistant",
+                3000,
+                &msg("x", r#","completed":3000"#)
+            ))),
+            0
+        );
+        assert_eq!(
+            models(s.push(&row("c", "assistant", 4000, &msg("x", "")))),
+            1,
+            "a real switch back"
         );
     }
 
