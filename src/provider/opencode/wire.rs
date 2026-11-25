@@ -36,9 +36,45 @@ pub struct Message {
     /// What a person (or the runtime) wrote, for the kinds that carry text.
     #[serde(default)]
     pub text: Option<String>,
+    /// What the runtime attached to a message it wrote itself.
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+/// What a `synthetic` message says about a child, when it is the report that
+/// a background `subagent` call's child went idle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report<'a> {
+    /// The child session.
+    pub child: &'a str,
+    /// `completed`, `error` or `cancelled`.
+    pub state: &'a str,
 }
 
 impl Message {
+    /// The child's end this message reports, if it reports one. The report is
+    /// `metadata: {source: "subagent", childID, state}` over a text headed
+    /// `<subagent ... state="..." ...>`. The two states differ in one case: a
+    /// child that went idle with background work of its own still outstanding
+    /// has `metadata.state` `completed` and a header saying `running`. That is
+    /// not an end, and another report follows.
+    pub fn report(&self) -> Option<Report<'_>> {
+        let md = self.metadata.as_ref()?;
+        if md.get("source")?.as_str()? != "subagent" {
+            return None;
+        }
+        // The header is the first tag; the child's own words follow it.
+        let header = self.text.as_deref().unwrap_or_default();
+        let header = header.split_once(">\n").map_or(header, |(tag, _)| tag);
+        if header.contains(" state=\"running\" ") {
+            return None;
+        }
+        Some(Report {
+            child: md.get("childID")?.as_str()?,
+            state: md.get("state")?.as_str()?,
+        })
+    }
+
     pub fn parse(data: &str) -> Option<Message> {
         serde_json::from_str(data).ok()
     }
@@ -279,6 +315,38 @@ mod tests {
         let plain =
             Message::parse_with(r#"{"content":[{"type":"text","text":"x"}]}"#, &[]).unwrap();
         assert_eq!(plain.content.len(), 1);
+    }
+
+    #[test]
+    fn a_report_is_final_only_when_its_header_does_not_say_running() {
+        let report = |header: &str, state: &str, body: &str| {
+            let text = format!(
+                "<subagent sessionID=\"ses_c\" state=\"{header}\" description=\"d\">\n{body}\n</subagent>"
+            );
+            let data = serde_json::json!({"text": text, "metadata":
+                {"source": "subagent", "childID": "ses_c", "agent": "general", "state": state}});
+            Message::parse(&data.to_string())
+                .unwrap()
+                .report()
+                .map(|r| (r.child.to_string(), r.state.to_string()))
+        };
+        let ended = |s: &str| Some(("ses_c".to_string(), s.to_string()));
+        assert_eq!(report("completed", "completed", "ok"), ended("completed"));
+        assert_eq!(report("error", "error", "boom"), ended("error"));
+        assert_eq!(report("running", "completed", "still going"), None);
+        // What the child wrote is not the header.
+        assert_eq!(
+            report(
+                "completed",
+                "completed",
+                "it printed <x state=\"running\" y> once"
+            ),
+            ended("completed")
+        );
+        // A background shell's notice is not a subagent's report.
+        let shell =
+            r#"{"text":"x","metadata":{"source":"shell","childID":"ses_c","state":"completed"}}"#;
+        assert_eq!(Message::parse(shell).unwrap().report(), None);
     }
 
     #[test]

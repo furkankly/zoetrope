@@ -25,17 +25,14 @@
 //!   idle after each turn, and a subagent is resumable, so an `idle` row states
 //!   nothing (compare Codex's `task_complete`). Stating `Ended` here would pin
 //!   a resumed agent `Done` while it works.
-//! - **Known gap: how a background subagent ended is not read.** In OpenCode
+//! - **How a subagent's end is known depends on the version.** In OpenCode
 //!   2.0.32 a `subagent` call returns when the child has finished, so the
 //!   core's join of that return (§2.1) ends the child. From 2.3 the call
-//!   usually returns at once with `metadata.status: "running"`, and the child's
-//!   completion arrives later as a `synthetic` row in the parent
-//!   (`metadata.source: "subagent"`), which this provider does not read yet.
-//!   Such a child's status is left to time-derived liveness: it shows
-//!   `running` after it has finished, until it has been quiet for the idle
-//!   window, then `done` whether it completed or failed. Reading the report
-//!   needs an ending the core can take back when the child is resumed, and an
-//!   `Ended` fact is final.
+//!   usually returns at once with `metadata.status: "running"`, and the end
+//!   arrives later as a `synthetic` row in the parent, the completion report
+//!   ([`wire::Message::report`]). The parent's stream states it about the child
+//!   as [`FactKind::Reported`], not `Ended`: the child can be resumed, and the
+//!   core takes the end back when the child does something later.
 //! - **A tool's verdict is not always its status.** A `shell` call whose
 //!   command exits non-zero (or dies by signal) is `completed`; the verdict is
 //!   in `metadata`, as Codex's is in `exit_code`. A background shell's
@@ -57,9 +54,9 @@
 //!   time is worked out from the message as it reads now, whether or not a
 //!   part was stated on an earlier poll, so reading a message as it grows and
 //!   reading it finished date what follows a tool the same.
-//! - **`synthetic`, `system`, `compaction` and the switch records** are
-//!   context the runtime wrote around the thread, not the thread speaking.
-//!   They state nothing, including the `synthetic` completion report above.
+//! - **`system`, `compaction`, the switch records and every other
+//!   `synthetic` row** are context the runtime wrote around the thread, not the
+//!   thread speaking. They state nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -72,7 +69,7 @@ mod db;
 pub mod discovery;
 pub mod wire;
 
-use crate::fact::{AgentKind, Fact, FactKind, Outcome, Statement};
+use crate::fact::{AgentKind, AgentStatus, Fact, FactKind, Outcome, Statement};
 use crate::provider::summary::{short_path, truncate_summary};
 use wire::{Message, Row, SessionRow, ToolState, ms};
 
@@ -262,6 +259,7 @@ impl Stream {
         match row.kind.as_str() {
             "user" => self.user(row),
             "assistant" => self.assistant(row),
+            "synthetic" => self.synthetic(row),
             // `idle` ends a turn, not an agent; the rest is the runtime
             // writing around the thread. See the module docs.
             _ => Vec::new(),
@@ -294,6 +292,37 @@ impl Stream {
                 kind,
             }],
         }]
+    }
+
+    /// A `synthetic` message is the runtime writing into the thread. The one
+    /// kind read is a background subagent's completion report, which states how
+    /// the *child* ended. It is resumable, so the end is [`FactKind::Reported`].
+    fn synthetic(&mut self, row: &Row) -> Vec<Statement> {
+        let seen = self.seen.entry(row.id.clone()).or_default();
+        if std::mem::replace(&mut seen.started, true) {
+            return Vec::new();
+        }
+        let Some(msg) = Message::parse(&row.data) else {
+            return Vec::new();
+        };
+        let Some(report) = msg.report() else {
+            return Vec::new();
+        };
+        let status = match report.state {
+            "completed" => AgentStatus::Done,
+            "error" => AgentStatus::Failed,
+            "cancelled" => AgentStatus::Stopped,
+            _ => return Vec::new(),
+        };
+        // The root is nobody's subagent, so nothing can report its end.
+        if report.child == self.root {
+            return Vec::new();
+        }
+        vec![Statement::from(Fact {
+            agent: Some(report.child.to_string()),
+            ts: ms(msg.time.created.or(Some(row.time_updated))),
+            kind: FactKind::Reported(status),
+        })]
     }
 
     /// An `assistant` message is rewritten as it streams: state the parts that
@@ -658,6 +687,46 @@ mod database_tests {
             crate::provider::harness::conform("opencode", &name, streams);
             unload(&db);
         }
+    }
+
+    /// Background children at moments along the way, where a final model
+    /// would hide the mistake: an interim report ends nobody, a final one does
+    /// at once and says how, and a resumed child is running again.
+    #[test]
+    fn a_background_childs_status_follows_its_reports_through_the_session() {
+        use crate::fact::{AgentStatus, Fact};
+        use crate::state::session::SessionModel;
+
+        let Some(db) = load("background") else { return };
+        let session = session_of(&db, "ses_bg_root");
+        let facts: Vec<Fact> = session
+            .every_file()
+            .flat_map(|f| session.provider.stream_for(f).poll())
+            .flat_map(|s| s.facts)
+            .collect();
+        // The model as it stood `secs` into the session.
+        let start = facts.iter().filter_map(|f| f.ts).min().unwrap();
+        let status = |secs: i64, id: &str| {
+            let now = start + chrono::Duration::seconds(secs);
+            let mut m = SessionModel::new("s".into());
+            for f in facts.iter().filter(|f| f.ts.is_none_or(|t| t <= now)) {
+                m.apply_fact(f);
+            }
+            m.recompute_liveness(Some(now));
+            m.agents[id].status
+        };
+        assert_eq!(status(14, "ses_bg_audit"), AgentStatus::Running, "interim");
+        assert_eq!(status(26, "ses_bg_audit"), AgentStatus::Done);
+        assert_eq!(status(15, "ses_bg_build"), AgentStatus::Running);
+        assert_eq!(status(17, "ses_bg_build"), AgentStatus::Failed);
+        assert_eq!(status(19, "ses_bg_cancel"), AgentStatus::Stopped);
+        assert_eq!(status(22, "ses_bg_epilogue"), AgentStatus::Done);
+        assert_eq!(
+            status(35, "ses_bg_epilogue"),
+            AgentStatus::Running,
+            "resumed"
+        );
+        unload(&db);
     }
 
     #[test]
