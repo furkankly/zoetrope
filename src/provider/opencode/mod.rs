@@ -23,10 +23,19 @@
 //!   child that exists, which is a tool call and no spawn.
 //! - **`idle` is a turn boundary, not an agent's end.** Every session goes
 //!   idle after each turn, and a subagent is resumable, so an `idle` row states
-//!   nothing (compare Codex's `task_complete`). A finished subagent's end is
-//!   the parent's `subagent` call returning, which the core already joins
-//!   (§2.1), and it stays reversible when the child is resumed. Stating `Ended`
-//!   here would pin a resumed agent `Done` while it works.
+//!   nothing (compare Codex's `task_complete`). Stating `Ended` here would pin
+//!   a resumed agent `Done` while it works.
+//! - **Known gap: how a background subagent ended is not read.** In OpenCode
+//!   2.0.32 a `subagent` call returns when the child has finished, so the
+//!   core's join of that return (§2.1) ends the child. From 2.3 the call
+//!   usually returns at once with `metadata.status: "running"`, and the child's
+//!   completion arrives later as a `synthetic` row in the parent
+//!   (`metadata.source: "subagent"`), which this provider does not read yet.
+//!   Such a child's status is left to time-derived liveness: it shows
+//!   `running` after it has finished, until it has been quiet for the idle
+//!   window, then `done` whether it completed or failed. Reading the report
+//!   needs an ending the core can take back when the child is resumed, and an
+//!   `Ended` fact is final.
 //! - **A tool's verdict is not always its status.** A `shell` call whose
 //!   command exits non-zero (or dies by signal) is `completed`; the verdict is
 //!   in `metadata`, as Codex's is in `exit_code`. A background shell's
@@ -50,7 +59,7 @@
 //!   reading it finished date what follows a tool the same.
 //! - **`synthetic`, `system`, `compaction` and the switch records** are
 //!   context the runtime wrote around the thread, not the thread speaking.
-//!   They state nothing.
+//!   They state nothing, including the `synthetic` completion report above.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};

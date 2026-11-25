@@ -65,8 +65,11 @@ Five consequences worth knowing before touching either side:
   it is still growing, and text is stated once something follows it. And the
   provider still never concludes: OpenCode's `idle` is the end of a turn, not
   of an agent (a subagent is resumable), so it states nothing, exactly as
-  Codex's `task_complete` does; a subagent's end is the call that spawned it
-  returning (§2.1), which stays reversible when it is resumed.
+  Codex's `task_complete` does. Where the spawning call waits for the child
+  (OpenCode 2.0.32), its return ends the child (§2.1). From 2.3 it usually
+  returns at once and the end is reported later in a record the provider does
+  not read yet, so those children fall to time-derived liveness (§4), and a
+  failed one reads `done` (see `provider/opencode/mod.rs`).
 
 The same rule holds one level up, for finding files rather than reading them
 ([DISCOVERY.md](DISCOVERY.md)):
