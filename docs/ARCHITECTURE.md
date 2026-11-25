@@ -8,8 +8,10 @@ reasoning that governs how those pieces are allowed to behave.
 The whole program solves one hard problem:
 
 > Reconstruct a faithful, navigable, live-or-replayed picture of a coding-agent
-> session (Claude Code, Codex) from an **undocumented, append-only, partially-timestamped,
-> multi-file** transcript — in which **completion is frequently unknowable**.
+> session (Claude Code, Codex, OpenCode) from an **undocumented, append-only,
+> partially-timestamped, multi-file** transcript — in which **completion is
+> frequently unknowable**. (OpenCode keeps a database, not a transcript, and
+> rewrites a record as it streams; see the fifth consequence below.)
 
 Almost every design decision below is downstream of that one sentence.
 
@@ -33,7 +35,7 @@ result came back. Reasoning about *absence* — the ack-vs-completion join (§2.
 time-derived liveness (§4), group rollup — lives in the core once, and survives
 every format.
 
-Four consequences worth knowing before touching either side:
+Five consequences worth knowing before touching either side:
 
 - **Every fact carries the same envelope** (`agent`, `ts`). Activity tracking
   and undated-item dating (`Timing`) read the envelope, so neither needs to know
@@ -53,6 +55,20 @@ Four consequences worth knowing before touching either side:
   `provider::harness::conform`: order invariance (§1.1) plus two golden files
   beside the fixture, the folded model and the dated timeline, which double as
   the readable record of what that provider extracts.
+- **A record may be read more than once, and may say more the second time.**
+  Most formats append. OpenCode rewrites a message row as it streams: the same
+  id, a growing `content`, a tool part walking `running` → `completed`. Its
+  provider remembers what it has stated about each message and states only what
+  is new, so re-reading a row is a no-op and the facts stay idempotent (§1.1).
+  The same care decides *when* a part is stated: a count the core keeps the
+  first of (`Tokens` under a `dedup` key) is stated at completion, never while
+  it is still growing, and text is stated once something follows it. And the
+  provider still never concludes: OpenCode's `idle` is the end of a turn, not
+  of an agent (a subagent is resumable), so it states nothing, exactly as
+  Codex's `task_complete` does. Where the spawning call waits for the child
+  (OpenCode 2.0.32), its return ends the child (§2.1). From 2.3 it usually
+  returns at once and a later record reports the end, which the provider states
+  as `Reported`, since the child can be resumed (§2.1).
 
 The same rule holds one level up, for finding files rather than reading them
 ([DISCOVERY.md](DISCOVERY.md)):
@@ -200,6 +216,14 @@ Claude provider, recorded in the `ended` store where it outranks the
 acknowledgement and time-derived liveness. The provider knows which records are
 endings; the model only knows an ending when it sees one.
 
+An ending an agent can **come back from** is a different fact, `Reported`
+(OpenCode's background completion report). It ranks just under `Ended`: above
+the acknowledgement and time-derived liveness, and `terminal`, but only while
+nothing the agent did is later than the report. Later activity can only be a
+resume, so the agent returns to liveness, and its next report ends it again.
+It is derived state like any other, a function of the facts and reversible
+(§1.1): the core keeps the latest report by its own time, never by arrival.
+
 `meta.stoppedByUser` is a *static final* flag and is **not** used as a completion
 time — see §1.2.
 
@@ -343,7 +367,11 @@ Honest ledger of what's derived-but-imperfect, for whoever touches this next:
   fixed, just on a rare path (sidechain agents normally produce activity). The
   principled fix: don't default a zero-activity async agent to terminal; let
   time-derived liveness own it until real evidence arrives. Left documented, not
-  yet changed.
+  yet changed. OpenCode 2.3's background spawns take this path every time: the
+  call returns before the child has written anything of its own, so the child
+  reads `done` until its first message. In 338 spawns in one real database that
+  was 14ms at the median, 122ms at the 95th percentile and under a second at
+  worst; a child held in a queue would show it for longer.
 - **Aggregate chip error-coloring.** A settled run shows a single aggregate
   ✓/✗; a run of N where only one call failed still reads as an error run. Cosmetic
   over-alarm, noted for a future pass.

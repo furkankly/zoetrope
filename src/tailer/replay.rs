@@ -109,6 +109,15 @@ pub(crate) fn build_replay(
                 seed.offsets.insert(file.path.clone(), consumed);
                 seed.streams.insert(file.path.clone(), stream);
             }
+            // A rows file has no bytes to have consumed: one poll states all
+            // of it, and the stream that did keeps the place the tail resumes
+            // from. Rows written while it polled are read next tick, as the
+            // cursor sits at the newest one it saw.
+            ReadMode::Rows => {
+                let mut stream = p.stream_for(file);
+                items.extend(stream.poll().into_iter().map(ReplayItem::new));
+                seed.streams.insert(file.path.clone(), stream);
+            }
             // A whole-read sidecar states its facts once it parses; one that
             // does not yet (mid-write) is left for the follow-up tail to retry.
             ReadMode::Whole => {

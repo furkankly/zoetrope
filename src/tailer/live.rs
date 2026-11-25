@@ -57,7 +57,7 @@ pub(crate) struct LiveSession {
     /// Tail state per tracked non-root file, keyed by absolute path, with the
     /// stream reading it. One map (paths are unique) so no agent id can
     /// collide across a provider's directory trees.
-    tracked: HashMap<PathBuf, (Stream, TailState)>,
+    tracked: HashMap<PathBuf, Tracked>,
     /// Whole-read sidecars already stated (by absolute path) — state once.
     seen_whole: HashSet<PathBuf>,
     /// Poll-tick counter, used to throttle the newer-session scan.
@@ -72,6 +72,15 @@ pub(crate) struct LiveSession {
     seed_offsets: HashMap<PathBuf, u64>,
     /// The streams the bulk parse used, adopted alongside the offsets.
     seed_streams: HashMap<PathBuf, Stream>,
+}
+
+/// One tracked non-root file: the stream reading it, and where a byte-read
+/// one has got to. A file read by rows ([`ReadMode::Rows`]) has no byte to be
+/// at, so its stream is asked what changed and `state` is unused.
+struct Tracked {
+    stream: Stream,
+    state: TailState,
+    rows: bool,
 }
 
 /// Per-file read positions and already-stated sidecars captured by the replay
@@ -147,7 +156,14 @@ impl LiveSession {
             .seed_streams
             .remove(&file.path)
             .unwrap_or_else(|| self.session.provider.stream_for(file));
-        self.tracked.insert(file.path.clone(), (stream, state));
+        self.tracked.insert(
+            file.path.clone(),
+            Tracked {
+                stream,
+                state,
+                rows: file.read == ReadMode::Rows,
+            },
+        );
     }
 
     /// The target that re-attaches this same session from scratch.
@@ -285,7 +301,14 @@ async fn poll_live(
 
     // --- root file ---
     let root_path = session.root_path().to_path_buf();
-    match read_appended(&root_path, &mut session.main_state) {
+    // A root read by rows is asked what changed; it cannot be truncated.
+    let root_read = if session.session.root.read == ReadMode::Rows {
+        statements.extend(session.main_stream.poll());
+        ReadResult::NoChange
+    } else {
+        read_appended(&root_path, &mut session.main_state)
+    };
+    match root_read {
         ReadResult::Reset => {
             let _ = ui_tx
                 .send(UiEvent::SessionReset {
@@ -383,12 +406,14 @@ fn newer_session(current: &Session, candidates: Vec<Session>) -> Option<Session>
 /// Returns `true` if any tracked file was truncated/rotated — the caller must
 /// re-attach the whole session (re-reading in place would re-emit
 /// already-applied content as duplicates).
-fn read_tracked(
-    tracked: &mut HashMap<PathBuf, (Stream, TailState)>,
-    statements: &mut Vec<Statement>,
-) -> bool {
+fn read_tracked(tracked: &mut HashMap<PathBuf, Tracked>, statements: &mut Vec<Statement>) -> bool {
     let mut reset = false;
-    for (path, (stream, state)) in tracked.iter_mut() {
+    for (path, t) in tracked.iter_mut() {
+        if t.rows {
+            statements.extend(t.stream.poll());
+            continue;
+        }
+        let Tracked { stream, state, .. } = t;
         match read_appended(path, state) {
             ReadResult::Lines(lines) => {
                 statements.extend(lines.iter().filter_map(|l| stream.push(l)));
@@ -409,7 +434,7 @@ fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) {
     let provider = session.session.provider;
     for file in &files {
         match file.read {
-            ReadMode::Tail => session.track(file),
+            ReadMode::Tail | ReadMode::Rows => session.track(file),
             ReadMode::Whole => {
                 emit_whole(provider, file, &mut session.seen_whole, statements);
             }
@@ -632,6 +657,88 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything a poll tick sent, flattened.
+    fn drain(rx: &mut mpsc::Receiver<UiEvent>) -> Vec<Statement> {
+        let mut said = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let UiEvent::Batch { statements, .. } = ev {
+                said.extend(statements);
+            }
+        }
+        said
+    }
+
+    const OPENCODE_NEXT: &str = r#"INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES ('msg_r07', 'ses_demo_root', 'user', 7, 1793527600000, 1793527600000,
+                '{"time":{"created":1793527600000},"text":"Thanks, ship it."}');"#;
+
+    /// A session kept in a database has no byte to resume from, so the bulk
+    /// replay hands over the *stream*, cursor and all: the tail then states
+    /// exactly what was written after the bulk read, and nothing twice.
+    #[tokio::test]
+    async fn replay_hands_its_cursor_to_a_rows_tail() {
+        use crate::provider::opencode::{discovery::locator, testing};
+
+        let Some(db) = testing::load("demo") else {
+            return;
+        };
+        let session = open(&Target::Path(locator(&db, "ses_demo_root")), None).unwrap();
+        assert_eq!(session.provider, Provider::OpenCode);
+        let (items, _info, seed) = crate::tailer::replay::build_replay(&session);
+        assert!(!items.is_empty(), "the bulk read states the whole session");
+
+        // Written after the bulk read, before the tail starts.
+        testing::write(&db, OPENCODE_NEXT);
+
+        let mut live = LiveSession::new(session, None, None);
+        live.seed(seed);
+        let (tx, mut rx) = mpsc::channel(32);
+        assert!(poll_live(&mut live, "x", &tx).await.is_none());
+        let said = drain(&mut rx);
+        assert_eq!(said.len(), 1, "only the row written since: {said:?}");
+        assert!(matches!(
+            &said[0].facts[0].kind,
+            crate::fact::FactKind::Prompt(t) if t == "Thanks, ship it."
+        ));
+
+        // And nothing again while nothing is written.
+        assert!(poll_live(&mut live, "x", &tx).await.is_none());
+        assert!(drain(&mut rx).is_empty());
+        testing::unload(&db);
+    }
+
+    /// Followed from scratch (no replay), the first tick backfills the whole
+    /// session across every file of the tree and later ticks only what is new.
+    #[tokio::test]
+    async fn a_rows_session_backfills_then_follows() {
+        use crate::provider::opencode::{discovery::locator, testing};
+
+        let Some(db) = testing::load("demo") else {
+            return;
+        };
+        let session = open(&Target::Path(locator(&db, "ses_demo_root")), None).unwrap();
+        let mut live = LiveSession::new(session, None, None);
+        let (tx, mut rx) = mpsc::channel(32);
+
+        poll_live(&mut live, "x", &tx).await;
+        let backfill = drain(&mut rx);
+        let agents: std::collections::BTreeSet<_> = backfill
+            .iter()
+            .flat_map(|s| &s.facts)
+            .filter_map(|f| f.agent.as_deref())
+            .collect();
+        assert_eq!(
+            agents.into_iter().collect::<Vec<_>>(),
+            ["main", "ses_demo_explore", "ses_demo_review"],
+            "the root and both spawned agents, read in one tick"
+        );
+
+        testing::write(&db, OPENCODE_NEXT);
+        poll_live(&mut live, "x", &tx).await;
+        assert_eq!(drain(&mut rx).len(), 1);
+        testing::unload(&db);
     }
 
     #[tokio::test]

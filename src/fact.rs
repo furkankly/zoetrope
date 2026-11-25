@@ -100,6 +100,11 @@ pub enum FactKind {
     /// The agent's end was observed in the format. Authoritative; pins the
     /// agent against time-derived revival.
     Ended(AgentStatus),
+    /// An end was reported for an agent the format can resume. As
+    /// authoritative as [`Ended`](Self::Ended) until the agent does something
+    /// later than the report, which shows it was resumed. Needs the report's
+    /// time to be told from what came before it.
+    Reported(AgentStatus),
     /// Untimed session metadata, rendered as a labelled row. Latest wins.
     Session { label: String, value: String },
     /// Untimed session metadata that counts occurrences.
@@ -165,6 +170,7 @@ impl FactKind {
             FactKind::ToolEnd { .. } => "ToolEnd",
             FactKind::Spawn { .. } => "Spawn",
             FactKind::Ended(_) => "Ended",
+            FactKind::Reported(_) => "Reported",
             FactKind::Session { .. } => "Session",
             FactKind::Tally(_) => "Tally",
             FactKind::Title(_) => "Title",

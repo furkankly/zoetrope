@@ -255,3 +255,41 @@ and anonymized, never restructured. Only `cli-0.153.4` doubles as a demo asset
 goldens beside each fixture. Adding a capture is a directory and
 `UPDATE_GOLDEN=1`.
 
+## The OpenCode fixture is synthetic, for now
+
+`assets/opencode/demo.sql` is the exception to the rule above, and it says so
+in its header. It is a hand-authored session in the shape OpenCode v2.3.x
+writes, loaded into a temporary SQLite database by the tests so discovery
+finds it the way it finds a live one: a root that spawns two agents, one that
+finishes and is later resumed and one whose call errors, a shell command that
+exits non-zero, a tool still running, and the rows the provider must ignore
+(`idle`, `synthetic`). The project, prompts and paths are invented.
+
+Synthetic because a real OpenCode session is a row in the user's own
+database, beside their credentials and every other session they have, and
+cannot be trimmed and anonymized the way a Codex rollout file can without
+first building the tool that does it. The shapes were taken from a real
+database and the provider reads real sessions of OpenCode 2.0.32, 2.3.0 and
+2.3.2, but only this fixture is in the repo. A real capture would be better
+evidence, the same argument as for Codex: record a short throwaway session in a
+scratch directory, export the rows of its tree, and replace the file.
+
+`assets/opencode/part-rows.sql` is a second synthetic database, for the one
+shape the first does not have: `experimental.part_rows` on, so an assistant
+message's parts are `session_part` rows and its own `content` is empty, beside
+a message of the same session that is still inline and a call still
+`streaming`. `demo.sql` has no `session_part` table at all, as a database
+written only by an older OpenCode may not. Both shapes are taken from
+OpenCode's own source (2.3.2) where no database we hold has them.
+
+`assets/opencode/background.sql` has the shape 2.3.x writes when subagents run
+in the background: the spawning call returns at once and a `synthetic` row
+reports the child's end later. Its absence is how the first version of the
+provider shipped without reading those reports. It has an interim report, a
+failure, a cancellation (from the source; no database we hold has one) and a
+child resumed after reporting.
+
+`captures_conform` (`src/provider/opencode/mod.rs`) runs every `*.sql` under
+`assets/opencode/` through the same conformance check, with goldens beside it
+(`UPDATE_GOLDEN=1`).
+

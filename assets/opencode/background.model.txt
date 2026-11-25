@@ -1,0 +1,23 @@
+  ◌ [main] opencode  (idle) — id=main
+      model: demo-model
+      tools: 5 (5✓ 0✗ 0⏳)   tokens: 20
+    ✓ [subagent] general  (done) — id=ses_bg_audit
+        Audit retries
+        model: demo-model
+        tools: 2 (2✓ 0✗ 0⏳)   tokens: 20
+        ↳ prompt: Audit the job queue.
+    ✗ [subagent] general  (failed) — id=ses_bg_build
+        Rebuild the index
+        model: demo-model
+        tools: 1 (1✓ 0✗ 0⏳)   tokens: 10
+        ↳ prompt: Audit the job queue.
+    ■ [subagent] general  (stopped) — id=ses_bg_cancel
+        Trace slow jobs
+        model: demo-model
+        tools: 1 (1✓ 0✗ 0⏳)   tokens: 10
+        ↳ prompt: Audit the job queue.
+    ✓ [subagent] general  (done) — id=ses_bg_epilogue
+        Summarise findings
+        model: demo-model
+        tools: 2 (2✓ 0✗ 0⏳)   tokens: 20
+        ↳ prompt: Audit the job queue.

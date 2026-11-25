@@ -1,0 +1,1650 @@
+//! The OpenCode provider: session rows in, [`Fact`]s out.
+//!
+//! OpenCode (v2) keeps a session in a SQLite database, not a transcript, so
+//! this is the one provider that is *polled* rather than read line by line
+//! (see [`discovery`] for where things are, and `docs/DISCOVERY.md` for why
+//! that is a second kind of feeder and not a wider [`SessionFile`]). The
+//! contract on this side is the same: a [`Stream`] states what its records
+//! contain and never concludes. What differs is the record. A transcript line
+//! is written once; a message row is **rewritten** as it streams: an assistant
+//! message grows part by part, and each tool part walks `running` → `completed`
+//! under the same id. So a stream remembers what it has already stated about
+//! each message and states only what is new, which is what keeps the facts
+//! idempotent (ARCHITECTURE §1.1) when the same row is read again.
+//!
+//! What this module knows that the model must not:
+//!
+//! - **A session is a thread; a subagent is a session of its own.** The root
+//!   is `main`, every other session its own id. The `subagent` tool is the one
+//!   that spawns, and its part names the child (`state.metadata.sessionID`) once
+//!   it exists. The *parent* states the child's birth, with the call that
+//!   spawned it, as Codex's does; the child's own stream states its own
+//!   activity. Calling `subagent` with a `sessionID` of its own **resumes** a
+//!   child that exists, which is a tool call and no spawn.
+//! - **`idle` is a turn boundary, not an agent's end.** Every session goes
+//!   idle after each turn, and a subagent is resumable, so an `idle` row states
+//!   nothing (compare Codex's `task_complete`). Stating `Ended` here would pin
+//!   a resumed agent `Done` while it works.
+//! - **How a subagent's end is known depends on the version.** In OpenCode
+//!   2.0.32 a `subagent` call returns when the child has finished, so the
+//!   core's join of that return (§2.1) ends the child. From 2.3 the call
+//!   usually returns at once with `metadata.status: "running"`, and the end
+//!   arrives later as a `synthetic` row in the parent, the completion report
+//!   ([`wire::Message::report`]). The parent's stream states it about the child
+//!   as [`FactKind::Reported`], not `Ended`: the child can be resumed, and the
+//!   core takes the end back when the child does something later.
+//! - **A tool's verdict is not always its status.** A `shell` call whose
+//!   command exits non-zero (or dies by signal) is `completed`; the verdict is
+//!   in `metadata`, as Codex's is in `exit_code`. A background shell's
+//!   `completed` is a launch acknowledgement.
+//! - **A part is stated once it is closed.** Text and reasoning grow while the
+//!   model streams, so they are stated when a later part or the message's
+//!   completion shows them finished, not on every poll. Tokens likewise wait
+//!   for completion, because the first count the core sees under a `dedup` key
+//!   is the one it keeps.
+//! - **A call is stated once it is made.** A tool part is first `streaming`,
+//!   its input a half-written string; the core keeps the first `ToolStart` per
+//!   call, so one stated then would never get its summary, and a resume of a
+//!   subagent would pass for a spawn.
+//! - **Parts may be rows of their own.** With `experimental.part_rows` each
+//!   assistant part is a `session_part` row and the message's own `content` is
+//!   empty; updating a part leaves the message row alone, so a message is
+//!   changed when it or any of its parts is (see `db.rs`).
+//! - **Untimed text is dated only by times that never change.** Text carries
+//!   no time of its own, so it takes the clock of the parts before it, which
+//!   moves on a call's `created` and never on when it ran or finished: those
+//!   arrive later, after the text may already have been stated.
+//! - **`system`, `compaction`, the switch records and every other
+//!   `synthetic` row** are context the runtime wrote around the thread, not the
+//!   thread speaking. They state nothing.
+
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
+
+#[cfg(feature = "native")]
+mod db;
+pub mod discovery;
+pub mod wire;
+
+use crate::fact::{AgentKind, AgentStatus, Fact, FactKind, Outcome, Statement};
+use crate::provider::summary::{short_path, truncate_summary};
+use wire::{Message, Row, SessionRow, ToolState, ms};
+
+/// One session's rows being read. Cloning one keeps its place.
+#[derive(Debug, Clone, Default)]
+pub struct Stream {
+    /// Only [`poll`](Stream::poll) opens it, and that needs the native build.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    db: PathBuf,
+    /// This thread's session id.
+    session: String,
+    /// The root session's id: references to it are the model's `main`.
+    root: String,
+    /// The model's id for the thread that spawned this one. `None` for the root.
+    parent: Option<String>,
+    /// The model's id for this thread.
+    owner: String,
+    /// For relativising paths in summaries.
+    cwd: Option<String>,
+    /// Whether the agent has been stated from its session row.
+    born: bool,
+    title: Option<String>,
+    /// The model last stated, so it is stated again only when it changes.
+    model: Option<String>,
+    /// The latest `time_updated` read. Rows at or after it are read again.
+    cursor: i64,
+    /// The rows read *at* the cursor, by fingerprint of their document, so a
+    /// row read twice in the same millisecond is stated once and one rewritten
+    /// within it is stated again.
+    boundary: HashMap<String, u64>,
+    /// What has been stated about each message, so a rewrite states the rest.
+    seen: HashMap<String, Seen>,
+}
+
+/// What has been stated about one message. Kept by what a part *is*, never by
+/// where it sits: OpenCode can replace a message's whole run of parts, and a
+/// position then names a different part than it did.
+#[derive(Debug, Clone, Default)]
+struct Seen {
+    started: bool,
+    tokens: bool,
+    /// The model this message last named.
+    model: Option<String>,
+    /// Where each tool call has got to, by call id.
+    tools: HashMap<String, ToolMem>,
+    /// The text and reasoning already stated, by content and by which time
+    /// that content has occurred in the message.
+    said: HashSet<(u64, usize)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolMem {
+    stage: Stage,
+    /// The child a `subagent` call names has been stated.
+    linked: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Stage {
+    #[default]
+    Pending,
+    /// The call's start is stated.
+    Started,
+    /// The call's end is stated.
+    Ended,
+}
+
+impl Stream {
+    pub fn new(db: PathBuf, session: String, root: String, parent: Option<String>) -> Self {
+        let owner = discovery::node_id(&session, &root);
+        Stream {
+            db,
+            session,
+            root,
+            parent,
+            owner,
+            ..Stream::default()
+        }
+    }
+
+    /// Read what changed since the last call and state it, in the order the
+    /// session made it. `None` when the database could not be read (busy,
+    /// gone, or the session's row is not there), which is not the same as
+    /// nothing having changed: a caller that must not mistake one for the
+    /// other (`inspect`) asks this, a live one retries on the next tick.
+    ///
+    /// Everything is read before anything is stated, so a read that fails
+    /// partway leaves the stream where it was and the next call starts the same.
+    #[cfg(feature = "native")]
+    pub fn try_poll(&mut self) -> Option<Vec<Statement>> {
+        let conn = db::open(&self.db)?;
+        let (session, rows) = db::read(&conn, &self.session, self.cursor)?;
+        let mut out = self.session_row(&session);
+        for row in &rows {
+            out.extend(self.push(row));
+        }
+        Some(out)
+    }
+
+    /// Without the database layer there is nothing to read.
+    #[cfg(not(feature = "native"))]
+    pub fn try_poll(&mut self) -> Option<Vec<Statement>> {
+        None
+    }
+
+    /// [`try_poll`](Self::try_poll), where a failed read is an empty tick.
+    pub fn poll(&mut self) -> Vec<Statement> {
+        self.try_poll().unwrap_or_default()
+    }
+
+    fn is_root(&self) -> bool {
+        self.session == self.root
+    }
+
+    /// State the agent from its session row, once, and the title whenever it
+    /// changes (the session names itself after its first exchange).
+    pub fn session_row(&mut self, row: &SessionRow) -> Vec<Statement> {
+        let mut out = Vec::new();
+        if !self.born {
+            self.born = true;
+            self.cwd = Some(row.directory.clone());
+            let at = ms(Some(row.time_created));
+            let mut facts = vec![Fact {
+                agent: Some(self.owner.clone()),
+                ts: at,
+                kind: if self.is_root() {
+                    FactKind::Agent {
+                        kind: AgentKind::Main,
+                        parent: None,
+                        agent_type: Some("opencode".into()),
+                        description: None,
+                        spawned_by: None,
+                        interactive: true,
+                    }
+                } else {
+                    FactKind::Agent {
+                        kind: AgentKind::Subagent,
+                        parent: self.parent.clone(),
+                        // The parent's call states the agent it asked for when
+                        // the row does not say.
+                        agent_type: row.agent.clone(),
+                        description: None,
+                        spawned_by: None,
+                        interactive: false,
+                    }
+                },
+            }];
+            if self.is_root() {
+                let session = |label: &str, value: &str| Fact {
+                    agent: None,
+                    ts: None,
+                    kind: FactKind::Session {
+                        label: label.into(),
+                        value: value.into(),
+                    },
+                };
+                facts.push(session("version", &row.version));
+                facts.push(session("cwd", &row.directory));
+            }
+            out.push(Statement { at, facts });
+        }
+        if self.is_root()
+            && let Some(title) = row.title.as_deref().filter(|t| !t.trim().is_empty())
+            && self.title.as_deref() != Some(title)
+        {
+            self.title = Some(title.to_string());
+            out.push(Statement::from(Fact {
+                agent: None,
+                ts: None,
+                kind: FactKind::Title(title.to_string()),
+            }));
+        }
+        out
+    }
+
+    /// State what one message row says that has not been stated. A row read
+    /// again unchanged states nothing.
+    pub fn push(&mut self, row: &Row) -> Vec<Statement> {
+        let print = fingerprint(row);
+        if row.time_updated == self.cursor && self.boundary.get(&row.id) == Some(&print) {
+            return Vec::new();
+        }
+        if row.time_updated > self.cursor {
+            self.cursor = row.time_updated;
+            self.boundary.clear();
+        }
+        if row.time_updated == self.cursor {
+            self.boundary.insert(row.id.clone(), print);
+        }
+        match row.kind.as_str() {
+            "user" => self.user(row),
+            "assistant" => self.assistant(row),
+            "synthetic" => self.synthetic(row),
+            // `idle` ends a turn, not an agent; the rest is the runtime
+            // writing around the thread. See the module docs.
+            _ => Vec::new(),
+        }
+    }
+
+    /// A `user` message is written once. On the root thread it is what a
+    /// person typed; on a subagent it is the spawner's instruction, which is
+    /// not a person's prompt, so it is only activity.
+    fn user(&mut self, row: &Row) -> Vec<Statement> {
+        let seen = self.seen.entry(row.id.clone()).or_default();
+        if std::mem::replace(&mut seen.started, true) {
+            return Vec::new();
+        }
+        let Some(msg) = Message::parse(&row.data) else {
+            return Vec::new();
+        };
+        let at = ms(msg.time.created.or(Some(row.time_updated)));
+        let text = msg.text.unwrap_or_default();
+        let kind = if self.session == self.root && !text.trim().is_empty() {
+            FactKind::Prompt(text.trim_end().to_string())
+        } else {
+            FactKind::Activity
+        };
+        vec![Statement {
+            at,
+            facts: vec![Fact {
+                agent: Some(self.owner.clone()),
+                ts: at,
+                kind,
+            }],
+        }]
+    }
+
+    /// A `synthetic` message is the runtime writing into the thread. The one
+    /// kind read is a background subagent's completion report, which states how
+    /// the *child* ended. It is resumable, so the end is [`FactKind::Reported`].
+    fn synthetic(&mut self, row: &Row) -> Vec<Statement> {
+        let seen = self.seen.entry(row.id.clone()).or_default();
+        if std::mem::replace(&mut seen.started, true) {
+            return Vec::new();
+        }
+        let Some(msg) = Message::parse(&row.data) else {
+            return Vec::new();
+        };
+        let Some(report) = msg.report() else {
+            return Vec::new();
+        };
+        let status = match report.state {
+            "completed" => AgentStatus::Done,
+            "error" => AgentStatus::Failed,
+            "cancelled" => AgentStatus::Stopped,
+            _ => return Vec::new(),
+        };
+        // The root is nobody's subagent, so nothing can report its end.
+        if report.child == self.root {
+            return Vec::new();
+        }
+        vec![Statement::from(Fact {
+            agent: Some(report.child.to_string()),
+            ts: ms(msg.time.created.or(Some(row.time_updated))),
+            kind: FactKind::Reported(status),
+        })]
+    }
+
+    /// An `assistant` message is rewritten as it streams: state the parts that
+    /// have closed, the tools that have started or ended, and the message's
+    /// tokens once it completes, each at its own time.
+    fn assistant(&mut self, row: &Row) -> Vec<Statement> {
+        let Some(msg) = Message::parse_with(&row.data, &row.parts) else {
+            return Vec::new();
+        };
+        let owner = self.owner.clone();
+        let cwd = self.cwd.clone();
+        let seen = self.seen.entry(row.id.clone()).or_default();
+        let complete = msg.is_complete();
+        let by = |ts: Option<DateTime<Utc>>, kind: FactKind| Fact {
+            agent: Some(owner.clone()),
+            ts,
+            kind,
+        };
+        let says = |ts: Option<DateTime<Utc>>, facts: Vec<Fact>| Statement { at: ts, facts };
+
+        // Where the message is on the clock, for text that carries no time of
+        // its own: it starts when the first token arrives and moves on at each
+        // part. Only times written once may move it (a call's `created`, never
+        // when it ran or finished) and it is worked out on *every* pass, so a
+        // poll partway through and a read of the finished message date the same
+        // text the same.
+        let began = ms(msg.time.first_token.or(msg.time.created));
+        let mut now = began;
+        let mut out = Vec::new();
+
+        // Every message names its model; state it when it differs from the one
+        // last stated, so a session on one model says it once. A rewrite of a
+        // message naming what it named before is no news, however many other
+        // models have been stated since.
+        if let Some(model) = msg.model.as_ref().and_then(|m| m.id.as_deref())
+            && seen.model.as_deref() != Some(model)
+        {
+            seen.model = Some(model.to_string());
+            if self.model.as_deref() != Some(model) {
+                self.model = Some(model.to_string());
+                let at = ms(msg.time.created).or(began);
+                out.push(says(at, vec![by(at, FactKind::Model(model.to_string()))]));
+            }
+        }
+
+        // How many times each content has been met on this pass.
+        let mut met: HashMap<u64, usize> = HashMap::new();
+        for (i, part) in msg.content.iter().enumerate() {
+            match part.kind.as_str() {
+                "text" | "reasoning" => {
+                    // Reasoning says when it finished; text does not, and sits
+                    // where the part before it left the clock.
+                    if let Some(at) = ms(part.time.completed.or(part.time.created)) {
+                        now = Some(at);
+                    }
+                    // Still being written until something follows it.
+                    let closed = complete || i + 1 < msg.content.len();
+                    let text = part.text.as_deref().unwrap_or_default().trim_end();
+                    // Remembered by what it says and which time it says it,
+                    // not where it is.
+                    let key = content_key(&part.kind, text);
+                    let nth = met.entry(key).or_default();
+                    let occurrence = (key, *nth);
+                    *nth += 1;
+                    if closed && !text.trim().is_empty() && seen.said.insert(occurrence) {
+                        out.push(says(
+                            now,
+                            vec![by(now, FactKind::Reasoning(text.to_string()))],
+                        ));
+                    }
+                }
+                "tool" => {
+                    let (Some(call), Some(state)) = (part.id.as_deref(), part.state.as_ref())
+                    else {
+                        continue;
+                    };
+                    // The model has asked for this call: what it writes next
+                    // is no earlier than this.
+                    let asked = ms(part.time.created);
+                    now = asked.or(now);
+                    // A call the model is still writing is `streaming`, its
+                    // input a half-written string. Nothing is stated until it
+                    // is made: the core keeps the first `ToolStart` it sees for
+                    // a call, so one stated now would never get its summary,
+                    // and a resume would pass for a spawn, since only the
+                    // parsed input says which it is.
+                    if state.streaming() {
+                        continue;
+                    }
+                    let mem = seen.tools.entry(call.to_string()).or_default();
+                    let name = part.tool_name();
+                    let started = ms(part.time.ran).or(asked).or(now);
+                    let ended = if state.finished() {
+                        ms(part.time.completed).or(started)
+                    } else {
+                        None
+                    };
+                    // `subagent` with a session of its own is a resume, and
+                    // one that failed before its input arrived (`{}`) asked
+                    // for nothing.
+                    let spawns = name == "subagent"
+                        && state.input_str("sessionID").is_none()
+                        && (state.input_str("prompt").is_some()
+                            || state.input_str("agent").is_some());
+
+                    if mem.stage == Stage::Pending {
+                        mem.stage = Stage::Started;
+                        let mut facts = vec![by(
+                            started,
+                            FactKind::ToolStart {
+                                call: call.to_string(),
+                                name: name.to_string(),
+                                summary: summarize(name, state, cwd.as_deref()),
+                            },
+                        )];
+                        if spawns {
+                            facts.push(by(
+                                started,
+                                FactKind::Spawn {
+                                    call: call.to_string(),
+                                },
+                            ));
+                        }
+                        out.push(says(started, facts));
+                    }
+
+                    // The child exists once the part names it, which may be
+                    // after the call began.
+                    if spawns
+                        && !mem.linked
+                        && let Some(child) = state.meta_str("sessionID")
+                    {
+                        mem.linked = true;
+                        out.push(says(
+                            started,
+                            vec![
+                                Fact {
+                                    agent: Some(child.to_string()),
+                                    ts: started,
+                                    kind: FactKind::Agent {
+                                        kind: AgentKind::Subagent,
+                                        parent: Some(owner.clone()),
+                                        agent_type: None,
+                                        description: state
+                                            .input_str("description")
+                                            .map(truncate_summary),
+                                        spawned_by: Some(call.to_string()),
+                                        interactive: false,
+                                    },
+                                },
+                                Fact {
+                                    agent: Some(child.to_string()),
+                                    ts: started,
+                                    kind: FactKind::Label {
+                                        agent_type: state.input_str("agent").map(str::to_string),
+                                        description: None,
+                                    },
+                                },
+                            ],
+                        ));
+                    }
+
+                    if mem.stage == Stage::Started && state.finished() {
+                        mem.stage = Stage::Ended;
+                        let failed = state.errored() || (name == "shell" && state.shell_failed());
+                        let outcome = if failed { Outcome::Err } else { Outcome::Ok };
+                        out.push(says(
+                            ended,
+                            vec![by(
+                                ended,
+                                FactKind::ToolEnd {
+                                    call: call.to_string(),
+                                    outcome,
+                                },
+                            )],
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Final once the message completes; the core keeps the first count it
+        // sees under a key, so a partial one must never be stated.
+        if complete
+            && !seen.tokens
+            && let Some(tokens) = &msg.tokens
+        {
+            seen.tokens = true;
+            let n = tokens.generated();
+            if n > 0 {
+                let at = ms(msg.time.completed).or(now);
+                out.push(says(
+                    at,
+                    vec![by(
+                        at,
+                        FactKind::Tokens {
+                            output: n,
+                            dedup: Some(row.id.clone()),
+                        },
+                    )],
+                ));
+            }
+        }
+
+        // A message that has begun is its owner working, even before it says
+        // anything the model keeps.
+        if !std::mem::replace(&mut seen.started, true) && out.is_empty() {
+            out.push(says(began, vec![by(began, FactKind::Activity)]));
+        }
+        out
+    }
+}
+
+/// What a text or reasoning part is, for remembering that it was stated.
+fn content_key(kind: &str, text: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut h);
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// A stable fingerprint of a message and its parts, to tell a rewrite from a
+/// re-read. The parts count: with part rows a tool finishing rewrites a part
+/// and leaves the message's own document as it was.
+fn fingerprint(row: &Row) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    row.data.hash(&mut h);
+    row.parts.hash(&mut h);
+    h.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Tool summaries: the OpenCode tool vocabulary and what makes a good one-liner
+// ---------------------------------------------------------------------------
+
+/// One line for a tool call, from its input. The built-in tools are named;
+/// anything else (an MCP or plugin tool) gets the first of the usual fields
+/// it carries.
+fn summarize(name: &str, state: &ToolState, cwd: Option<&str>) -> Option<String> {
+    let text = |key: &str| state.input_str(key).map(truncate_summary);
+    let path = |key: &str| state.input_str(key).map(|p| short_path(p, cwd));
+    let named = match name {
+        "shell" => text("command"),
+        "read" | "edit" | "write" => path("path"),
+        "patch" => state
+            .input_str("patchText")
+            .and_then(|p| patch_files(p, cwd)),
+        "grep" | "glob" => text("pattern"),
+        "webfetch" => text("url"),
+        "websearch" => text("query"),
+        "subagent" => text("description").or_else(|| text("agent")),
+        "skill" => text("id"),
+        "execute" => state
+            .input_str("code")
+            .and_then(|c| c.lines().find(|l| !l.trim().is_empty()))
+            .map(truncate_summary),
+        _ => None,
+    };
+    named.or_else(|| {
+        [
+            "command",
+            "path",
+            "pattern",
+            "url",
+            "query",
+            "description",
+            "id",
+        ]
+        .into_iter()
+        .find_map(|k| if k == "path" { path(k) } else { text(k) })
+    })
+}
+
+/// The files a patch touches, from its `*** Add/Update/Delete File:` lines:
+/// the summary of a patch is where it lands, never the diff.
+fn patch_files(patch: &str, cwd: Option<&str>) -> Option<String> {
+    let files: Vec<String> = patch
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("*** Add File: ")
+                .or_else(|| l.strip_prefix("*** Update File: "))
+                .or_else(|| l.strip_prefix("*** Delete File: "))
+        })
+        .map(|p| short_path(p.trim(), cwd))
+        .collect();
+    (!files.is_empty()).then(|| truncate_summary(&files.join(", ")))
+}
+
+/// Fixture databases for the tests, here and in the feeders: the SQL under
+/// `assets/opencode/` loaded into a temporary SQLite file, which is what
+/// OpenCode's own is. Test-only.
+#[cfg(all(test, feature = "native"))]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+
+    /// A database holding `assets/opencode/<name>.sql`, or `None` where the
+    /// checkout has no fixtures (the published crate ships only `src/`). Each
+    /// call is its own file, removed by [`unload`].
+    pub(crate) fn load(name: &str) -> Option<PathBuf> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = crate::provider::harness::fixture_dir("opencode")?;
+        let sql = std::fs::read_to_string(dir.join(format!("{name}.sql"))).unwrap();
+        let db = std::env::temp_dir().join(format!(
+            "zoetrope_opencode_{name}_{}_{}.db",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&db);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(&sql)
+            .unwrap();
+        Some(db)
+    }
+
+    pub(crate) fn unload(db: &Path) {
+        let _ = std::fs::remove_file(db);
+    }
+
+    /// Run `sql` against the database as OpenCode would write to it.
+    pub(crate) fn write(db: &Path, sql: &str) {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod database_tests {
+    use super::testing::{load, unload, write};
+    use super::*;
+    use crate::provider::{FileRole, Provider, ReadMode, Scope, Target, open};
+
+    const ROOT: &str = "ses_demo_root";
+
+    fn session_of(db: &std::path::Path, id: &str) -> crate::provider::Session {
+        open(&Target::Path(discovery::locator(db, id)), None).unwrap()
+    }
+
+    /// The demo database, discovered the way a live one is, run through the
+    /// whole conformance check: order invariance, the folded model, the dated
+    /// timeline.
+    #[test]
+    fn captures_conform() {
+        let Some(dir) = crate::provider::harness::fixture_dir("opencode") else {
+            return;
+        };
+        let mut fixtures: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension()? == "sql").then(|| p.file_stem()?.to_str().map(str::to_string))?
+            })
+            .collect();
+        fixtures.sort();
+        assert!(!fixtures.is_empty(), "no fixtures under {}", dir.display());
+        for name in fixtures {
+            let db = load(&name).unwrap();
+            let root = discovery::list_in(&db, &Scope::ALL)
+                .into_iter()
+                .find(|f| f.role == FileRole::Root)
+                .unwrap_or_else(|| panic!("{name}: no root session"))
+                .session;
+            let path = db.clone();
+            let streams = move || -> Vec<Vec<Statement>> {
+                let session = session_of(&path, &root);
+                session
+                    .every_file()
+                    .map(|f| session.provider.stream_for(f).poll())
+                    .collect()
+            };
+            crate::provider::harness::conform("opencode", &name, streams);
+            unload(&db);
+        }
+    }
+
+    /// Background children at moments along the way, where a final model
+    /// would hide the mistake: an interim report ends nobody, a final one does
+    /// at once and says how, and a resumed child is running again.
+    #[test]
+    fn a_background_subagents_status_follows_its_reports_through_the_session() {
+        use crate::fact::{AgentStatus, Fact};
+        use crate::state::session::SessionModel;
+
+        let Some(db) = load("background") else { return };
+        let session = session_of(&db, "ses_bg_root");
+        let facts: Vec<Fact> = session
+            .every_file()
+            .flat_map(|f| session.provider.stream_for(f).poll())
+            .flat_map(|s| s.facts)
+            .collect();
+        // The model as it stood `secs` into the session.
+        let start = facts.iter().filter_map(|f| f.ts).min().unwrap();
+        let status = |secs: i64, id: &str| {
+            let now = start + chrono::Duration::seconds(secs);
+            let mut m = SessionModel::new("s".into());
+            for f in facts.iter().filter(|f| f.ts.is_none_or(|t| t <= now)) {
+                m.apply_fact(f);
+            }
+            m.recompute_liveness(Some(now));
+            m.agents[id].status
+        };
+        assert_eq!(status(14, "ses_bg_audit"), AgentStatus::Running, "interim");
+        assert_eq!(status(26, "ses_bg_audit"), AgentStatus::Done);
+        assert_eq!(status(15, "ses_bg_build"), AgentStatus::Running);
+        assert_eq!(status(17, "ses_bg_build"), AgentStatus::Failed);
+        assert_eq!(status(19, "ses_bg_cancel"), AgentStatus::Stopped);
+        assert_eq!(status(22, "ses_bg_epilogue"), AgentStatus::Done);
+        assert_eq!(
+            status(35, "ses_bg_epilogue"),
+            AgentStatus::Running,
+            "resumed"
+        );
+        unload(&db);
+    }
+
+    /// A database is a database whatever its name holds.
+    #[test]
+    fn a_bare_database_with_a_hash_in_its_name_opens() {
+        let Some(db) = load("demo") else { return };
+        let odd = db.with_file_name(format!("zoetrope#odd_{}.db", std::process::id()));
+        std::fs::rename(&db, &odd).unwrap();
+        assert_eq!(open(&Target::Path(odd.clone()), None).unwrap().id, ROOT);
+        // And a session inside it is still located.
+        assert_eq!(session_of(&odd, "ses_demo_review").id, ROOT);
+        unload(&odd);
+    }
+
+    /// However deep the tree, it has one root.
+    #[test]
+    fn a_very_deep_tree_has_one_root() {
+        let Some(db) = load("demo") else { return };
+        let mut parent = ROOT.to_string();
+        for i in 0..40 {
+            write(
+                &db,
+                &format!(
+                    "INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, version, time_created, time_updated) \
+                 VALUES ('ses_deep_{i}', 'p', '{parent}', 's', '/home/dev/shop', '2', 1, 1);"
+                ),
+            );
+            parent = format!("ses_deep_{i}");
+        }
+        let files = discovery::list_in(&db, &Scope::ALL);
+        assert!(files.iter().all(|f| f.session == ROOT));
+        assert_eq!(session_of(&db, &parent).id, ROOT);
+        unload(&db);
+    }
+
+    /// A corrupt `parent_id` cycle ends the walk and loses nothing.
+    #[test]
+    fn a_cycle_of_parents_terminates() {
+        let Some(db) = load("demo") else { return };
+        write(
+            &db,
+            "UPDATE session_v2 SET parent_id = 'ses_demo_review' WHERE id = 'ses_demo_root';",
+        );
+        assert_eq!(discovery::list_in(&db, &Scope::ALL).len(), 3);
+        assert!(discovery::session_file(&discovery::locator(&db, ROOT)).is_some());
+        unload(&db);
+    }
+
+    #[test]
+    fn discovery_lists_the_tree_root_first() {
+        let Some(db) = load("demo") else { return };
+        let files = discovery::list_in(&db, &Scope::ALL);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].role, FileRole::Root);
+        assert_eq!(files[0].session, ROOT);
+        assert!(files.iter().all(|f| f.read == ReadMode::Rows));
+        assert!(files.iter().all(|f| f.session == ROOT));
+        assert!(files.iter().all(|f| f.project_key == "/home/dev/shop"));
+        let agents: Vec<&FileRole> = files[1..].iter().map(|f| &f.role).collect();
+        assert!(agents.iter().all(|r| **r
+            == FileRole::Agent {
+                parent: ROOT.into()
+            }));
+
+        // The scope prunes by project, id prefix and time.
+        assert_eq!(
+            discovery::list_in(&db, &Scope::project("/home/dev/shop/".as_ref())).len(),
+            3
+        );
+        assert!(discovery::list_in(&db, &Scope::project("/elsewhere".as_ref())).is_empty());
+        assert_eq!(discovery::list_in(&db, &Scope::id("ses_demo_r")).len(), 3);
+        assert!(discovery::list_in(&db, &Scope::id("ses_other")).is_empty());
+        let later = std::time::SystemTime::now();
+        assert!(discovery::list_in(&db, &Scope::ALL.since(later)).is_empty());
+        unload(&db);
+    }
+
+    /// Any file of a session opens the session, by locator or by the bare
+    /// database, and a locator that names nothing is not found.
+    #[test]
+    fn a_session_opens_from_any_of_its_files() {
+        let Some(db) = load("demo") else { return };
+        let via_root = session_of(&db, ROOT);
+        assert_eq!(via_root.provider, Provider::OpenCode);
+        assert_eq!(via_root.id, ROOT);
+        assert_eq!(via_root.files.len(), 2);
+
+        let via_child = session_of(&db, "ses_demo_review");
+        assert_eq!(via_child.id, ROOT);
+        assert_eq!(via_child.root.path, via_root.root.path);
+
+        let via_db = open(&Target::Path(db.clone()), None).unwrap();
+        assert_eq!(via_db.id, ROOT, "a bare database is its newest session");
+
+        let missing = discovery::locator(&db, "ses_nope");
+        assert!(open(&Target::Path(missing), None).is_err());
+        // Not a locator and not a file: nothing claims it.
+        assert!(open(&Target::Path("/nowhere/at/all".into()), None).is_err());
+        unload(&db);
+    }
+
+    #[test]
+    fn a_stream_states_a_session_once_and_then_only_what_changed() {
+        let Some(db) = load("demo") else { return };
+        let session = session_of(&db, ROOT);
+        let mut stream = session.provider.stream_for(&session.root);
+
+        let first = stream.poll();
+        let said = kinds(&first);
+        assert_eq!(
+            said.iter().filter(|k| **k == "Agent").count(),
+            3,
+            "root + two spawned"
+        );
+        assert_eq!(said.iter().filter(|k| **k == "ToolStart").count(), 6);
+        assert!(stream.poll().is_empty(), "nothing changed, nothing stated");
+
+        // OpenCode finishes the in-flight call, rewriting its row in place,
+        // and the session carries on in a new one.
+        write(
+            &db,
+            r#"UPDATE session_message SET time_updated = time_updated + 20000, data = json_set(
+                   json_set(data, '$.time.completed', 1793527500000),
+                   '$.content[0].state.status', 'completed')
+               WHERE id = 'msg_r06';
+               INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+               VALUES ('msg_r07', 'ses_demo_root', 'user', 7, 1793527600000, 1793527600000,
+                       '{"time":{"created":1793527600000},"text":"Thanks, ship it."}');"#,
+        );
+        let next = stream.poll();
+        assert_eq!(
+            kinds(&next),
+            ["ToolEnd", "Prompt"],
+            "the rewrite ends the call; no second start"
+        );
+        assert!(stream.poll().is_empty());
+        unload(&db);
+    }
+
+    /// A subagent that appears while the session runs is found by the
+    /// per-tick rescan, with its parent.
+    #[test]
+    fn a_new_subagent_is_found_by_rescan() {
+        let Some(db) = load("demo") else { return };
+        let mut session = session_of(&db, ROOT);
+        assert!(
+            session.rescan().is_empty(),
+            "nothing new on a settled session"
+        );
+        write(
+            &db,
+            r#"INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, version, agent, time_created, time_updated)
+               VALUES ('ses_demo_late', 'prj_demo', 'ses_demo_explore', 'late', '/home/dev/shop', '2.3.2', 'general', 1793527700000, 1793527700000);"#,
+        );
+        let found = session.rescan();
+        assert_eq!(found.len(), 1, "a grandchild is part of the tree");
+        assert_eq!(found[0].session, ROOT);
+        assert_eq!(
+            found[0].role,
+            FileRole::Agent {
+                parent: "ses_demo_explore".into()
+            }
+        );
+        // Its stream names the spawner by the model's id for it.
+        let said = session.provider.stream_for(&found[0]).poll();
+        assert!(matches!(
+            &said[0].facts[0].kind,
+            FactKind::Agent { parent, .. } if parent.as_deref() == Some("ses_demo_explore")
+        ));
+        unload(&db);
+    }
+
+    /// With `experimental.part_rows` the parts are rows of their own. They are
+    /// read, alongside a message of the same session that is still inline; a
+    /// call still being written states nothing; and a part finishing is a change
+    /// although the message's own row is exactly as it was.
+    #[test]
+    fn part_rows_are_read_and_a_part_finishing_is_a_change() {
+        let Some(db) = load("part-rows") else { return };
+        let session = session_of(&db, "ses_parts_root");
+        let mut stream = session.provider.stream_for(&session.root);
+
+        let first = stream.poll();
+        let started: Vec<&str> = first
+            .iter()
+            .flat_map(|s| &s.facts)
+            .filter_map(|f| match &f.kind {
+                FactKind::ToolStart { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            ["read", "grep"],
+            "one from part rows, one inline; the streaming call is not made yet"
+        );
+        assert!(stream.poll().is_empty());
+
+        // The model makes the call. Only its part row is rewritten: the
+        // message row keeps its time.
+        write(
+            &db,
+            r#"UPDATE session_part SET time_updated = time_updated + 5000, data = json_set(
+                   json_set(json_set(data, '$.state.status', 'running'),
+                            '$.state.input', json('{"patchText":"*** Begin Patch\n*** Update File: /home/dev/parts/src/config.rs\n*** End Patch"}')),
+                   '$.time.ran', 1793610000000)
+               WHERE message_id = 'msg_p04';"#,
+        );
+        let called = stream.poll();
+        assert_eq!(kinds(&called), ["ToolStart"]);
+        assert!(matches!(
+            &called[0].facts[0].kind,
+            FactKind::ToolStart { name, summary, .. }
+                if name == "patch" && summary.as_deref() == Some("src/config.rs")
+        ));
+
+        write(
+            &db,
+            r#"UPDATE session_part SET time_updated = time_updated + 5000, data = json_set(
+                   json_set(data, '$.state.status', 'completed'), '$.time.completed', 1793610005000)
+               WHERE message_id = 'msg_p04';"#,
+        );
+        assert_eq!(kinds(&stream.poll()), ["ToolEnd"]);
+        assert!(stream.poll().is_empty());
+        unload(&db);
+    }
+
+    /// A read that fails is not a tick with nothing new: `inspect` must be able
+    /// to tell, and the stream must not have moved, so the next read states
+    /// exactly what it would have.
+    #[test]
+    fn a_failed_read_is_not_an_empty_one_and_leaves_the_stream_where_it_was() {
+        let Some(db) = load("demo") else { return };
+        let session = session_of(&db, ROOT);
+        let child = session
+            .files
+            .iter()
+            .find(|f| f.path.to_string_lossy().ends_with("ses_demo_explore"))
+            .unwrap();
+        let mut stream = session.provider.stream_for(child);
+        assert!(stream.try_poll().is_some_and(|s| !s.is_empty()));
+
+        // The messages are out of reach for a moment.
+        write(
+            &db,
+            "ALTER TABLE session_message RENAME TO session_message_away;",
+        );
+        assert!(stream.try_poll().is_none(), "unreadable is not nothing");
+        assert!(stream.poll().is_empty(), "though a live tick just retries");
+
+        write(
+            &db,
+            r#"ALTER TABLE session_message_away RENAME TO session_message;
+               INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+               VALUES ('msg_e07', 'ses_demo_explore', 'user', 7, 1793527700000, 1793527700000,
+                       '{"time":{"created":1793527700000},"text":"One more thing."}');"#,
+        );
+        let then = stream.try_poll().expect("readable again");
+        assert_eq!(then.len(), 1, "exactly the row written since: {then:?}");
+        assert!(matches!(then[0].facts[0].kind, FactKind::Activity));
+        unload(&db);
+    }
+
+    /// The database is the user's, live, and holds their credentials: what we
+    /// open it with must not be able to change it, whatever the SQL.
+    #[test]
+    fn the_connection_cannot_write() {
+        let Some(db) = load("demo") else { return };
+        let conn = db::open(&db).unwrap();
+        for sql in [
+            "DELETE FROM session_message",
+            "UPDATE session_v2 SET title = 'x'",
+            "CREATE TABLE intruder (x)",
+        ] {
+            assert!(conn.execute_batch(sql).is_err(), "`{sql}` must be refused");
+        }
+        assert_eq!(db::sessions(&conn).len(), 3, "and nothing was lost");
+        unload(&db);
+    }
+
+    /// The session row and its messages come from one read transaction on a
+    /// connection that cannot write, or the old inline parts of a message being
+    /// moved into part rows could be read beside their own copies. Nothing can
+    /// be interleaved with a single call from here, so what is checked is that
+    /// the transaction opens and ends on that connection and hands over both.
+    #[test]
+    fn the_session_and_its_messages_are_read_in_one_transaction() {
+        for (fixture, root) in [("demo", ROOT), ("part-rows", "ses_parts_root")] {
+            let Some(db) = load(fixture) else { return };
+            let conn = db::open(&db).unwrap();
+            let (row, rows) = db::read(&conn, root, 0).expect("readable");
+            assert_eq!(row.id, root);
+            assert!(rows.iter().any(|r| r.kind == "assistant"), "{fixture}");
+            assert!(
+                db::read(&conn, "ses_nope", 0).is_none(),
+                "an absent session is a failed read"
+            );
+            // The snapshot is let go: the same connection reads again.
+            assert!(db::read(&conn, root, 0).is_some());
+            unload(&db);
+        }
+    }
+
+    #[test]
+    fn a_database_that_is_gone_states_nothing() {
+        let gone = std::env::temp_dir().join("zoetrope_opencode_never_existed.db");
+        let _ = std::fs::remove_file(&gone);
+        assert!(stream_at(&gone).poll().is_empty());
+        assert!(stream_at(&gone).try_poll().is_none());
+        assert!(discovery::session_file(&discovery::locator(&gone, "ses_x")).is_none());
+        assert!(discovery::list_in(&gone, &Scope::ALL).is_empty());
+    }
+
+    fn stream_at(db: &std::path::Path) -> Stream {
+        Stream::new(db.to_path_buf(), "ses_x".into(), "ses_x".into(), None)
+    }
+
+    fn kinds(statements: &[Statement]) -> Vec<&'static str> {
+        statements
+            .iter()
+            .flat_map(|s| s.facts.iter().map(|f| f.kind.name()))
+            .filter(|k| {
+                !matches!(
+                    *k,
+                    "Session"
+                        | "Title"
+                        | "Activity"
+                        | "Model"
+                        | "Tokens"
+                        | "Reasoning"
+                        | "Label"
+                        | "Spawn"
+                )
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(session: &str, root: &str, parent: Option<&str>) -> Stream {
+        Stream::new(
+            PathBuf::new(),
+            session.into(),
+            root.into(),
+            parent.map(str::to_string),
+        )
+    }
+
+    fn row(id: &str, kind: &str, updated: i64, data: &str) -> Row {
+        Row {
+            id: id.into(),
+            kind: kind.into(),
+            time_updated: updated,
+            data: data.into(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// An assistant row whose parts live in `session_part` rows.
+    fn row_with_parts(id: &str, updated: i64, data: &str, parts: &[&str]) -> Row {
+        Row {
+            parts: parts.iter().map(|p| p.to_string()).collect(),
+            ..row(id, "assistant", updated, data)
+        }
+    }
+
+    fn kinds(statements: &[Statement]) -> Vec<&'static str> {
+        statements
+            .iter()
+            .flat_map(|s| s.facts.iter().map(|f| f.kind.name()))
+            .collect()
+    }
+
+    fn session(parent: Option<&str>, agent: Option<&str>) -> SessionRow {
+        SessionRow {
+            id: "x".into(),
+            parent_id: parent.map(str::to_string),
+            directory: "/p".into(),
+            title: Some("Fix it".into()),
+            version: "2.3.2".into(),
+            agent: agent.map(str::to_string),
+            time_created: 1_000,
+            time_updated: 2_000,
+        }
+    }
+
+    #[test]
+    fn the_root_is_main_with_its_rows_and_a_title() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let said = s.session_row(&session(None, Some("build")));
+        assert_eq!(said[0].facts[0].agent.as_deref(), Some("main"));
+        assert!(matches!(
+            &said[0].facts[0].kind,
+            FactKind::Agent { kind: AgentKind::Main, interactive: true, agent_type, .. }
+                if agent_type.as_deref() == Some("opencode")
+        ));
+        let labels: Vec<&str> = said[0]
+            .facts
+            .iter()
+            .filter_map(|f| match &f.kind {
+                FactKind::Session { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["version", "cwd"]);
+        assert!(matches!(&said[1].facts[0].kind, FactKind::Title(t) if t == "Fix it"));
+        // Stated once; the title again only when it changes.
+        assert!(s.session_row(&session(None, Some("build"))).is_empty());
+        let mut renamed = session(None, Some("build"));
+        renamed.title = Some("Fix it properly".into());
+        assert!(matches!(
+            &s.session_row(&renamed)[0].facts[0].kind,
+            FactKind::Title(t) if t == "Fix it properly"
+        ));
+    }
+
+    #[test]
+    fn a_child_session_is_its_own_agent_under_its_spawner() {
+        let mut s = stream("ses_c", "ses_r", Some("main"));
+        let said = s.session_row(&session(Some("ses_r"), Some("explore")));
+        assert_eq!(said.len(), 1, "a child names no session rows or title");
+        assert_eq!(said[0].facts[0].agent.as_deref(), Some("ses_c"));
+        assert!(matches!(
+            &said[0].facts[0].kind,
+            FactKind::Agent { kind: AgentKind::Subagent, parent, agent_type, interactive: false, .. }
+                if parent.as_deref() == Some("main") && agent_type.as_deref() == Some("explore")
+        ));
+    }
+
+    #[test]
+    fn a_tool_is_started_once_and_ended_when_the_row_says_so() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let running = r#"{"time":{"created":1000,"firstToken":1100},"content":[
+            {"type":"tool","id":"call_1","name":"shell",
+             "state":{"status":"running","input":{"command":"cargo test"}},
+             "time":{"created":1200,"ran":1210}}]}"#;
+        let first = s.push(&row("m1", "assistant", 1210, running));
+        assert_eq!(kinds(&first), ["ToolStart"]);
+        assert!(matches!(
+            &first[0].facts[0].kind,
+            FactKind::ToolStart { call, name, summary }
+                if call == "call_1" && name == "shell" && summary.as_deref() == Some("cargo test")
+        ));
+        // The same row again: nothing.
+        assert!(s.push(&row("m1", "assistant", 1210, running)).is_empty());
+
+        // Rewritten: the call finished, nonzero exit, message complete.
+        let done = r#"{"time":{"created":1000,"firstToken":1100,"completed":3000},
+            "tokens":{"output":40,"reasoning":2},"content":[
+            {"type":"tool","id":"call_1","name":"shell",
+             "state":{"status":"completed","input":{"command":"cargo test"},"metadata":{"exit":101}},
+             "time":{"created":1200,"ran":1210,"completed":2900}}]}"#;
+        let then = s.push(&row("m1", "assistant", 3000, done));
+        assert_eq!(kinds(&then), ["ToolEnd", "Tokens"], "no second start");
+        assert!(matches!(
+            &then[0].facts[0].kind,
+            FactKind::ToolEnd { call, outcome: Outcome::Err } if call == "call_1"
+        ));
+        assert!(
+            matches!(&then[1].facts[0].kind, FactKind::Tokens { output: 42, dedup: Some(k) } if k == "m1")
+        );
+        assert_eq!(then[0].at, ms(Some(2900)), "the end sits at its own time");
+        assert!(s.push(&row("m1", "assistant", 3000, done)).is_empty());
+    }
+
+    /// OpenCode stores a tool part as `streaming` with a half-written string
+    /// for input, and only replaces both when the call is made. A start stated
+    /// then would be the one the core keeps, summary-less, and would take a
+    /// resume for a spawn.
+    #[test]
+    fn a_tool_still_being_written_states_nothing_until_it_is_called() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let streaming = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"call_s","name":"subagent",
+             "state":{"status":"streaming","input":"{\"sessionID\":\"ses_c\",\"desc"},
+             "time":{"created":1100}}]}"#;
+        let first = s.push(&row("m1", "assistant", 1100, streaming));
+        assert_eq!(
+            kinds(&first),
+            ["Activity"],
+            "the message is working; the call is not made yet"
+        );
+
+        let called = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"call_s","name":"subagent",
+             "state":{"status":"running","input":{"sessionID":"ses_c","description":"Carry on","prompt":"p"},"metadata":{}},
+             "time":{"created":1100,"ran":1500}}]}"#;
+        let then = s.push(&row("m1", "assistant", 1500, called));
+        // The parsed input says this is a resume: no spawn, and the summary is there.
+        assert_eq!(kinds(&then), ["ToolStart"]);
+        assert!(matches!(
+            &then[0].facts[0].kind,
+            FactKind::ToolStart { summary, .. } if summary.as_deref() == Some("Carry on")
+        ));
+        assert_eq!(
+            then[0].at,
+            ms(Some(1500)),
+            "started when it was made, not when it was asked for"
+        );
+
+        // A call that fails while still streaming ends with an object for input.
+        let failed = r#"{"time":{"created":2000},"content":[
+            {"type":"tool","id":"call_f","name":"read",
+             "state":{"status":"error","input":{},"error":{"type":"tool.input-incomplete","message":"x"}},
+             "time":{"created":2100,"completed":2200}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m2", "assistant", 2200, failed))),
+            ["ToolStart", "ToolEnd"]
+        );
+    }
+
+    /// What follows a tool is dated by when the tool was asked for, whether it
+    /// was stated on this poll or on one long before: reading a message as it
+    /// grows and reading it finished must agree.
+    #[test]
+    fn what_follows_a_tool_is_dated_the_same_live_and_from_scratch() {
+        let growing = r#"{"time":{"created":1000,"firstToken":1100},"content":[
+            {"type":"tool","id":"c","name":"read","state":{"status":"completed","input":{"path":"a"}},
+             "time":{"created":5000,"ran":5000,"completed":9000}},
+            {"type":"text","text":"then this"}]}"#;
+        let done = growing.replacen(
+            r#""firstToken":1100}"#,
+            r#""firstToken":1100,"completed":9500}"#,
+            1,
+        );
+
+        // Live: the tool is stated on one poll; the text closes on the next.
+        let mut live = stream("ses_r", "ses_r", None);
+        live.push(&row("m", "assistant", 9000, growing));
+        let live_text = live.push(&row("m", "assistant", 9500, &done));
+        // From scratch: the finished message, once.
+        let mut bulk = stream("ses_r", "ses_r", None);
+        let bulk_said = bulk.push(&row("m", "assistant", 9500, &done));
+
+        let text_at = |said: &[Statement]| {
+            said.iter()
+                .find(|s| {
+                    s.facts
+                        .iter()
+                        .any(|f| matches!(f.kind, FactKind::Reasoning(_)))
+                })
+                .map(|s| s.at)
+        };
+        assert_eq!(
+            text_at(&live_text),
+            Some(ms(Some(5000))),
+            "from the call, not the message's start"
+        );
+        assert_eq!(text_at(&live_text), text_at(&bulk_said));
+    }
+
+    /// With `experimental.part_rows` the parts are rows of their own and the
+    /// message's document has none: they are read from the rows, and a part
+    /// finishing is a change to the message even though its own row is as it was.
+    #[test]
+    fn part_rows_state_what_inline_parts_would() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let envelope = r#"{"time":{"created":1000,"firstToken":1100},"content":[]}"#;
+        let running = r#"{"type":"tool","id":"call_1","name":"shell",
+            "state":{"status":"running","input":{"command":"cargo test"},"metadata":{}},
+            "time":{"created":1200,"ran":1210}}"#;
+        let first = s.push(&row_with_parts("m1", 1210, envelope, &[running]));
+        assert_eq!(kinds(&first), ["ToolStart"]);
+
+        // The part is rewritten; the message row is untouched and an update
+        // time later than it is all that tells.
+        let done = r#"{"type":"tool","id":"call_1","name":"shell",
+            "state":{"status":"completed","input":{"command":"cargo test"},"metadata":{"exit":0}},
+            "time":{"created":1200,"ran":1210,"completed":2000}}"#;
+        let then = s.push(&row_with_parts("m1", 2000, envelope, &[done]));
+        assert_eq!(kinds(&then), ["ToolEnd"]);
+        assert!(
+            s.push(&row_with_parts("m1", 2000, envelope, &[done]))
+                .is_empty()
+        );
+    }
+
+    /// OpenCode can replace a message's whole run of parts. What was stated
+    /// about a part is remembered by what it is, so a call that moves, and a
+    /// part that now sits where another did, are not mistaken for one another.
+    #[test]
+    fn a_rewrite_that_moves_parts_is_followed_by_call_and_content_not_position() {
+        let mut s = stream("ses_r", "ses_r", None);
+        // [text, running A]: the text is closed by the call after it.
+        let before = r#"{"time":{"created":1000},"content":[
+            {"type":"text","text":"First I will look."},
+            {"type":"tool","id":"call_a","name":"read","state":{"status":"running","input":{"path":"a"}},
+             "time":{"created":1100,"ran":1100}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1100, before))),
+            ["Reasoning", "ToolStart"]
+        );
+
+        // Replaced by [completed A]: A is at position 0, where the text was.
+        let after = r#"{"time":{"created":1000,"completed":2000},"content":[
+            {"type":"tool","id":"call_a","name":"read","state":{"status":"completed","input":{"path":"a"}},
+             "time":{"created":1100,"ran":1100,"completed":1900}}]}"#;
+        let then = s.push(&row("m", "assistant", 2000, after));
+        assert_eq!(
+            kinds(&then),
+            ["ToolEnd"],
+            "A ended, or its start would stay pending for good"
+        );
+        assert!(
+            matches!(&then[0].facts[0].kind, FactKind::ToolEnd { call, .. } if call == "call_a")
+        );
+        assert!(
+            s.push(&row("m", "assistant", 2500, after)).is_empty(),
+            "the same call is not ended twice"
+        );
+
+        // Replaced again: the text is back, a position later, with a new call
+        // before it. The text was stated; the new call was not.
+        let again = r#"{"time":{"created":1000,"completed":3000},"content":[
+            {"type":"tool","id":"call_b","name":"read","state":{"status":"completed","input":{"path":"b"}},
+             "time":{"created":2100,"ran":2100,"completed":2200}},
+            {"type":"text","text":"First I will look."}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 3000, again))),
+            ["ToolStart", "ToolEnd"],
+            "the text that moved is not stated twice"
+        );
+    }
+
+    /// A call that fails while the model is still writing it ends with `{}`
+    /// for input: it asked for nothing, so it is no spawn.
+    #[test]
+    fn a_subagent_call_that_never_got_its_input_is_no_spawn() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let failed = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"c","name":"subagent","state":{"status":"error","input":{}},
+             "time":{"created":1100,"completed":1200}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1200, failed))),
+            ["ToolStart", "ToolEnd"]
+        );
+    }
+
+    /// Saying the same thing twice is saying it twice: the latest reasoning
+    /// is the last one said, not the last one that was new.
+    #[test]
+    fn the_same_text_said_again_is_stated_again() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let said = r#"{"time":{"created":1000,"completed":2000},"content":[
+            {"type":"text","text":"Retrying."},{"type":"text","text":"Other."},{"type":"text","text":"Retrying."}]}"#;
+        let first = s.push(&row("m", "assistant", 2000, said));
+        assert_eq!(kinds(&first), ["Reasoning", "Reasoning", "Reasoning"]);
+        assert!(
+            s.push(&row("m", "assistant", 2500, said)).is_empty(),
+            "once each"
+        );
+    }
+
+    /// Text closed by a later call while an earlier one still runs must not be
+    /// dated differently once that earlier call has finished.
+    #[test]
+    fn text_between_calls_is_dated_the_same_while_they_run_and_after() {
+        let tool = |id: &str, at: i64, status: &str, done: &str| {
+            format!(
+                r#"{{"type":"tool","id":"{id}","name":"read","state":{{"status":"{status}","input":{{"path":"a"}}}},"time":{{"created":{at},"ran":{at}{done}}}}}"#
+            )
+        };
+        let message = |first: String| {
+            format!(
+                r#"{{"time":{{"created":1000,"firstToken":1100}},"content":[{first},{{"type":"text","text":"meanwhile"}},{}]}}"#,
+                tool("b", 6000, "running", "")
+            )
+        };
+        let text_at = |data: &str| {
+            stream("ses_r", "ses_r", None)
+                .push(&row("m", "assistant", 9000, data))
+                .iter()
+                .find(|s| {
+                    s.facts
+                        .iter()
+                        .any(|f| matches!(f.kind, FactKind::Reasoning(_)))
+                })
+                .and_then(|s| s.at)
+        };
+        assert_eq!(
+            text_at(&message(tool("a", 5000, "running", ""))),
+            text_at(&message(tool(
+                "a",
+                5000,
+                "completed",
+                r#","completed":9000"#
+            )))
+        );
+    }
+
+    /// An old message rewritten after the model changed does not change it back.
+    #[test]
+    fn a_rewrite_of_an_older_message_is_no_change_of_model() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let msg = |model: &str, extra: &str| {
+            format!(
+                r#"{{"time":{{"created":1000{extra}}},"model":{{"id":"{model}"}},"content":[]}}"#
+            )
+        };
+        let models = |said: Vec<Statement>| kinds(&said).iter().filter(|k| **k == "Model").count();
+        assert_eq!(
+            models(s.push(&row("a", "assistant", 1000, &msg("x", "")))),
+            1
+        );
+        assert_eq!(
+            models(s.push(&row("b", "assistant", 2000, &msg("y", "")))),
+            1
+        );
+        assert_eq!(
+            models(s.push(&row(
+                "a",
+                "assistant",
+                3000,
+                &msg("x", r#","completed":3000"#)
+            ))),
+            0
+        );
+        assert_eq!(
+            models(s.push(&row("c", "assistant", 4000, &msg("x", "")))),
+            1,
+            "a real switch back"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_in_the_same_millisecond_is_not_lost() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let before = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"c","name":"read","state":{"status":"running","input":{"path":"a"}},"time":{"created":1000}}]}"#;
+        let after = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"c","name":"read","state":{"status":"completed","input":{"path":"a"}},"time":{"created":1000,"completed":1000}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1000, before))),
+            ["ToolStart"]
+        );
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1000, after))),
+            ["ToolEnd"]
+        );
+    }
+
+    #[test]
+    fn text_is_stated_when_it_closes_and_tokens_when_the_message_does() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let streaming = r#"{"time":{"created":1000,"firstToken":1100},"tokens":{"output":3},
+            "content":[{"type":"text","text":"Looking"}]}"#;
+        // Open: the model is still writing it. Only the message's activity.
+        assert_eq!(
+            kinds(&s.push(&row("m", "assistant", 1100, streaming))),
+            ["Activity"]
+        );
+        let closed = r#"{"time":{"created":1000,"firstToken":1100,"completed":2000},"tokens":{"output":50},
+            "content":[{"type":"reasoning","text":"plan"},{"type":"text","text":"Looking at it."}]}"#;
+        let said = s.push(&row("m", "assistant", 2000, closed));
+        assert_eq!(kinds(&said), ["Reasoning", "Reasoning", "Tokens"]);
+        assert!(
+            matches!(&said[2].facts[0].kind, FactKind::Tokens { output: 50, .. }),
+            "the count at completion, never the partial one"
+        );
+    }
+
+    #[test]
+    fn a_subagent_call_spawns_a_child_and_a_resume_does_not() {
+        let mut s = stream("ses_r", "ses_r", None);
+        let spawn = r#"{"time":{"created":1000},"content":[
+            {"type":"tool","id":"call_s","name":"subagent",
+             "state":{"status":"running","input":{"agent":"explore","description":"Map the theme code","prompt":"x"},
+                      "metadata":{"sessionID":"ses_c"}},
+             "time":{"created":1100,"ran":1100}}]}"#;
+        let said = s.push(&row("m1", "assistant", 1100, spawn));
+        assert_eq!(kinds(&said), ["ToolStart", "Spawn", "Agent", "Label"]);
+        let child = &said[1].facts;
+        assert_eq!(child[0].agent.as_deref(), Some("ses_c"));
+        assert!(matches!(
+            &child[0].kind,
+            FactKind::Agent { kind: AgentKind::Subagent, parent, description, spawned_by, agent_type, .. }
+                if parent.as_deref() == Some("main")
+                    && description.as_deref() == Some("Map the theme code")
+                    && spawned_by.as_deref() == Some("call_s")
+                    && agent_type.is_none()
+        ));
+        assert!(matches!(
+            &child[1].kind,
+            FactKind::Label { agent_type, .. } if agent_type.as_deref() == Some("explore")
+        ));
+
+        // Asking the same child to carry on is a tool call, not a spawn.
+        let resume = r#"{"time":{"created":2000},"content":[
+            {"type":"tool","id":"call_r","name":"subagent",
+             "state":{"status":"running","input":{"sessionID":"ses_c","description":"more","prompt":"y"},
+                      "metadata":{"sessionID":"ses_c"}},
+             "time":{"created":2100,"ran":2100}}]}"#;
+        assert_eq!(
+            kinds(&s.push(&row("m2", "assistant", 2100, resume))),
+            ["ToolStart"]
+        );
+    }
+
+    #[test]
+    fn a_prompt_is_the_roots_and_a_subagents_first_message_is_only_activity() {
+        let said = |s: &mut Stream| {
+            s.push(&row(
+                "u",
+                "user",
+                1000,
+                r#"{"time":{"created":1000},"text":"Do the thing\n"}"#,
+            ))
+        };
+        let mut root = stream("ses_r", "ses_r", None);
+        let root_said = said(&mut root);
+        assert!(matches!(&root_said[0].facts[0].kind, FactKind::Prompt(t) if t == "Do the thing"));
+        assert!(said(&mut root).is_empty(), "stated once");
+        let mut child = stream("ses_c", "ses_r", Some("main"));
+        assert_eq!(kinds(&said(&mut child)), ["Activity"]);
+    }
+
+    #[test]
+    fn turn_boundaries_and_runtime_context_state_nothing() {
+        let mut s = stream("ses_c", "ses_r", Some("main"));
+        for (i, kind) in [
+            "idle",
+            "synthetic",
+            "system",
+            "compaction",
+            "model-switched",
+            "wat",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let at = 1000 + i as i64;
+            assert!(
+                s.push(&row(
+                    &format!("m{i}"),
+                    kind,
+                    at,
+                    r#"{"time":{"created":1000},"outcome":"succeeded","text":"x"}"#
+                ))
+                .is_empty(),
+                "{kind} states nothing"
+            );
+        }
+        assert!(
+            s.push(&row("bad", "assistant", 5000, "not json"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn summaries_name_what_a_tool_touched() {
+        let state = |json: &str| serde_json::from_str::<ToolState>(json).unwrap();
+        let cwd = Some("/p");
+        assert_eq!(
+            summarize("read", &state(r#"{"input":{"path":"/p/src/a.rs"}}"#), cwd).as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            summarize(
+                "patch",
+                &state(
+                    r#"{"input":{"patchText":"*** Begin Patch\n*** Update File: /p/a.js\n@@\n-a\n+b\n*** Add File: /p/b.js\n+x\n*** End Patch"}}"#
+                ),
+                cwd
+            )
+            .as_deref(),
+            Some("a.js, b.js")
+        );
+        assert_eq!(
+            summarize(
+                "grep",
+                &state(r#"{"input":{"pattern":"fn main","path":"/p"}}"#),
+                cwd
+            )
+            .as_deref(),
+            Some("fn main")
+        );
+        assert_eq!(
+            summarize(
+                "execute",
+                &state(r#"{"input":{"code":"\n// go\nrun()"}}"#),
+                cwd
+            )
+            .as_deref(),
+            Some("// go")
+        );
+        // A tool the provider does not know: the first usual field.
+        assert_eq!(
+            summarize(
+                "router_verify",
+                &state(r#"{"input":{"command":"just check"}}"#),
+                cwd
+            )
+            .as_deref(),
+            Some("just check")
+        );
+        assert_eq!(
+            summarize("question", &state(r#"{"input":{"questions":[]}}"#), cwd),
+            None
+        );
+    }
+}

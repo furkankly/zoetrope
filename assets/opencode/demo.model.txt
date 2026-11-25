@@ -1,0 +1,15 @@
+  ◌ [main] opencode  (idle) — id=main
+      model: demo-model
+      tools: 6 (3✓ 2✗ 1⏳)   tokens: 250
+    ✓ [subagent] explore  (done) — id=ses_demo_explore
+        Map the theme code
+        model: demo-model
+        tools: 3 (3✓ 0✗ 0⏳)   tokens: 100
+        ↳ prompt: Add a dark-mode toggle to the settings page.
+        ↳ thought: The settings page owns theme state. Read it, then ask an explorer to map the theme code.
+    ✗ [subagent] general  (failed) — id=ses_demo_review
+        Review the diff
+        model: demo-model
+        tools: 1 (0✓ 1✗ 0⏳)   tokens: 8
+        ↳ prompt: Add a dark-mode toggle to the settings page.
+        ↳ thought: Patch the theme module, add the toggle, then run the tests.

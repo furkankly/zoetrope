@@ -270,16 +270,18 @@ pub(crate) fn compute_scrubber_tally(
 /// the left, transport tag on the right).
 /// The spawn mark on the scrubber strip and in the narration line: the
 /// session's provider's own emblem, in its own colour. Claude's sunburst in
-/// coral, Codex's circled star in green, a plain star in a neutral for a
-/// session whose root has not been stated yet. Two columns wide, like the
-/// other marks. Dingbats on purpose: every terminal and the browser's font
-/// atlas render them, the hexagon block is not. The browser's atlas drops the
-/// colour and shows the glyph alone, which still tells the providers apart.
+/// coral, Codex's circled star in green, OpenCode's square in blue, a plain
+/// star in a neutral for a session whose root has not been stated yet. Two
+/// columns wide, like the other marks. Dingbats on purpose: every terminal and
+/// the browser's font atlas render them, the hexagon block is not. The
+/// browser's atlas drops the colour and shows the glyph alone, which still
+/// tells the providers apart.
 fn spawn_mark(provider: Option<crate::provider::Provider>) -> (&'static str, Color) {
     use crate::provider::Provider;
     match provider {
         Some(Provider::Claude) => ("❋ ", Color::Indexed(173)),
         Some(Provider::Codex) => ("❂ ", Color::Indexed(36)),
+        Some(Provider::OpenCode) => ("❏ ", Color::Indexed(75)),
         None => ("✦ ", Color::Indexed(252)),
     }
 }
